@@ -1,5 +1,62 @@
 # Test timing catalog
 
+## Provider-owned HTTP transports
+
+The OpenAI verbosity request matrix runs all 36 combinations over real local
+HTTP. Temporary instrumentation at `b23f9a8f` attributed 967–982 ms of its
+1.00–1.01 s runtime to constructing 36 HTTP clients, about 97% of the total.
+There are no deliberate sleeps in that test.
+
+All four inference adapters retain a lazily initialized transport per provider
+handle. Initialization follows early cancellation, credential and model checks.
+SDK wrappers stay request-local, so credentials, endpoints, headers, betas and
+session identifiers are resolved afresh. In-flight requests retain the
+transport without retaining the provider itself. There is no global cache.
+
+AJ already retains provider handles in its model configuration. The verbosity
+matrix does the same, once per API, while retaining every request and assertion.
+This additionally exercises settings changes on the same provider. Its three
+isolated warm runs took **0.106, 0.110 and 0.104 s**. Instrumentation confirmed
+**three transport builds**, totalling 80 ms, rather than 36.
+
+The free `stream`/`complete` convenience helpers still create a fresh provider
+per call. Callers seeking reuse retain a `provider_for` handle. Direct provider
+construction uses `::default()`. SDK `Client::new` retains its independent
+transport behavior, with an explicit constructor for supplying a transport.
+
+TLS, proxy and timeout defaults are unchanged, but their initialization and
+retention follow provider lifetime rather than each inference. Idle pooled
+connections and TLS configuration can outlive a turn. API credentials are not
+transport defaults, and transport ownership ends with its provider and active
+requests. This reduces construction work without promising lower idle memory.
+
+Two real-socket boundary tests exercise all four APIs. They observe same-socket
+reuse after fully consumed 401 responses, credential/header rotation and
+clearing, endpoint changes, and independent pools for separate providers.
+Concurrent requests establish distinct sockets before cancellation, then
+require EOF on the cancelled request and a valid response on the other.
+These do not assert that every successful SSE inference reuses its connection.
+Fresh-per-request transport mutations in each SDK fail the socket-reuse check.
+
+Independent review approved the ownership and request isolation. The default
+workspace passes **4,082 tests**, with 191 ignored. Slow-inclusive passes
+**4,264**, with nine ignored. The transport tests passed three additional
+repeats. Formatting, all-target Clippy/build, dependency guards and scratch
+checks pass. No profiling instrumentation or mutations remain.
+
+With compilation separate, default workspace runs took **18.437 s and
+16.925 s**, versus 19.893 s and 18.172 s at `b23f9a8f`. Slow-inclusive wall
+times varied from **54.411 to 58.299 s**, versus a 57.034 s baseline. Summed
+suite execution was 50.948–51.477 s versus 52.334 s. The focused matrix gain
+is much clearer than a precise full-suite speedup claim.
+
+Run the focused checks with:
+
+```sh
+RUSTC_BOOTSTRAP=1 ./scripts/check-test-scratch.sh -p aj-models \
+  --test verbosity --test provider_transport
+```
+
 ## Queue-aware stream pacing
 
 The host HTTP writer keeps its 50 ms coalescing window, but does not start

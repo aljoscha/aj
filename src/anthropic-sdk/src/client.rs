@@ -58,6 +58,16 @@ pub struct Client {
 
 impl Client {
     pub fn new(base_url: Option<String>, api_key: String) -> Self {
+        Self::with_http_client(base_url, api_key, ReqwestClient::new())
+    }
+
+    /// Use a caller-owned transport while keeping request identity on this client.
+    /// Shared transports should not carry account- or endpoint-specific defaults.
+    pub fn with_http_client(
+        base_url: Option<String>,
+        api_key: String,
+        client: ReqwestClient,
+    ) -> Self {
         let base_url = base_url.unwrap_or_else(|| BASE_URL.to_string());
         let auth_mode = if api_key.starts_with("sk-ant-oat") {
             AuthMode::OAuth
@@ -66,7 +76,7 @@ impl Client {
         };
 
         Self {
-            client: ReqwestClient::new(),
+            client,
             api_key,
             auth_mode,
             version: "2023-06-01".to_string(),

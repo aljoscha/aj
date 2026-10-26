@@ -6,10 +6,12 @@
 //! [`complete_simple`] convenience functions that look up the appropriate
 //! provider based on [`ModelInfo::api`] and forward the call.
 //!
-//! Providers are intentionally stateless at this layer: per-call auth and
-//! HTTP knobs flow in through [`StreamOptions`]. That keeps the dispatch
-//! functions free to construct (or pool) provider instances however they
-//! see fit without leaking lifecycle concerns to callers.
+//! Providers retain their HTTP transport, not request settings. Per-call auth
+//! and HTTP options flow through [`StreamOptions`]. Keep a [`provider_for`]
+//! handle across inferences to reuse its connections. The convenience dispatch
+//! functions create a fresh provider for each call.
+
+use std::sync::{Arc, OnceLock};
 
 use futures::StreamExt;
 
@@ -19,6 +21,11 @@ use crate::types::{
     AssistantError, AssistantMessage, Context, ErrorCategory, SimpleStreamOptions, StopReason,
     StreamOptions,
 };
+
+/// Per-provider transport ownership, also held by in-flight requests.
+/// Initialization follows early cancellation, credential and model checks.
+/// No credentials, endpoint headers or request options belong on this client.
+pub(crate) type HttpClient = Arc<OnceLock<reqwest::Client>>;
 
 /// A provider knows how to stream inference for a specific API type.
 ///
@@ -74,16 +81,17 @@ pub trait Provider: Send + Sync {
 /// `None` into an [`AssistantMessageEvent::Error`] on the resulting
 /// stream so callers always observe a uniform stream shape.
 ///
-/// Exposed `pub` so the binary can build a provider handle once at
-/// startup and pass it to the agent through [`Provider`]-aware
-/// constructors, rather than re-dispatching the API string on every
-/// inference call.
+/// Each handle owns an independent, lazily initialized HTTP transport. Retain
+/// the handle across inferences to reuse it. Credentials and request settings
+/// are still resolved for each call.
 pub fn provider_for(api: &str) -> Option<Box<dyn Provider>> {
     match api {
-        "anthropic-messages" => Some(Box::new(crate::anthropic::AnthropicProvider)),
-        "openai-completions" => Some(Box::new(crate::openai::OpenAiCompletionsProvider)),
-        "openai-responses" => Some(Box::new(crate::openai::OpenAiResponsesProvider)),
-        "openai-codex-responses" => Some(Box::new(crate::openai::OpenAiCodexResponsesProvider)),
+        "anthropic-messages" => Some(Box::new(crate::anthropic::AnthropicProvider::default())),
+        "openai-completions" => Some(Box::new(crate::openai::OpenAiCompletionsProvider::default())),
+        "openai-responses" => Some(Box::new(crate::openai::OpenAiResponsesProvider::default())),
+        "openai-codex-responses" => Some(Box::new(
+            crate::openai::OpenAiCodexResponsesProvider::default(),
+        )),
         _ => None,
     }
 }

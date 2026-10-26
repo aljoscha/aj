@@ -45,7 +45,7 @@ use serde_json::Value;
 
 use crate::cancel::{SelectOutcome, select_cancel};
 use crate::oauth::openai::extract_account_id;
-use crate::provider::Provider;
+use crate::provider::{HttpClient, Provider};
 use crate::registry::{ModelInfo, validate_thinking_level};
 use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use crate::transform::transform_messages;
@@ -92,8 +92,11 @@ const OPENAI_BETA: &str = "responses=experimental";
 /// value the OAuth flow uses for the authorize URL.
 const ORIGINATOR: &str = "aj";
 
-/// Stateless provider for the Codex Responses API.
-pub struct OpenAiCodexResponsesProvider;
+/// Provider with a reusable HTTP transport for the Codex Responses API.
+#[derive(Default)]
+pub struct OpenAiCodexResponsesProvider {
+    http: HttpClient,
+}
 
 impl Provider for OpenAiCodexResponsesProvider {
     fn supports_freeform_tools(&self) -> bool {
@@ -111,6 +114,7 @@ impl Provider for OpenAiCodexResponsesProvider {
             context.clone(),
             options.clone(),
             ThinkingLevel::Off,
+            HttpClient::clone(&self.http),
         )
     }
 
@@ -125,6 +129,7 @@ impl Provider for OpenAiCodexResponsesProvider {
             context.clone(),
             options.base.clone(),
             options.reasoning.clone(),
+            HttpClient::clone(&self.http),
         )
     }
 }
@@ -138,11 +143,12 @@ fn spawn_stream(
     context: Context,
     options: StreamOptions,
     reasoning: ThinkingLevel,
+    http: HttpClient,
 ) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
     tokio::spawn(async move {
-        run_stream(producer.clone(), model, context, options, reasoning).await;
+        run_stream(producer.clone(), model, context, options, reasoning, http).await;
         producer.end();
     });
     stream
@@ -154,8 +160,11 @@ async fn run_stream(
     context: Context,
     options: StreamOptions,
     reasoning: ThinkingLevel,
+    http: HttpClient,
 ) {
-    if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
+    if let Err(err) =
+        run_stream_inner(&producer, &model, &context, &options, &reasoning, &http).await
+    {
         producer.push(error_message(API_NAME, &model, None, err));
     }
 }
@@ -166,6 +175,7 @@ async fn run_stream_inner(
     context: &Context,
     options: &StreamOptions,
     reasoning: &ThinkingLevel,
+    http: &HttpClient,
 ) -> Result<(), AssistantError> {
     if let Some(token) = options.cancel.as_ref()
         && token.is_cancelled()
@@ -221,11 +231,15 @@ async fn run_stream_inner(
         model.base_url.clone()
     };
 
-    let mut client = Client::new(Some(base_url), credential.key.clone())
-        .with_extra_header("chatgpt-account-id", account_id)
-        .with_extra_header("originator", ORIGINATOR)
-        .with_extra_header("OpenAI-Beta", OPENAI_BETA)
-        .with_extra_header("User-Agent", user_agent());
+    let mut client = Client::with_http_client(
+        Some(base_url),
+        credential.key.clone(),
+        http.get_or_init(reqwest::Client::new).clone(),
+    )
+    .with_extra_header("chatgpt-account-id", account_id)
+    .with_extra_header("originator", ORIGINATOR)
+    .with_extra_header("OpenAI-Beta", OPENAI_BETA)
+    .with_extra_header("User-Agent", user_agent());
 
     // session-correlation headers mirror the Responses provider's.
     // Codex is always hosted at chatgpt.com so we don't gate on
@@ -905,7 +919,7 @@ mod tests {
             }));
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                OpenAiCodexResponsesProvider
+                OpenAiCodexResponsesProvider::default()
                     .stream(&model, &Context::new("sys"), &options)
                     .result(),
             )
@@ -1107,8 +1121,11 @@ mod tests {
         model.base_url = server.base_url.clone();
         let token = tokio_util::sync::CancellationToken::new();
         let options = labeled_options(token.clone());
-        let mut stream =
-            OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+        let mut stream = OpenAiCodexResponsesProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &options,
+        );
 
         let start = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
             .await
@@ -1136,7 +1153,11 @@ mod tests {
         model.base_url = server.base_url.clone();
         let token = tokio_util::sync::CancellationToken::new();
         let options = labeled_options(token.clone());
-        let stream = OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+        let stream = OpenAiCodexResponsesProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &options,
+        );
 
         server.wait_for_request().await;
         token.cancel();
@@ -1158,7 +1179,11 @@ mod tests {
         let token = tokio_util::sync::CancellationToken::new();
         let mut options = labeled_options(token.clone());
         options.on_payload = Some(OnPayload::new(move |_| token.cancel()));
-        let stream = OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+        let stream = OpenAiCodexResponsesProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &options,
+        );
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
@@ -1177,7 +1202,11 @@ mod tests {
         let mut model = fake_model("gpt-5.1", false);
         model.base_url = server.base_url.clone();
         let options = labeled_options(tokio_util::sync::CancellationToken::new());
-        let stream = OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+        let stream = OpenAiCodexResponsesProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &options,
+        );
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
@@ -1205,8 +1234,11 @@ mod tests {
         let mut model = fake_model("gpt-5.5", false);
         model.base_url = server.base_url.clone();
         let options = labeled_options(tokio_util::sync::CancellationToken::new());
-        let mut stream =
-            OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+        let mut stream = OpenAiCodexResponsesProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &options,
+        );
 
         let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -1272,7 +1304,11 @@ mod tests {
         let mut model = fake_model("gpt-5.5", false);
         model.base_url = server.base_url.clone();
         let options = labeled_options(tokio_util::sync::CancellationToken::new());
-        let stream = OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+        let stream = OpenAiCodexResponsesProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &options,
+        );
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
@@ -1838,7 +1874,7 @@ mod tests {
         let model = fake_model("gpt-5.1", false);
         let ctx = Context::new("hi");
         let options = StreamOptions::default();
-        let mut stream = OpenAiCodexResponsesProvider.stream(&model, &ctx, &options);
+        let mut stream = OpenAiCodexResponsesProvider::default().stream(&model, &ctx, &options);
         while stream.next().await.is_some() {}
         let final_message = stream.result().await;
         assert_eq!(final_message.stop_reason, StopReason::Error);
@@ -1857,7 +1893,7 @@ mod tests {
             api_key: Some(token),
             ..Default::default()
         };
-        let mut stream = OpenAiCodexResponsesProvider.stream(&model, &ctx, &options);
+        let mut stream = OpenAiCodexResponsesProvider::default().stream(&model, &ctx, &options);
         while stream.next().await.is_some() {}
         let final_message = stream.result().await;
         assert_eq!(final_message.stop_reason, StopReason::Error);

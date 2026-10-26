@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use aj_models::provider::complete_simple;
+use aj_models::provider::provider_for;
 use aj_models::registry::{Catalog, ModelRegistry, bundled_codex_seed};
 use aj_models::types::{
     Context, SimpleStreamOptions, StopReason, StreamOptions, ThinkingLevel, Verbosity,
@@ -31,6 +31,7 @@ async fn verbosity_resolves_at_each_openai_request_boundary() {
             "/text/verbosity",
         ),
     ] {
+        let provider = provider_for(api).expect("registered API");
         for supported in [false, true] {
             for default in [None, Some(Verbosity::Low), Some(Verbosity::High)] {
                 for requested in [None, Some(Verbosity::Medium)] {
@@ -85,7 +86,8 @@ async fn verbosity_resolves_at_each_openai_request_boundary() {
                         body
                     };
                     let (body, terminal) = tokio::time::timeout(Duration::from_secs(5), async {
-                        tokio::join!(server, complete_simple(&model, &context, &options))
+                        let stream = provider.stream_simple(&model, &context, &options);
+                        tokio::join!(server, stream.result())
                     })
                     .await
                     .expect("request and terminal complete");
