@@ -1113,41 +1113,49 @@ mod tests {
     /// lost wakeup or a queue that forgets to end would pass all of them and
     /// hang a real client: a stalled stream is indistinguishable from a quiet
     /// one until something else happens to wake it.
-    #[tokio::test]
-    async fn a_parked_stream_is_woken_by_a_frame_and_ended_by_a_close() {
+    #[test]
+    fn a_parked_stream_is_woken_by_a_frame_and_ended_by_a_close() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Woken(AtomicBool);
+        impl Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
         let fanout = Arc::new(Fanout::default());
         let (id, mut rx, _cancelled) =
             fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.finish_block(id, SESSION, 0);
 
-        // Published from another task, after this one has parked on `recv`: the
-        // sleep can only elapse while this task is waiting, so the frame has to
-        // carry the wakeup with it.
-        let publishing = tokio::spawn({
-            let fanout = Arc::clone(&fanout);
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        for closing in [false, true] {
+            let woken = Arc::new(Woken(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&woken));
+            let mut context = Context::from_waker(&waker);
+            let mut receive = std::pin::pin!(rx.recv());
+            assert!(receive.as_mut().poll(&mut context).is_pending());
+            if closing {
+                fanout.close();
+            } else {
                 fanout.publish(reliable("late"));
             }
-        });
-        let woken = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("the parked stream to be woken by the live frame");
-        assert!(matches!(woken, Some(Frame::Event { .. })));
-        publishing.await.expect("the publishing task");
-
-        let closing = tokio::spawn({
-            let fanout = Arc::clone(&fanout);
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                fanout.close();
+            // Repolling alone would conceal a lost wake. The producer must
+            // notify the exact waiter registered by the pending receive.
+            assert!(
+                woken.0.load(Ordering::SeqCst),
+                "the parked receiver was not woken"
+            );
+            let Poll::Ready(frame) = receive.as_mut().poll(&mut context) else {
+                panic!("the woken receive stayed pending");
+            };
+            if closing {
+                assert!(frame.is_none(), "a closed stream hands nothing back");
+            } else {
+                assert!(matches!(frame, Some(Frame::Event { .. })));
             }
-        });
-        let ended = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("the parked stream to end when the host closes it");
-        assert!(ended.is_none(), "a closed stream hands nothing back");
-        closing.await.expect("the closing task");
+        }
     }
 
     /// Closing the registry is terminal. A registration that begins after it

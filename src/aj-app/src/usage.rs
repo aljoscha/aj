@@ -612,6 +612,9 @@ mod tests {
         seed_accounts(&auth, "openrouter").await;
         auth.set_default_account("anthropic", "work").await.unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
+        // Account setup uses real storage. Only the fake source's timeout is
+        // driven by virtual time.
+        tokio::time::pause();
         let statuses = collect_usage_from_sources(
             &auth,
             vec![Arc::new(FakeUsageSource {

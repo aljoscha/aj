@@ -3344,21 +3344,14 @@ mod task_registry_tests {
         // Unknown ids resolve immediately with `None`.
         assert_eq!(registry.wait_terminal(999).await, None);
 
-        let flipper = {
-            let registry = registry.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                registry.set_status(id, TaskStatus::Exited(Some(0)));
-            })
-        };
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            registry.wait_terminal(id),
-        )
-        .await
-        .expect("wait_terminal resolves once the status flips");
+        let wait = registry.wait_terminal(id);
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        registry.set_status(id, TaskStatus::Exited(Some(0)));
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("wait_terminal resolves once the status flips");
         assert_eq!(status, Some(TaskStatus::Exited(Some(0))));
-        flipper.await.expect("flipper joined");
 
         // Already-terminal tasks resolve immediately.
         assert_eq!(
@@ -3382,18 +3375,17 @@ mod task_registry_tests {
         // A driver flipping its status during the wait resolves the
         // quiesce before the grace expires.
         let (c, _) = register(&registry, AgentId::Main, "c");
-        let flipper = {
-            let registry = registry.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                registry.set_status(c, TaskStatus::Killed);
-            })
-        };
-        assert!(registry.quiesce(std::time::Duration::from_secs(5)).await);
-        flipper.await.expect("flipper joined");
+        let wait = registry.quiesce(std::time::Duration::from_secs(5));
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        registry.set_status(c, TaskStatus::Killed);
+        assert!(
+            matches!(futures::poll!(&mut wait), std::task::Poll::Ready(true)),
+            "terminal entries resolve quiescence without spending its grace"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn terminal_status_does_not_quiesce_before_the_detached_driver_returns() {
         let registry = TaskRegistry::default();
         let (id, _cancel, driver) = registry.register_driver(
@@ -6368,7 +6360,7 @@ mod event_protocol_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn truncated_turn_is_retried_then_succeeds() {
         // A provider stream that drops before its terminal frame
         // surfaces as a transient `Error` (via
@@ -7276,18 +7268,6 @@ mod event_protocol_tests {
 
     // ---- Background agent spawns ------------------------------------------
 
-    /// Poll `cond` until it holds (bounded), yielding so detached
-    /// drivers make progress.
-    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-        for _ in 0..500 {
-            if cond() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {what}");
-    }
-
     /// A background spawn returns a `Started` result with both ids,
     /// retains the handle like a blocking spawn, still emits
     /// `SubAgentEnd`, and delivers the child's report as a completion
@@ -7366,18 +7346,11 @@ mod event_protocol_tests {
         // The handle is retained exactly like a blocking spawn's.
         assert_eq!(sub_registry.ids(), vec![1]);
 
-        // The detached driver outlives the parent's turn; wait for
-        // the completion notice it queues.
-        wait_until(|| tasks.has_notices(AgentId::Main), "completion notice").await;
+        // Quiescence includes the driver's notice and terminal bus events,
+        // not just its displayed status.
+        assert!(tasks.quiesce(std::time::Duration::from_secs(5)).await);
+        assert!(tasks.has_notices(AgentId::Main));
         assert_eq!(tasks.status(1), Some(TaskStatus::Exited(Some(0))));
-        // The driver announced the task on the bus as its first act
-        // and closed it with `TaskEnd`. The notice is queued before
-        // the `TaskEnd` emit, so wait for the emit itself.
-        wait_until(
-            || task_events.lock().unwrap().contains(&("end", 1)),
-            "TaskEnd on the bus",
-        )
-        .await;
         assert_eq!(
             *task_events.lock().unwrap(),
             vec![("start", 1), ("end", 1)],
@@ -7452,7 +7425,8 @@ mod event_protocol_tests {
             .expect("parent prompt");
         assert_eq!(*started.lock().unwrap(), vec![(1, 1)]);
 
-        wait_until(|| tasks.has_notices(AgentId::Main), "failure notice").await;
+        assert!(tasks.quiesce(std::time::Duration::from_secs(5)).await);
+        assert!(tasks.has_notices(AgentId::Main));
         assert_eq!(tasks.status(1), Some(TaskStatus::Exited(Some(1))));
         assert_eq!(
             *conclusions.lock().unwrap(),
@@ -8380,7 +8354,7 @@ mod event_protocol_tests {
     /// order, so a slow first call still lands ahead of a fast second
     /// one in the transcript. The completion order proves they actually
     /// overlapped and finished out of order.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn parallel_results_keep_call_order_despite_skew() {
         let state = Arc::new(ProbeState::default());
         let probe = ProbeTool {
@@ -8418,7 +8392,7 @@ mod event_protocol_tests {
 
     /// Serial tools are singleton barrier groups: two calls to a
     /// `Sequential` tool never overlap.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sequential_tools_never_overlap() {
         let state = Arc::new(ProbeState::default());
         let probe = ProbeTool {
@@ -8451,7 +8425,7 @@ mod event_protocol_tests {
 
     /// The concurrency cap bounds in-flight calls within a parallel
     /// group while still finalizing results in order.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrency_cap_bounds_in_flight_calls() {
         let state = Arc::new(ProbeState::default());
         let probe = ProbeTool {

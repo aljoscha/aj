@@ -155,16 +155,12 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
 /// log in the store, which on a real one is a multi-second, multi-gigabyte
 /// read before first paint.
 ///
-/// Then a streaming turn, which marks the directory dirty on every event, so
-/// the publisher refreshes at its coalescing rate throughout. Those refreshes
+/// Then a streaming turn with explicit listings throughout. Durable appends
+/// and working-state changes also wake the coalesced publisher. Those refreshes
 /// must touch no filesystem at all: the live session's state comes from the
 /// host, and the store's cold half is served from the cache the last
 /// enumeration point left.
-#[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: real I/O budget across a paced streaming turn"
-)]
+#[tokio::test]
 async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
     let dir = TempDir::new().expect("tempdir");
     let sessions_dir = dir.path().join("sessions");
@@ -225,7 +221,11 @@ async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
     let session = host.create().await.expect("create");
     host.sessions().await.expect("sessions");
 
+    // Materialization is complete. Script and publisher timers can advance
+    // virtually while every listing and process I/O counter stays real.
+    tokio::time::pause();
     let before = read_bytes();
+    let builds = host.list_builds();
     let enumerations = host.store_directory_reads();
     let sidecar_enumerations = host.store_sidecar_directory_reads();
     let lock_enumerations = host.store_lock_directory_reads();
@@ -244,7 +244,7 @@ async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
     .expect("prompt");
     // Polling the host is itself a refresh, so the wait does not understate
     // what a turn's refreshes cost.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         polls += 1;
         let working = host
@@ -257,7 +257,10 @@ async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
         if !working {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "the turn never ended");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn never ended"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let read = read_bytes() - before;
@@ -265,6 +268,12 @@ async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
     let sidecars_enumerated = host.store_sidecar_directory_reads() - sidecar_enumerations;
     let locks_enumerated = host.store_lock_directory_reads() - lock_enumerations;
     let probed = host.store_lock_probes() - lock_probes;
+    assert!(polls > 1, "the measurement spans multiple live refreshes");
+    assert!(
+        host.list_builds() > builds,
+        "the publisher ran during the measured turn"
+    );
+    tokio::time::resume();
     host.shutdown().await;
 
     assert!(

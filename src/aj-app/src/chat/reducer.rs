@@ -2793,7 +2793,8 @@ mod tests {
             &mut life,
             sub_agent_start(1, "scripted", "scripted"),
         );
-        let spawn_start = s.sub_box_mut(1).expect("box").started_at;
+        let spawn_start = Instant::now() - Duration::from_secs(10);
+        s.sub_box_mut(1).expect("box").started_at = spawn_start;
 
         apply(
             &mut s,
@@ -2809,7 +2810,6 @@ mod tests {
 
         // Idle, then a continuation re-run. The clock restarts (start advances,
         // end cleared) so the runtime times the new run, not the idle gap.
-        std::thread::sleep(std::time::Duration::from_millis(2));
         apply(
             &mut s,
             &mut life,
@@ -5046,13 +5046,12 @@ mod tests {
             (s, life)
         };
         let (first, first_life) = fold(events.clone());
-        std::thread::sleep(Duration::from_millis(2));
         let (mut second, second_life) = fold(events);
-
         let started = |state: &ChatState| match &entries(state, AgentId::Main)[0].kind {
             EntryKind::SubAgent(b) => b.started_at,
             other => panic!("expected the sub box first, got {other:?}"),
         };
+        second.sub_box_mut(1).expect("box").started_at = started(&first) - Duration::from_secs(1);
         assert_ne!(
             started(&first),
             started(&second),

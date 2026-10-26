@@ -1596,7 +1596,10 @@ pub mod codex {
                 assert_eq!(result.unwrap(), ResetOutcome::Reset);
             }
 
+            // The awaited call owns dispatch. After rejection, a nonblocking
+            // accept checks the same real endpoint used by the successful POSTs.
             auth.remove_account(PROVIDER_ID, "work").await.unwrap();
+            let listener = listener.into_std().unwrap();
             for rebound in [false, true] {
                 if rebound {
                     auth.insert_account(
@@ -1619,9 +1622,7 @@ pub mod codex {
                     "rebound={rebound}: {result:?}"
                 );
                 assert!(
-                    tokio::time::timeout(Duration::from_millis(250), listener.accept())
-                        .await
-                        .is_err(),
+                    matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
                     "stale target reached POST endpoint, rebound={rebound}"
                 );
             }
@@ -1646,11 +1647,6 @@ pub mod codex {
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/consume", listener.local_addr().unwrap());
-            let accepted = tokio::spawn(async move {
-                tokio::time::timeout(Duration::from_millis(250), listener.accept())
-                    .await
-                    .is_ok()
-            });
             let target: RateLimitResetTarget = serde_json::from_value(
                 serde_json::to_value(reset_target("account-from-usage")).unwrap(),
             )
@@ -1660,8 +1656,11 @@ pub mod codex {
                 .await;
 
             assert!(matches!(result, Err(UsageError::StaleResetTarget)));
+            // The awaited call owns the send, with no detached dispatch. A
+            // rejected target cannot connect later. Inspect the kernel queue
+            // directly rather than depending on Tokio's cached readiness.
             assert!(
-                !accepted.await.unwrap(),
+                matches!(listener.into_std().unwrap().accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
                 "stale target reached POST endpoint"
             );
         }

@@ -27,6 +27,7 @@ nix = { workspace = true }
 signal-hook = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 ignore = { workspace = true }
 

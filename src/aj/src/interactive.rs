@@ -9646,15 +9646,16 @@ mod tests {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
             fold_ready_frames(world);
-            let idle = world
-                .control
-                .sessions()
-                .await
-                .expect("session list")
+            let sessions = world.control.sessions().await.expect("session list");
+            let row = sessions
                 .sessions
                 .iter()
-                .find(|entry| entry.id == world.session())
-                .is_some_and(|entry| !entry.working);
+                .find(|entry| entry.id == world.session());
+            let caught_up = row.is_some_and(|row| {
+                !row.working
+                    && world.client().applied_seq_for_test().unwrap_or(0)
+                        >= row.last_seq.unwrap_or(0)
+            });
             // Background tasks are judged from the client's own table, which
             // `TaskStart` and `TaskEnd` keep current: every task a turn launched
             // announces itself before the turn ends.
@@ -9668,7 +9669,14 @@ mod tests {
             // not just the host be idle: over a connection the frames of the
             // work that just finished can still be in flight (in process they
             // are already queued, so this converges at once).
-            if idle && tasks_done && !world.client().working() {
+            // An instantaneous turn can finish before any reply frame arrives.
+            // Initial idle flags alone do not prove delivery. The applied mark
+            // fences durable content, while lifecycle endings cover its tail.
+            if caught_up
+                && tasks_done
+                && !world.client().working()
+                && !world.client().lifecycle().is_running(AgentId::Main)
+            {
                 fold_ready_frames(world);
                 return;
             }
@@ -9711,14 +9719,17 @@ mod tests {
     /// Install a demo before its first turn when only its completed history
     /// matters. Tests observing in-flight work must keep explicit staging.
     fn install_unpaced_demo(world: &World, demo: &str) {
+        world.handles().run_config.lock().unwrap().main.provider = unpaced_demo(demo);
+    }
+
+    fn unpaced_demo(demo: &str) -> Arc<aj_models::scripted::ScriptedProvider> {
         let mut scripts = aj_models::scripted::demos::lookup(demo).expect("known demo");
         for script in &mut scripts {
             for step in &mut script.steps {
                 step.delay = Duration::ZERO;
             }
         }
-        world.handles().run_config.lock().unwrap().main.provider =
-            Arc::new(aj_models::scripted::ScriptedProvider::new(scripts));
+        Arc::new(aj_models::scripted::ScriptedProvider::new(scripts))
     }
 
     /// Point the focused session at a slowly streamed script, so a turn
@@ -11016,10 +11027,6 @@ mod tests {
     /// one, while a resume neither repeats its context nor the process-side
     /// warnings. The context opens the transcript in both cases, as the log's
     /// own record, and this process's rows land after it.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn session_switch_folds_complete_notice_block_for_fresh_only() {
         let dir = TempDir::new().expect("tempdir");
@@ -11029,6 +11036,7 @@ mod tests {
         let parity_warning = warning_event("session notice parity sentinel");
         world.process_notices.diagnostics.push(parity_warning);
         // Persist the session so the resume path below has a log on disk.
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let resumable = world.session().to_string();
         // Counted, not merely looked for: switching back restores the parked
@@ -11209,6 +11217,7 @@ mod tests {
     /// that need a session this process's host has never materialized.
     async fn released_disk_session(dir: &TempDir, tag: Option<&str>) -> String {
         let mut world = scripted_world_with_layers(dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         if let Some(tag) = tag {
             apply_tag_edit(
@@ -11244,10 +11253,6 @@ mod tests {
     /// The held session carries a tag, because the toast names the session
     /// the way the user knows it and the label has to come off the live
     /// directory to get there.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_locked_session_refuses_the_switch_in_a_toast() {
         let dir = TempDir::new().expect("tempdir");
@@ -11449,15 +11454,12 @@ mod tests {
     ///
     /// Counted rather than searched, so a confirmation folded under any
     /// wording fails here.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_switch_that_took_toasts_and_folds_into_neither_transcript() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let first = world.session().to_string();
 
@@ -11525,15 +11527,12 @@ mod tests {
     /// A create reports itself in a toast, and the session it left keeps the
     /// transcript it had. The created session's own startup notices still
     /// fold: those are facts about that session, not about the gesture.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_create_toasts_and_leaves_the_outgoing_transcript_alone() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let first = world.session().to_string();
         let left_before = main_entries(&world.chat.borrow());
@@ -12523,7 +12522,6 @@ mod tests {
         assert!(!app.handle_input(event).quit);
         assert!(shell.borrow().keymap.borrow().pending_sequence().is_some());
 
-        std::thread::sleep(std::time::Duration::from_millis(2));
         assert!(!app.fire_due_timers().quit);
         assert!(
             shell.borrow().keymap.borrow().pending_sequence().is_none(),
@@ -12860,14 +12858,11 @@ mod tests {
     /// storage error shows up as an error row, the client owes
     /// a re-attach at once, and the loop's ordinary rejoin lands on a fresh
     /// materialization of the same session, which then runs the next prompt.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_persistence_failure_re_attaches_a_fresh_materialization() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let failed_session = world.session().to_string();
         let failed_log = Arc::clone(&world.handles().log);
@@ -12915,7 +12910,7 @@ mod tests {
             !Arc::ptr_eq(&failed_log, &world.handles().log),
             "the rejoin reused the fused ConversationLog"
         );
-        install_busy_script(world.handles());
+        install_unpaced_demo(&world, "streaming-text");
         handle_submit(&mut world, "again".to_string()).await;
         settle(&mut world).await;
         assert!(
@@ -13917,16 +13912,13 @@ mod tests {
 
     /// Editor-focused busy Alt+Enter returns a scrolled transcript to the live
     /// tail after the host accepts the steering text.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn editor_focused_busy_alt_enter_follows_the_transcript_tail() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
 
+        install_unpaced_demo(&world, "streaming-text");
         handle_submit(&mut world, "earlier prompt".to_string()).await;
         settle(&mut world).await;
         for i in 0..40 {
@@ -13982,16 +13974,13 @@ mod tests {
 
     /// Alt+Enter is editor-local: with transcript focus, an idle draft is
     /// preserved and no host action or turn is produced.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn focused_idle_alt_enter_does_not_submit() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
 
+        install_unpaced_demo(&world, "streaming-text");
         handle_submit(&mut world, "earlier prompt".to_string()).await;
         settle(&mut world).await;
         for i in 0..40 {
@@ -14034,16 +14023,13 @@ mod tests {
 
     /// Alt+Enter is also inert outside the editor while a turn is busy, so it
     /// cannot consume the draft or mutate the steering queue.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn focused_busy_alt_enter_does_not_steer() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
 
+        install_unpaced_demo(&world, "streaming-text");
         handle_submit(&mut world, "earlier prompt".to_string()).await;
         settle(&mut world).await;
         for i in 0..40 {
@@ -17422,10 +17408,6 @@ mod tests {
 
     /// Full-log export is identical locally, over HTTP, and through the gateway,
     /// even when a host branch is absent from the client's attached transcript.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn export_html_parity_saves_the_full_host_log_on_the_client() {
         let Some(home) = isolated_test_home() else {
@@ -17433,6 +17415,7 @@ mod tests {
         };
         let dir = TempDir::new().expect("host dir");
         let (mut local_world, local_shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&local_world, "streaming-text");
         run_prompt(&mut local_world, "visible branch").await;
         let log = Arc::clone(&local_world.local.as_ref().unwrap().log);
         let head = log.lock().await.head().unwrap().to_string();
@@ -18496,14 +18479,11 @@ mod tests {
         assert_eq!(reattach(world, shell).await.unwrap(), CatchUp::Caught);
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn oracle_state_refreshes_after_a_backpressured_attach() {
         let dir = TempDir::new().unwrap();
         let mut world = scripted_world(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         drive_demo_to_completion(&mut world).await;
         let mut stream = world
             .host()
@@ -21391,10 +21371,6 @@ mod tests {
 
     // --- Branch flow (Phase 3) ---
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn branch_arming_editing_and_cancel_do_not_wait_for_the_host() {
         for connected in [false, true] {
@@ -21408,6 +21384,13 @@ mod tests {
                 Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
                 None => world_and_shell(&dir, "streaming-text").await,
             };
+            if let Some(remote) = &remote {
+                remote
+                    .install_unpaced_demo(world.session(), "streaming-text")
+                    .await;
+            } else {
+                install_unpaced_demo(&world, "streaming-text");
+            }
             run_prompt(&mut world, "original prompt").await;
             assert_eq!(reattach(&mut world, &shell).await.unwrap(), CatchUp::Caught);
             let host = remote
@@ -21528,10 +21511,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn branch_refusal_retains_edits_and_cancel_or_rearm_discards_only_the_draft() {
         let dir = TempDir::new().expect("tempdir");
@@ -21540,6 +21519,7 @@ mod tests {
         layers.project_path = Some(project_path.clone());
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", layers).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "original").await;
         let original = world.handles().run_config.lock().unwrap().settings();
         let (message, old_head) = {
@@ -21913,14 +21893,11 @@ mod tests {
     /// refused the same way: a toast, the anchor kept, the text restored, and
     /// no branch resolved. This is the case the removed two-step
     /// background-task confirm used to cover.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn background_task_submit_refused_toasts_keeps_anchor() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         assert!(!world.client().working(), "no turn in flight");
         let task = register_bash_task(&mut world, "sleep 100").await;
@@ -21951,10 +21928,6 @@ mod tests {
     /// a branch exit naming that message as the one to branch before, so the
     /// host moves the head to its parent, carrying the edited prompt. The
     /// anchor remains client-owned until the host accepts the switch.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn armed_submit_branches_before_the_anchored_message() {
         use aj_models::types::Message;
@@ -21963,6 +21936,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
 
         // The first user message on disk, plus its parent (a settings entry),
@@ -22335,15 +22309,12 @@ mod tests {
     /// The refusal is the host's: a mid-turn head switch would let the running
     /// turn persist onto the branch being left. The frontend surfaces the
     /// reason as the branch-failure notice.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn branch_switch_refused_while_busy_and_proceeds_when_idle() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let head = world
             .handles()
@@ -22419,15 +22390,12 @@ mod tests {
     /// `NewSession` command) are what keep a user from walking away from live
     /// work by accident. There is no recheck at the consumption site, because
     /// with nothing torn down there is nothing left to protect.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_switch_leaves_the_outgoing_sessions_work_running() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let outgoing = world.session().to_string();
         let task = register_bash_task(&mut world, "sleep 100").await;
@@ -22479,15 +22447,12 @@ mod tests {
     ///
     /// The state is staged straight on the host's handles, which publishes no
     /// frame, so the block's `caught_up` is the only thing that can carry it.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_backgrounded_session_takes_its_tables_from_caught_up() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "in the first session").await;
         let first = world.session().to_string();
         let moved = apply_focus_request(
@@ -22571,15 +22536,12 @@ mod tests {
     /// The cursor is what makes this observable: it advances only if that
     /// session's fold ran, and a switch that dropped the outgoing client the way
     /// a rebuild does would leave nothing there to advance.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_backgrounded_session_keeps_folding() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "in the first session").await;
         let first = world.session().to_string();
         let moved = apply_focus_request(
@@ -22702,15 +22664,12 @@ mod tests {
     /// Bounded explicitly, because the failure mode is a hang: without the
     /// timeout a regression here shows up as a test suite that never finishes
     /// rather than one that fails.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_swap_onto_an_attached_session_does_not_await_a_block() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let first = world.session().to_string();
 
@@ -22850,15 +22809,12 @@ mod tests {
     /// switching that session's head mints a fresh epoch, and until a re-attach
     /// is served its fold filters out every later frame, so a switch onto it
     /// would paint the branch the reset abandoned.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_background_session_reset_by_another_peer_recovers() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "on the first branch").await;
         let first = world.session().to_string();
         let head = world
@@ -23307,15 +23263,12 @@ mod tests {
     /// where it is, the failure notice names the reason, and the pending prompt
     /// is restored into the editor rather than run against a head that did not
     /// move.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_stale_head_keeps_the_session_and_restores_the_prompt() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let session = world.session().to_string();
 
@@ -23540,6 +23493,17 @@ mod tests {
     }
 
     impl RemoteHost {
+        /// Configure fixture content on the actual host before a session's
+        /// first inference, leaving all client operations on the HTTP path.
+        async fn install_unpaced_demo(&self, session: &str, demo: &str) {
+            let handles = self
+                .host
+                .local_handles(session)
+                .await
+                .expect("live session");
+            handles.run_config.lock().unwrap().main.provider = unpaced_demo(demo);
+        }
+
         async fn start(dir: &TempDir, demo: &str) -> RemoteHost {
             let args = Args::parse_from(["aj", "--scripted", demo]);
             Self::with_args(dir, args).await
@@ -23992,8 +23956,8 @@ mod tests {
         session: &str,
         wanted: impl Fn(&aj_wire::SessionSummary) -> bool,
     ) -> bool {
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        while Instant::now() < deadline {
+        let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+        while tokio::time::Instant::now() < deadline {
             fold_ready_frames(world);
             if world
                 .directory
@@ -24003,7 +23967,12 @@ mod tests {
             {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            match tokio::time::timeout_at(deadline, world.stream_mut().recv()).await {
+                Ok(ControlFrame::Frame(frame)) => {
+                    let _ = world.directory.apply(frame);
+                }
+                _ => return false,
+            }
         }
         false
     }
@@ -24017,8 +23986,8 @@ mod tests {
         session: &str,
         wanted: impl Fn(&SidebarRow) -> bool,
     ) -> bool {
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        while Instant::now() < deadline {
+        let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+        while tokio::time::Instant::now() < deadline {
             fold_ready_frames(world);
             sync_sidebar(world, shell);
             if shell
@@ -24031,7 +24000,12 @@ mod tests {
             {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            match tokio::time::timeout_at(deadline, world.stream_mut().recv()).await {
+                Ok(ControlFrame::Frame(frame)) => {
+                    let _ = world.directory.apply(frame);
+                }
+                _ => return false,
+            }
         }
         false
     }
@@ -24180,14 +24154,11 @@ mod tests {
     /// Two presses of the gesture leave the session as it started, however
     /// quickly they follow one another. The peer coalesces its rows on a tick,
     /// so a direction read from the last row alone would archive twice.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_second_press_undoes_the_first() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let home = world.session().to_string();
         assert!(
@@ -24456,14 +24427,11 @@ mod tests {
     /// The strip's reveal, every byte of it real: an archived row is out of
     /// the default view, the chord on the keyboard puts it back struck
     /// through, and the same chord takes it away again.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn the_reveal_chord_shows_the_archived_rows() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let home = world.session().to_string();
         let put_away = world
@@ -24476,10 +24444,12 @@ mod tests {
             .command(&put_away, Command::Archive { archived: true })
             .await
             .expect("archive the session nobody is in");
+        tokio::time::pause();
         assert!(
             poll_directory_row(&mut world, &put_away, |row| row.archived).await,
             "the peer never published the bit",
         );
+        tokio::time::resume();
         shell.borrow().sidebar.borrow_mut().toggled = true;
         shell.borrow().sidebar.borrow_mut().visible = true;
         sync_sidebar(&world, &shell);
@@ -24541,12 +24511,13 @@ mod tests {
     /// 6.8, 9.2).
     #[cfg_attr(
         not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
+        ignore = "slow: one-second directory publication window"
     )]
     #[tokio::test]
     async fn a_row_shows_what_its_session_is_doing() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let first = world.session().to_string();
 
@@ -24649,14 +24620,11 @@ mod tests {
     /// The three brightnesses need all three working-set states at once, which
     /// is what the visit-and-return is for: it leaves the second session
     /// attached in the background while the third is only listed.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn the_strip_paints_focus_and_the_working_set() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let focused = world.session().to_string();
         let background = world
@@ -24669,12 +24637,15 @@ mod tests {
             .create(None, None, None, None, None)
             .await
             .expect("a third session");
+        tokio::time::pause();
         for session in [&background, &listed] {
             assert!(
                 poll_row(&mut world, &shell, session, |_| true).await,
                 "{session} never appeared in the rows",
             );
         }
+
+        tokio::time::resume();
 
         let (mut app, _writer, _root) = app_over(&shell).await;
         for target in [background.clone(), focused.clone()] {
@@ -24926,15 +24897,12 @@ mod tests {
     /// Not merely "moves nowhere": running the switch body would fold a notice
     /// for a switch that did not happen, discard an armed branch anchor, and
     /// reset the scroll.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn resuming_the_focused_session_changes_nothing() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let session = world.session().to_string();
         let head = world
@@ -25112,10 +25080,6 @@ mod tests {
         shut_down(&world).await;
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn session_views_route_completions_through_the_selected_editor() {
         use vaxis::vxfw::{
@@ -25158,6 +25122,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let a = world.session().to_string();
         let view_a = shell.borrow().view();
@@ -25189,6 +25154,7 @@ mod tests {
         )
         .await;
         settle_pending_transition(&mut app, &shell, &mut world).await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let view_b = shell.borrow().view();
         view_b
@@ -25343,10 +25309,6 @@ mod tests {
         shut_down(&world).await;
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn session_views_keep_reading_position_until_the_model_is_evicted() {
         let dir = TempDir::new().expect("tempdir");
@@ -25355,6 +25317,7 @@ mod tests {
         let prompt = (0..80)
             .map(|i| format!("reading row {i:03}\n"))
             .collect::<String>();
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, &prompt).await;
         let a = world.session().to_string();
         shell
@@ -25487,10 +25450,6 @@ mod tests {
         shut_down(&world).await;
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn replacing_a_focused_model_returns_to_the_editor_before_paint_or_capture() {
         use aj_agent::message::AgentMessage;
@@ -25500,6 +25459,7 @@ mod tests {
             let dir = TempDir::new().expect("tempdir");
             let (mut world, shell, mut app, mut writer, root) =
                 world_shell_app(&dir, "streaming-text", default_layers()).await;
+            install_unpaced_demo(&world, "streaming-text");
             run_prompt(&mut world, "original prompt").await;
             sync_status(&world);
             let view = shell.borrow().view();
@@ -25629,10 +25589,6 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn branch_submission_leaves_scroll_back_for_the_new_response() {
         let dir = TempDir::new().expect("tempdir");
@@ -25641,6 +25597,7 @@ mod tests {
         let context = (0..80)
             .map(|i| format!("context row {i:03}\n"))
             .collect::<String>();
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, &context).await;
         run_prompt(&mut world, "branch here").await;
         let message = world
@@ -25771,7 +25728,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
+        ignore = "slow: repeated rendering through remote transcript replay"
     )]
     #[tokio::test]
     async fn passive_reattachment_keeps_live_reading_state_but_rebuilt_models_open_at_tail() {
@@ -25781,6 +25738,9 @@ mod tests {
         let prompt = (0..80)
             .map(|i| format!("reading row {i:03}\n"))
             .collect::<String>();
+        remote
+            .install_unpaced_demo(world.session(), "streaming-text")
+            .await;
         run_prompt(&mut world, &prompt).await;
         let session = world.session().to_string();
         let transcript = Rc::clone(&shell.borrow().view().transcript);
@@ -27271,10 +27231,6 @@ mod tests {
 
     // ---- Session environment ----
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn the_env_overlay_edits_adds_and_removes_through_the_drive_loop_locally_and_remotely() {
         for connected in [false, true] {
@@ -27288,6 +27244,13 @@ mod tests {
                 Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
                 None => world_and_shell(&dir, "streaming-text").await,
             };
+            if let Some(remote) = &remote {
+                remote
+                    .install_unpaced_demo(world.session(), "streaming-text")
+                    .await;
+            } else {
+                install_unpaced_demo(&world, "streaming-text");
+            }
             run_prompt(&mut world, "persist the session").await;
             let unchanged = " \tkeep\r\n\\\"界 ";
             for (key, value) in [("EDITED", "old"), ("REMOVE", "gone"), ("KEEP", unchanged)] {
@@ -27813,10 +27776,6 @@ mod tests {
     }
 
     /// The host's facts reach the drawn page through either remote route.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn connected_session_info_draws_the_hosts_facts_directly_and_through_gateway() {
         let dir = TempDir::new().expect("tempdir");
@@ -27837,6 +27796,9 @@ mod tests {
             .await
             .expect("create env-bearing host session");
         let (mut local_client, _) = connect_world_and_shell(&dir, &remote, &[&session]).await;
+        remote
+            .install_unpaced_demo(local_client.session(), "streaming-text")
+            .await;
         assert!(handle_submit(&mut local_client, "persist the host log".to_string()).await);
         settle(&mut local_client).await;
         drop(local_client);
@@ -27950,10 +27912,6 @@ mod tests {
 
     /// The selector's preview read asks for exactly the rows it opened with,
     /// which the directory already holds, so opening it lists nothing again.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn the_session_selector_previews_exactly_its_rows() {
         use axum::{Json, Router, extract::Query, http::Uri};
@@ -27963,6 +27921,7 @@ mod tests {
         create_disk_session(&dir, "beta session prompt").await;
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "current session prompt").await;
         refresh_browser_directory(&mut world).await;
         let shown: Vec<String> = world
@@ -28824,10 +28783,6 @@ mod tests {
     /// The connect-mode smoke test: a prompt submitted over the
     /// wire streams the host's answer into the transcript, and the footer
     /// shows the host's settings rather than this client's.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn connect_mode_prompt_streams_the_hosts_answer() {
         let dir = TempDir::new().expect("tempdir");
@@ -28849,6 +28804,9 @@ mod tests {
             "direct connect keeps taking its directory from the peer hello: {footer}",
         );
 
+        remote
+            .install_unpaced_demo(world.session(), "streaming-text")
+            .await;
         assert!(handle_submit(&mut world, "hello".to_string()).await);
         settle(&mut world).await;
 
@@ -28908,10 +28866,6 @@ mod tests {
     /// Session selection: an explicit id attaches it, `--new`
     /// creates, bare connect takes the host's latest, and a host with no
     /// sessions gets one created.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn connect_mode_resolves_the_session_to_attach() {
         let dir = TempDir::new().expect("tempdir");
@@ -28944,6 +28898,9 @@ mod tests {
         // Bare: the host's most recently modified session, which is the one
         // that just ran a turn.
         let mut working = connect_world(&dir, &remote, &[&first]).await;
+        remote
+            .install_unpaced_demo(working.session(), "streaming-text")
+            .await;
         assert!(handle_submit(&mut working, "wake the older one".to_string()).await);
         settle(&mut working).await;
         let latest = connect_world(&dir, &remote, &[]).await;
@@ -29604,16 +29561,15 @@ mod tests {
     /// comes out of its build catching up, and the first Caught puts the history
     /// on screen with the launch's own rows on top of it, saying nothing about a
     /// stream coming back.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_launch_lands_its_rows_on_top_of_the_replayed_history() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         // History on the host, written through a first client that then lets go.
         let (mut seed, _seed_shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        remote
+            .install_unpaced_demo(seed.session(), "streaming-text")
+            .await;
         run_prompt(&mut seed, "history before the launch").await;
         let session = seed.session().to_string();
         seed.stream.take();
@@ -31241,60 +31197,75 @@ mod tests {
 
     /// A locked refusal stays settled through release and disappearance/return
     /// updates, without retrying or repeating the notice while the loop runs.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: 15-second refusal observation window"
-    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_refusal_is_folded_once_however_long_the_client_waits() {
+    async fn a_locked_refusal_stays_settled_through_directory_updates() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         let session = world.session().to_string();
 
         let refusal = "another writer holds this session";
+        let returned_tag = "returned after refusal";
+        let returned = serde_json::to_string(&aj_wire::Frame::List {
+            sessions: vec![aj_wire::SessionSummary {
+                tag: Some(returned_tag.to_string()),
+                last_seq: Some(2),
+                ..listed_row(&session)
+            }],
+            hosts: Vec::new(),
+        })
+        .expect("the returned row");
         let script = vec![
             list_holding(&[(&session, true)]),
             refusal_frame(&session, "locked", refusal),
             list_holding_at(&[(&session, false)], 1),
             list_of(&[]),
-            list_holding_at(&[(&session, false)], 2),
+            returned,
         ];
         let peer = WarmPeer::start(script, Duration::from_millis(20)).await;
         redirect_to(&mut world, &peer, Duration::from_millis(400));
 
-        // Long enough that the old backoff would have asked many times over: it
-        // caps at RETRY_BACKOFF_MAX and ramps from RETRY_BACKOFF_MIN, so this
-        // window allowed a dozen attempts and a dozen rows.
-        let window = RETRY_BACKOFF_MAX * 3;
         let chat = Rc::clone(&world.chat);
+        let sidebar = Rc::clone(&shell.borrow().sidebar);
         let (exit, ()) = crate::remote::tests::bounded(
-            "the loop to run out its window",
+            "the loop to process every directory transition",
             drive_until(&mut world, &shell, |writer| async move {
                 let seen = settled(Duration::from_secs(8), || {
-                    notices_of(&chat.borrow())
+                    (notices_of(&chat.borrow())
                         .iter()
                         .any(|text| text == refusal)
-                        .then_some(())
+                        && sidebar
+                            .borrow()
+                            .rows
+                            .iter()
+                            .any(|row| row.tag.as_deref() == Some(returned_tag)))
+                    .then_some(())
                 })
                 .await;
                 assert!(
                     seen.is_some(),
-                    "the refusal never landed, so nothing here measures how often \
-                     it lands",
+                    "the refusal and final directory transition never reached the UI",
                 );
-                tokio::time::sleep(window).await;
                 drop(writer);
             }),
         )
         .await;
 
         assert!(matches!(exit, Ok(SessionExit::Quit)));
+        // `drive` returns its unfinished recovery to World. No continuation
+        // and no directory obligation means there is no retry left to wake
+        // after this invocation, regardless of how much idle time passes.
+        assert!(
+            world.resume.is_none(),
+            "a refusal must not leave a pending retry"
+        );
+        assert!(!world.directory.needs_reattach());
+        assert_eq!(world.connection, Connection::Refused);
         let rows = notices_of(&world.chat.borrow());
         assert_eq!(
             rows.iter().filter(|text| *text == refusal).count(),
             1,
-            "the peer's refusal was folded {} times over {window:?}: {rows:?}",
+            "the peer's refusal was folded {} times across directory updates: {rows:?}",
             rows.iter().filter(|text| *text == refusal).count(),
         );
         assert_eq!(
@@ -31994,10 +31965,6 @@ mod tests {
     /// Creating and switching sessions work over a connection, which is what the
     /// sidebar drives. Both go through the control surface, so the
     /// session they land on attaches the same way it would in process.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn connect_mode_creates_and_switches_sessions() {
         let dir = TempDir::new().expect("tempdir");
@@ -32037,6 +32004,9 @@ mod tests {
         );
 
         // Work in it, so switching back has something to come back to.
+        remote
+            .install_unpaced_demo(world.session(), "streaming-text")
+            .await;
         assert!(handle_submit(&mut world, "over the wire".to_string()).await);
         settle(&mut world).await;
         assert_eq!(
@@ -32338,10 +32308,6 @@ mod tests {
     /// has to happen before the terminal is taken, so an unreadable `@file`
     /// reports on the normal screen, which leaves the submit a second statement
     /// no test below the drive loop can reach.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_created_session_submits_the_launch_turn_its_argv_carried() {
         let dir = TempDir::new().expect("tempdir");
@@ -32355,6 +32321,9 @@ mod tests {
             "the argv carried no launch turn, so submitting it proves nothing",
         );
 
+        remote
+            .install_unpaced_demo(world.session(), "streaming-text")
+            .await;
         submit_launch(&mut world, launch).await;
         fold_ready_frames(&mut world);
         settle(&mut world).await;
@@ -33080,15 +33049,12 @@ mod tests {
     /// Without the head the overlay falls back to its default cursor, and
     /// confirming that row parks a real branch request, so the user switches
     /// to the branch they were already on.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn the_tree_overlay_opens_on_the_head_the_read_carries() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, _app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         assert!(handle_submit(&mut world, "first".to_string()).await);
         settle(&mut world).await;
 
@@ -33110,16 +33076,15 @@ mod tests {
     /// The tree view and the branch gesture work over a connection: the tree
     /// read carries the head the overlay pre-selects, and the branch anchor
     /// travels as a `before` target the host resolves to the message's parent.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn connect_mode_browses_the_tree_and_branches() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
 
+        remote
+            .install_unpaced_demo(world.session(), "streaming-text")
+            .await;
         assert!(handle_submit(&mut world, "first".to_string()).await);
         settle(&mut world).await;
 

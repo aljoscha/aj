@@ -403,6 +403,14 @@ impl SessionClient {
         })
     }
 
+    /// Highest durable position folded by this client, for fixture settlement.
+    /// This is not a reconnect cursor: trailing transient events may still be
+    /// outstanding, so tests must also observe the relevant lifecycle endings.
+    #[cfg(feature = "test-support")]
+    pub fn applied_seq_for_test(&self) -> Option<u64> {
+        self.applied
+    }
+
     /// Whether the attach block arriving is rebuilding the projection from
     /// nothing rather than extending a committed one.
     ///

@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use serial_test::serial;
 use vaxis::Winsize;
+use vaxis::key::Key;
 use vaxis::screen::Screen;
-use vaxis::widgets::terminal::{Event, Options, Terminal};
+use vaxis::widgets::terminal::{Event, InputEvent, Options, Terminal};
 use vaxis::window::Window;
 
 /// Overall timeout for a poll loop. Generous, since we exit early on success.
@@ -152,37 +153,67 @@ fn osc_sets_window_title() {
 
 #[test]
 #[serial]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: real PTY resize staging delay"
-)]
 fn resize_updates_child_reported_size() {
-    // The child sleeps briefly so we can resize before it reads its size, then
-    // prints the current PTY size which the resize should have changed.
-    let Some(mut term) = try_new(&["sh", "-c", "sleep 0.5; stty size"], Options::default()) else {
+    // The child cannot inspect the size until terminal input releases its read.
+    let Some(mut term) = try_new(
+        &[
+            "sh",
+            "-c",
+            "stty -echo; printf 'waiting\\n'; read -r gate && printf 'released\\n' && stty size",
+        ],
+        Options::default(),
+    ) else {
         return;
     };
     if !try_spawn(&mut term) {
         return;
     }
 
-    term.resize(winsize(100, 40)).expect("resize");
-
     let screen = make_screen(100, 40);
     let win = make_window(&screen, 100, 40);
 
+    let start = Instant::now();
+    loop {
+        while term.try_event().is_some() {}
+        term.draw(&win);
+        if row_text(&win, 0).trim_end() == "waiting" {
+            break;
+        }
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "child did not reach the read gate"
+        );
+        thread::sleep(POLL);
+    }
+    assert!(
+        row_text(&win, 1).trim().is_empty(),
+        "child is held at the gate"
+    );
+    term.resize(winsize(100, 40)).expect("resize");
+    term.update(InputEvent::KeyPress(Key {
+        codepoint: Key::ENTER,
+        ..Key::default()
+    }))
+    .expect("release child through terminal input");
+
+    let mut saw_release = false;
     let mut saw_size = false;
     let start = Instant::now();
     while start.elapsed() < TIMEOUT {
         while term.try_event().is_some() {}
         term.draw(&win);
-        if row_text(&win, 0).contains("40 100") {
-            saw_size = true;
+        for row in 0..win.height {
+            let text = row_text(&win, row);
+            saw_release |= text.trim_end() == "released";
+            saw_size |= text.trim_end() == "40 100";
+        }
+        if saw_release && saw_size {
             break;
         }
         thread::sleep(POLL);
     }
 
+    assert!(saw_release, "child did not acknowledge the gate release");
     assert!(
         saw_size,
         "expected the child to report the resized 40x100 size"
