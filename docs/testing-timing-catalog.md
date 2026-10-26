@@ -1,5 +1,75 @@
 # Test timing catalog
 
+## What rustdoc processes, and the remaining CPU hotspot
+
+There are two active Rust documentation examples in the workspace:
+
+- `aj-app/src/cli/args.rs`: a `compile_fail` check that `Args` does not expose
+  the unsupported `clap::Parser` construction boundary.
+- `vaxis/src/fuzzy.rs`: a runnable fuzzy-filter example.
+
+The examples in `vaxis/src/vxfw/{async_app,keymap}.rs` are ignored. Fences
+marked `toml`, `sh` or `text` are not Rust doctests.
+
+Rustdoc still processes each library to discover examples. A clean
+`cargo test --workspace --doc` took **3.130 s**, while the same command with
+`-- --list` took **3.030 s**. List mode skips test execution but still compiles
+the merged doctest harness, reported at about **0.29 s**. The overhead is
+mostly crate processing, not the two examples. Separate
+`-Ztime-passes` diagnostics attributed about **1.36 s** of the list-mode pass
+to macro expansion and **0.29 s** to name resolution across the twelve crates.
+These phases include generated code such as derives. The diagnostic run itself
+was slower because it emitted thousands of timing records, so its overall
+elapsed time is not a clean benchmark. Nested compiler phase times must not be
+added together. Example compilation is not the main cost here.
+
+A GNU gprofng CPU sample of the default `aj` test binary at `db1ee691`, using
+10 ms sampling without rebuilding optimized application code, passed all
+1,233 active tests in 7.23 s. Of **31.04 sampled CPU-seconds**, HTTP client
+construction accounted for **17.81 s**, native certificate loading for
+**17.50 s**, and PEM parsing for **15.41 s**. Those inclusive costs overlap.
+This identifies system trust-store decoding, especially public-certificate
+base64 and line scanning, rather than UI rendering as the largest remaining
+CPU target. Sampling excludes descendant processes and is an estimate, not
+an exact accounting of every thread's work.
+
+### Optimize the measured dependency, not test coverage
+
+The development profile compiles only `rustls-pki-types` at `opt-level = 3`.
+Cargo's emitted artifact profiles confirm that debug assertions, overflow
+checks and line-table debug information remain enabled. Application code
+remains at optimization level zero. The test profile inherits this override,
+while release settings are unchanged. Native certificate sources, parsing,
+verification, proxy behavior and HTTP transport ownership are unchanged.
+
+With compilation separate, paired default workspace runs took **14.958 and
+15.202 s** without the override. With it they took **15.119 and 12.136 s**.
+The first optimized run had extra time outside reported test execution.
+The `aj` binary improved from **6.893–7.045 s to 5.081–5.105 s**, and summed
+suite execution fell from 11.570–11.740 s to 8.614–9.036 s. Whole-command
+user-plus-system CPU fell from **59.197–59.950 s to 39.290–41.094 s**.
+All four runs passed the same 4,083 tests, including doctests, and the scratch
+guard. No tests or assertions were removed.
+
+Switching profiles triggered a **63 s one-time dependency/downstream rebuild**
+on this machine. That is not the recurring warm-run cost or a measurement of
+the dependency's isolated compilation overhead. Optimized dependency code is
+less convenient to step through in a debugger. Application debugging settings
+are preserved, and dependency optimization can be overridden per invocation:
+
+```sh
+cargo --config 'profile.dev.package.rustls-pki-types.opt-level=0' test -p aj
+```
+
+Independent review approved the change. Final runs through the repository
+profile passed **4,083 default tests**, with 191 ignored, and **4,265
+slow-inclusive tests**, with nine ignored. Warm default wall time repeated at
+**12.137 s**, with **38.908 CPU-seconds**. Its first run took 16.286 s, largely
+because of overhead outside reported test execution. Slow-inclusive took
+50.736 s. Formatting, all-target Clippy/build, dependency guards and the
+scratch-guard regressions passed. No profiling instrumentation is retained in
+the source tree.
+
 ## Runner overhead and nextest evaluation
 
 At `b0655a6c`, timestamped Cargo, test-runner and rustdoc wrappers separated
