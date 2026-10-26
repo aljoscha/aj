@@ -477,7 +477,10 @@ impl Fixture {
             GatewayServer::bind(gateway.clone(), addr("127.0.0.1:0"), IdentityGate::local())
                 .await
                 .expect("bind a loopback gateway port");
-        let client = RemoteClient::new(&server.url()).expect("client");
+        // Raw probes and typed requests share a fixture-local control transport.
+        // Gateway restarts still construct fresh pools on both sides.
+        let http = RemoteClient::http_transport().expect("client transport");
+        let client = RemoteClient::with_http(&server.url(), http.clone()).expect("client");
         Self {
             state,
             static_hosts,
@@ -485,7 +488,7 @@ impl Fixture {
             gateway,
             server,
             client,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 

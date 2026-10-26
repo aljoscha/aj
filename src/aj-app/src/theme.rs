@@ -49,6 +49,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -58,7 +59,7 @@ use aj_models::ThinkingConfig;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Bundled "dark" palette JSON. The safe fallback: loads when an
 /// explicitly-named theme fails to parse so the binary always comes
@@ -968,41 +969,12 @@ pub(crate) fn watch_user_theme_in_dir(
     // Channel feeding from notify's callback to our debouncer
     // task. We don't care about the event payload; one zero-sized
     // ping is enough to schedule a reload.
-    let (notify_tx, mut notify_rx) = unbounded_channel::<()>();
+    let (notify_tx, notify_rx) = unbounded_channel::<()>();
     // The notify callback may fire on a non-tokio thread (e.g.
     // the inotify reader thread); we filter event paths there to
     // keep the ping channel low-volume.
-    let filename_for_cb = filename.clone();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let event = match res {
-            Ok(event) => event,
-            Err(err) => {
-                tracing::debug!("theme watcher reported error: {err}");
-                return;
-            }
-        };
-        // Only react to data-changing events. Access-time
-        // updates and metadata-only flips don't change the
-        // file contents.
-        if !matches!(
-            event.kind,
-            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-        ) {
-            return;
-        }
-        // Filter to events that touch our specific theme
-        // file. Some platforms emit events without paths;
-        // when that happens we still ping so the debouncer
-        // can decide based on the file's current state.
-        let mentions_us = event.paths.is_empty()
-            || event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(filename_for_cb.as_os_str()));
-        if !mentions_us {
-            return;
-        }
-        let _ = notify_tx.send(());
+    let mut watcher = notify::recommended_watcher(move |res| {
+        handle_theme_event(res, &filename, &notify_tx);
     })
     .ok()?;
     watcher
@@ -1014,56 +986,88 @@ pub(crate) fn watch_user_theme_in_dir(
         .ok()?;
 
     let (theme_tx, theme_rx) = unbounded_channel::<Theme>();
-    let path_for_task = path.clone();
     let mode = ColorMode::detect();
-    tokio::spawn(async move {
-        loop {
-            // Block until the first event arrives.
-            if notify_rx.recv().await.is_none() {
-                // Watcher dropped; the caller is winding down.
-                break;
-            }
-            // Coalesce: sleep the debounce window, then drain
-            // anything that arrived during it. This collapses
-            // editor write bursts into one re-parse.
-            tokio::time::sleep(WATCHER_DEBOUNCE).await;
-            while notify_rx.try_recv().is_ok() {}
-
-            // Quiet period elapsed; attempt the reload. We
-            // tolerate transient ENOENT (editors momentarily
-            // unlink before atomic-rename) and parse failures
-            // (the user is mid-edit) by skipping this iteration
-            // and waiting for the next event.
-            let content = match fs::read_to_string(&path_for_task) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::debug!(
-                        "theme watcher: read failed for {}: {err}",
-                        path_for_task.display()
-                    );
-                    continue;
-                }
-            };
-            let label = path_for_task.display().to_string();
-            match Theme::from_json_with_mode(&label, &content, mode) {
-                Ok(theme) => {
-                    if theme_tx.send(theme).is_err() {
-                        // Receiver dropped; the interactive mode
-                        // has shut down.
-                        break;
-                    }
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        "theme watcher: parse failed for {}: {err}",
-                        path_for_task.display()
-                    );
-                }
-            }
-        }
-    });
+    tokio::spawn(reload_user_theme(path, mode, notify_rx, theme_tx));
 
     Some((ThemeWatcherGuard { _watcher: watcher }, theme_rx))
+}
+
+fn handle_theme_event(
+    res: notify::Result<notify::Event>,
+    filename: &OsStr,
+    notify_tx: &UnboundedSender<()>,
+) {
+    let event = match res {
+        Ok(event) => event,
+        Err(err) => {
+            tracing::debug!("theme watcher reported error: {err}");
+            return;
+        }
+    };
+    // Reading the theme can itself generate access events. Those must not
+    // schedule another reload.
+    if !matches!(
+        event.kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    ) {
+        return;
+    }
+    // Filter to events that touch our specific theme
+    // file. Some platforms emit events without paths;
+    // when that happens we still ping so the debouncer
+    // can decide based on the file's current state.
+    let mentions_us =
+        event.paths.is_empty() || event.paths.iter().any(|p| p.file_name() == Some(filename));
+    if !mentions_us {
+        return;
+    }
+    let _ = notify_tx.send(());
+}
+
+async fn reload_user_theme(
+    path: PathBuf,
+    mode: ColorMode,
+    mut notify_rx: UnboundedReceiver<()>,
+    theme_tx: UnboundedSender<Theme>,
+) {
+    loop {
+        // Block until the first event arrives.
+        if notify_rx.recv().await.is_none() {
+            // Watcher dropped; the caller is winding down.
+            break;
+        }
+        // Coalesce: sleep the debounce window, then drain
+        // anything that arrived during it. This collapses
+        // editor write bursts into one re-parse.
+        tokio::time::sleep(WATCHER_DEBOUNCE).await;
+        while notify_rx.try_recv().is_ok() {}
+
+        // The debounce window elapsed. Attempt the reload. We
+        // tolerate transient ENOENT (editors momentarily
+        // unlink before atomic-rename) and parse failures
+        // (the user is mid-edit) by skipping this iteration
+        // and waiting for the next event.
+        let content = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::debug!("theme watcher: read failed for {}: {err}", path.display());
+                continue;
+            }
+        };
+        let label = path.display().to_string();
+        match Theme::from_json_with_mode(&label, &content, mode) {
+            Ok(theme) => {
+                if theme_tx.send(theme).is_err() {
+                    // Receiver dropped; the interactive mode
+                    // has shut down.
+                    break;
+                }
+            }
+            Err(err) => {
+                tracing::debug!("theme watcher: parse failed for {}: {err}", path.display());
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1072,6 +1076,9 @@ pub(crate) fn watch_user_theme_in_dir(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
     use super::*;
 
     #[test]
@@ -1342,67 +1349,127 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn watch_user_theme_ignores_unrelated_files_in_same_dir() {
-        // The watcher targets the directory, so unrelated files in
-        // it (themes the user is editing for a *different*
-        // session, log files, etc.) shouldn't trigger reloads.
+    #[tokio::test(start_paused = true)]
+    async fn theme_events_ignore_unrelated_files() {
         let dir = tempfile::tempdir().expect("tempdir created");
         let our_path = dir.path().join("ours.json");
         let other_path = dir.path().join("other.json");
         std::fs::write(&our_path, minimal_theme_json("ours", "#112233")).expect("write ours");
-
-        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "ours")
-            .expect("watcher should start when the file exists");
-
-        // Write a *different* file. The watcher's filename filter
-        // should drop this event.
         std::fs::write(&other_path, minimal_theme_json("other", "#445566")).expect("write other");
 
-        // Wait through the debounce window plus a generous margin
-        // for fs-event delivery, then assert no theme arrived. A
-        // false positive here (a stray event) would surface as a
-        // received message — which is exactly what we want to
-        // catch.
-        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
-        assert!(
-            result.is_err(),
-            "watcher fired for an unrelated filename: {:?}",
-            result
+        let (notify_tx, notify_rx) = unbounded_channel();
+        let (theme_tx, mut rx) = unbounded_channel();
+        let mut worker = std::pin::pin!(reload_user_theme(
+            our_path.clone(),
+            ColorMode::Color256,
+            notify_rx,
+            theme_tx,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // Controlled events exercise the production callback and worker,
+        // not OS delivery. Poll first to arm any accepted event's timer.
+        // Sleeping under paused time lets the timer driver dispatch it
+        // before the next explicit worker poll.
+        handle_theme_event(
+            Ok(
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(other_path),
+            ),
+            our_path.file_name().unwrap(),
+            &notify_tx,
         );
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        tokio::time::sleep(WATCHER_DEBOUNCE).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty
+        );
+
+        // A matching event must traverse the same live pipeline and load
+        // our file, rather than the unrelated file or a bundled palette.
+        handle_theme_event(
+            Ok(
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(our_path.clone()),
+            ),
+            our_path.file_name().unwrap(),
+            &notify_tx,
+        );
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty
+        );
+        tokio::time::sleep(WATCHER_DEBOUNCE).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        let theme = rx.try_recv().expect("matching event delivered a theme");
+        assert_eq!(theme.name(), "ours");
+        assert_eq!(
+            theme.fg_color(ThemeColor::Accent),
+            ThemeRgb::Rgb(0x11, 0x22, 0x33)
+        );
+        assert_eq!(theme.fg_color(ThemeColor::Text), ThemeRgb::Default);
+        assert_eq!(theme.color_mode(), ColorMode::Color256);
     }
 
-    #[tokio::test]
-    async fn watch_user_theme_swallows_parse_errors_silently() {
-        // A mid-edit save can momentarily produce invalid JSON.
-        // The watcher should *not* propagate the error; it should
-        // wait for the next write that produces a parseable
-        // document.
+    #[tokio::test(start_paused = true)]
+    async fn theme_events_recover_after_invalid_json() {
         let dir = tempfile::tempdir().expect("tempdir created");
         let path = dir.path().join("partial.json");
-        std::fs::write(&path, minimal_theme_json("partial", "#000000")).expect("write seed");
+        std::fs::write(&path, minimal_theme_json("partial", "#112233")).expect("write seed");
 
-        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "partial")
-            .expect("watcher should start when the file exists");
+        let (notify_tx, notify_rx) = unbounded_channel();
+        let (theme_tx, mut rx) = unbounded_channel();
+        let mut worker = std::pin::pin!(reload_user_theme(
+            path.clone(),
+            ColorMode::Truecolor,
+            notify_rx,
+            theme_tx,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(path.clone());
 
-        // First write: invalid JSON. The watcher should re-read,
-        // fail to parse, and discard silently.
-        std::fs::write(&path, "{ this is not valid json").expect("write invalid");
-        // Give the debouncer time to fire and drop the bad event.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // Channel must still be empty.
-        assert!(
-            rx.try_recv().is_err(),
-            "watcher must not surface a parse error as a Theme"
+        // Establish that matching events produce a parsed palette before
+        // checking the invalid-file case.
+        handle_theme_event(Ok(event.clone()), path.file_name().unwrap(), &notify_tx);
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        tokio::time::sleep(WATCHER_DEBOUNCE).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        let initial = rx.try_recv().expect("initial event delivered a theme");
+        assert_eq!(
+            initial.fg_color(ThemeColor::Accent),
+            ThemeRgb::Rgb(0x11, 0x22, 0x33)
         );
 
-        // Second write: valid again. Now we expect a delivery.
+        std::fs::write(&path, "{ this is not valid json").expect("write invalid");
+        handle_theme_event(Ok(event.clone()), path.file_name().unwrap(), &notify_tx);
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        tokio::time::sleep(WATCHER_DEBOUNCE).await;
+        // With the timer elapsed, this poll runs the synchronous read and
+        // parse through to the next receive. Keep the invalid file in
+        // place until then so recovery cannot mask an unprocessed reload.
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty
+        );
+
         std::fs::write(&path, minimal_theme_json("partial", "#abcdef")).expect("write valid");
-        let recovered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("watcher recovered within 5s")
-            .expect("channel was open");
+        handle_theme_event(Ok(event), path.file_name().unwrap(), &notify_tx);
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        tokio::time::sleep(WATCHER_DEBOUNCE).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        let recovered = rx
+            .try_recv()
+            .expect("valid event delivered a recovered theme");
         assert_eq!(recovered.name(), "partial");
+        assert_eq!(
+            recovered.fg_color(ThemeColor::Accent),
+            ThemeRgb::Rgb(0xab, 0xcd, 0xef)
+        );
     }
 
     /// Each thinking level (and "off") routes to its dedicated
