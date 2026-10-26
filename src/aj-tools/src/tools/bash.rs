@@ -4018,7 +4018,7 @@ esac
             .execute(
                 &mut ctx,
                 BashInput {
-                    command: "echo hi; sleep 0.3; echo bye".to_string(),
+                    command: "echo hi; echo bye".to_string(),
                     timeout: 30,
                     description: "test progress".to_string(),
                     run_in_background: false,
@@ -4043,7 +4043,7 @@ esac
                     stderr_truncation,
                     ..
                 } => {
-                    assert_eq!(command, "echo hi; sleep 0.3; echo bye");
+                    assert_eq!(command, "echo hi; echo bye");
                     assert!(exit_code.is_none(), "partial should not carry exit_code");
                     assert!(
                         full_output_path.is_none(),

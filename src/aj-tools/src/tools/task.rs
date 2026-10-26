@@ -404,11 +404,12 @@ fn error_outcome(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use aj_agent::TaskRegistry;
-    use aj_agent::tool::TaskId;
+    use aj_agent::tool::{TaskId, TaskOutputSource, TaskRead};
+    use tokio_util::sync::CancellationToken;
 
     use aj_models::types::UserContent;
 
@@ -476,11 +477,39 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    fn spill_contains(registry: &TaskRegistry, id: TaskId, needle: &str) -> bool {
-        let Some((_, read)) = registry.read(id) else {
-            return false;
-        };
-        read.stdout_tail.contains(needle)
+    #[derive(Default)]
+    struct ControlledOutput(Mutex<TaskRead>);
+
+    impl TaskOutputSource for ControlledOutput {
+        fn snapshot(&self) -> TaskRead {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl ControlledOutput {
+        fn append(&self, stdout: &str) {
+            let mut read = self.0.lock().unwrap();
+            read.stdout_tail.push_str(stdout);
+            read.stdout_total_bytes += u64::try_from(stdout.len()).unwrap();
+        }
+    }
+
+    // The test owns output publication and terminal transitions. No detached
+    // driver or shell scheduling is needed to exercise the task_output contract.
+    fn controlled_task(
+        ctx: &DummyToolContext,
+    ) -> (TaskId, Arc<ControlledOutput>, CancellationToken) {
+        let output = Arc::new(ControlledOutput::default());
+        let (id, cancel) = ctx.task_registry().register_unowned_for_test(
+            ctx.agent_id(),
+            "controlled-task".into(),
+            TaskKind::Bash {
+                command: "controlled output".into(),
+            },
+            "controlled output".into(),
+            Arc::<ControlledOutput>::clone(&output),
+        );
+        (id, output, cancel)
     }
 
     /// Reads are stateless: two reads of a running task return
@@ -489,26 +518,29 @@ mod tests {
     #[tokio::test]
     async fn stateless_reads_return_overlapping_tails() {
         let mut ctx = DummyToolContext::default();
-        let (id, spill) =
-            start_background(&mut ctx, "echo one; sleep 0.2; echo two; sleep 30").await;
-        let registry = ctx.task_registry();
-
-        wait_for(|| spill_contains(&registry, id, "one"), "first line").await;
+        let (id, output, _) = controlled_task(&ctx);
+        output.append("one\n");
         let first = read_task(&mut ctx, id, false, 30).await;
         assert!(!first.is_error);
         let first_wire = extract_text(&first.content);
         assert!(first_wire.contains("still running"), "wire: {first_wire:?}");
         assert!(first_wire.contains("one"), "wire: {first_wire:?}");
 
-        wait_for(|| spill_contains(&registry, id, "two"), "second line").await;
+        assert!(!first_wire.contains("two"), "wire: {first_wire:?}");
+        output.append("two\n");
         let second = read_task(&mut ctx, id, false, 30).await;
+        assert!(!second.is_error);
         let second_wire = extract_text(&second.content);
+        assert!(
+            second_wire.contains("still running"),
+            "wire: {second_wire:?}"
+        );
         // Overlap: the second read repeats the first read's content.
         assert!(second_wire.contains("one"), "wire: {second_wire:?}");
         assert!(second_wire.contains("two"), "wire: {second_wire:?}");
 
-        registry.kill(id);
-        std::fs::remove_file(spill).ok();
+        ctx.task_registry()
+            .set_status(id, TaskStatus::Exited(Some(0)));
     }
 
     /// A blocking read resolves when the task exits, reporting the
@@ -516,9 +548,20 @@ mod tests {
     #[tokio::test]
     async fn block_resolves_on_terminal_status() {
         let mut ctx = DummyToolContext::default();
-        let (id, spill) = start_background(&mut ctx, "sleep 0.2; echo done; exit 3").await;
+        let (id, output, _) = controlled_task(&ctx);
+        let spill_file = tempfile::NamedTempFile::new().unwrap();
+        let spill = spill_file.path().to_path_buf();
+        output.0.lock().unwrap().spill_path = Some(spill.clone());
+        let registry = ctx.task_registry();
+        let read = read_task(&mut ctx, id, true, 30);
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
 
-        let outcome = read_task(&mut ctx, id, true, 30).await;
+        output.append("done\n");
+        registry.set_status(id, TaskStatus::Exited(Some(3)));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("terminal status must resolve the pending read");
         assert!(!outcome.is_error);
         let wire = extract_text(&outcome.content);
         assert!(wire.contains("exit code 3"), "wire: {wire:?}");
@@ -531,27 +574,35 @@ mod tests {
             ToolDetails::Bash {
                 exit_code: Some(3),
                 task_id: Some(tid),
-                full_output_path: Some(_),
+                full_output_path: Some(path),
+                stdout,
                 ..
-            } => assert_eq!(*tid, id),
+            } => {
+                assert_eq!(*tid, id);
+                assert_eq!(path, &spill);
+                assert_eq!(stdout, "done\n");
+            }
             other => panic!("expected terminal Bash details, got {other:?}"),
         }
-
-        std::fs::remove_file(spill).ok();
     }
 
     /// Hitting the blocking timeout is a normal "still running"
     /// report, not an error.
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for the 1s blocking read timeout"
-    )]
+    #[tokio::test(start_paused = true)]
     async fn block_timeout_is_not_an_error() {
         let mut ctx = DummyToolContext::default();
-        let (id, spill) = start_background(&mut ctx, "sleep 30").await;
-
-        let outcome = read_task(&mut ctx, id, true, 1).await;
+        let (id, output, cancel) = controlled_task(&ctx);
+        let registry = ctx.task_registry();
+        let read = read_task(&mut ctx, id, true, 1);
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(futures::poll!(&mut read).is_pending());
+        output.append("progress\n");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let std::task::Poll::Ready(outcome) = futures::poll!(&mut read) else {
+            panic!("the read must resolve at its timeout");
+        };
         assert!(!outcome.is_error, "timeout must not be an error");
         let wire = extract_text(&outcome.content);
         assert!(wire.contains("still running"), "wire: {wire:?}");
@@ -563,9 +614,10 @@ mod tests {
             } => assert_eq!(*tid, id),
             other => panic!("expected running Bash details, got {other:?}"),
         }
-
-        ctx.task_registry().kill(id);
-        std::fs::remove_file(spill).ok();
+        assert!(wire.contains("progress"), "wire: {wire:?}");
+        assert_eq!(registry.status(id), Some(TaskStatus::Running));
+        assert!(!cancel.is_cancelled(), "timeout must not cancel the task");
+        registry.set_status(id, TaskStatus::Exited(Some(0)));
     }
 
     /// Cancelling the turn cancels the blocking wait, not the task:
@@ -573,28 +625,27 @@ mod tests {
     #[tokio::test]
     async fn turn_cancel_cancels_the_wait_not_the_task() {
         let mut ctx = DummyToolContext::default();
-        let (id, spill) = start_background(&mut ctx, "sleep 30").await;
-
+        let (id, _, cancel) = controlled_task(&ctx);
+        let registry = ctx.task_registry();
         let token = ctx.cancellation.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            token.cancel();
-        });
+        let read = read_task(&mut ctx, id, true, 30);
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
 
-        let start = Instant::now();
-        let _outcome = read_task(&mut ctx, id, true, 30).await;
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "cancel should resolve the wait promptly"
-        );
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("cancel should resolve the wait promptly");
+        assert!(!outcome.is_error);
+        let wire = extract_text(&outcome.content);
+        assert!(wire.contains("still running"), "wire: {wire:?}");
         assert_eq!(
-            ctx.task_registry().status(id),
+            registry.status(id),
             Some(TaskStatus::Running),
             "the task itself must keep running"
         );
-
-        ctx.task_registry().kill(id);
-        std::fs::remove_file(spill).ok();
+        assert!(!cancel.is_cancelled(), "the task token must stay live");
+        registry.set_status(id, TaskStatus::Exited(Some(0)));
     }
 
     /// Tails larger than the bash budgets pick up the standard

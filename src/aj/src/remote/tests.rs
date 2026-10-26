@@ -690,16 +690,134 @@ fn sub_agent_turn() -> Vec<AssistantMessage> {
     ]
 }
 
-/// A turn that puts a sub-agent and a foreground tool in flight at the same
-/// time: one message spawning a background sub-agent and running a bash
-/// command that sleeps for `sleep_seconds`.
-///
-/// The two run concurrently, which is what lets a test choose which of them a
-/// re-attach lands on. `report` is what the sub streams back, and its length is
-/// how long the sub's run takes, one character every 20ms under
-/// [`cut_provider`]. The command decides how long the parent stays blocked
-/// afterwards, and while it is blocked nothing durable is appended.
-fn running_tool_and_sub_turn(report: &str, sleep_seconds: u32) -> Vec<AssistantMessage> {
+/// A real Bash process blocks in its builtin `read` until the test releases
+/// it. Accepting its connection proves the process reached the gate, rather
+/// than merely having a tool-start event queued. Dropping the gate closes its
+/// sockets and unblocks the process on failure too, without a helper process
+/// or scratch file.
+/// Requires Bash's network redirections, available in the standard CI Bash.
+struct BashGate {
+    listener: tokio::net::TcpListener,
+    process: Option<tokio::net::TcpStream>,
+}
+
+impl BashGate {
+    async fn new() -> Self {
+        Self {
+            listener: tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+                .await
+                .expect("bind the Bash gate"),
+            process: None,
+        }
+    }
+
+    fn command(&self) -> String {
+        let port = self.listener.local_addr().expect("gate address").port();
+        format!("IFS= read -r release < /dev/tcp/127.0.0.1/{port}")
+    }
+
+    async fn wait_until_blocked(&mut self) {
+        let (process, _) = bounded("Bash to reach its gate", self.listener.accept())
+            .await
+            .expect("accept the Bash process");
+        self.process = Some(process);
+    }
+
+    async fn release(mut self) {
+        use tokio::io::AsyncWriteExt;
+
+        bounded(
+            "release Bash",
+            self.process
+                .as_mut()
+                .expect("Bash reached its gate")
+                .write_all(b"release\n"),
+        )
+        .await
+        .expect("release the Bash process");
+    }
+}
+
+// The parent cannot infer again until Bash is released, so the second
+// call belongs to the child. The test owns its generated stream so it can
+// hold or finish the report independently of scheduler timing.
+struct HeldChildProvider {
+    inner: Arc<ScriptedProvider>,
+    calls: AtomicUsize,
+    child: StdMutex<Option<tokio::sync::oneshot::Sender<HeldInference>>>,
+}
+
+struct HeldInference {
+    source: AssistantMessageEventStream,
+    output: AssistantMessageEventStream,
+}
+
+impl Drop for HeldInference {
+    fn drop(&mut self) {
+        // A failed assertion must not leave the child's consumer waiting.
+        self.output.end();
+    }
+}
+
+impl HeldChildProvider {
+    fn new(
+        script: Vec<AssistantMessage>,
+    ) -> (Arc<Self>, tokio::sync::oneshot::Receiver<HeldInference>) {
+        let (child, received) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                inner: scripted(script, 1, Duration::ZERO),
+                calls: AtomicUsize::new(0),
+                child: StdMutex::new(Some(child)),
+            }),
+            received,
+        )
+    }
+}
+
+impl Provider for HeldChildProvider {
+    fn stream(
+        &self,
+        model: &ModelInfo,
+        context: &Context,
+        options: &StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let source = self.inner.stream(model, context, options);
+        if self.calls.fetch_add(1, Ordering::SeqCst) != 1 {
+            return source;
+        }
+        let output = AssistantMessageEventStream::new();
+        let held = HeldInference {
+            source,
+            output: output.clone(),
+        };
+        assert!(
+            self.child
+                .lock()
+                .expect("child sender mutex")
+                .take()
+                .expect("one child inference")
+                .send(held)
+                .is_ok(),
+            "the test is waiting for the child inference",
+        );
+        output
+    }
+
+    fn stream_simple(
+        &self,
+        model: &ModelInfo,
+        context: &Context,
+        options: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.stream(model, context, &options.base)
+    }
+}
+
+/// A turn that spawns a background sub-agent alongside a gated foreground
+/// Bash command. The child can conclude while the parent stays blocked, so
+/// its lifecycle tail appends no further durable entries.
+fn running_tool_and_sub_turn(report: &str, command: &str) -> Vec<AssistantMessage> {
     let mut both = calling(
         "kicking that off",
         "call-sub",
@@ -710,7 +828,7 @@ fn running_tool_and_sub_turn(report: &str, sleep_seconds: u32) -> Vec<AssistantM
         is_raw: false,
         id: "call-slow".to_string(),
         name: "bash".to_string(),
-        arguments: serde_json::json!({"command": format!("sleep {sleep_seconds}"),
+        arguments: serde_json::json!({"command": command,
                                       "description": "slow"}),
     }));
     vec![
@@ -5030,21 +5148,37 @@ async fn a_cut_between_a_tool_end_and_its_durable_message_converges() {
     ignore = "slow: remote catch-up quiet window"
 )]
 async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
-    // A report long enough that the sub is still streaming it when the client
-    // comes back, and a command that keeps the parent blocked past that.
-    let fixture = Fixture::with_provider(cut_provider(running_tool_and_sub_turn(
-        "the sub reporting back at length, one character at a time, so that its \
-         run is still going when the client comes back",
-        3,
-    )))
-    .await;
+    use aj_models::streaming::AssistantMessageEvent;
+    use futures::StreamExt;
+
+    let mut bash = BashGate::new().await;
+    let command = bash.command();
+    let (provider, received) = HeldChildProvider::new(running_tool_and_sub_turn(
+        "the sub reporting back",
+        &command,
+    ));
+    let fixture = Fixture::build(provider, IdentityGate::local(), Duration::from_secs(30)).await;
     let session = fixture.create().await;
     let mut oracle = fixture.oracle(&session).await;
     let mut remote = fixture.remote(&session).await;
     fixture.prompt(&session, "do both").await;
 
-    // Cut once the slow command is under way. The sub-agent was spawned by the
-    // same message and is streaming its answer, so both are in flight.
+    bash.wait_until_blocked().await;
+    let mut child = bounded("the child inference", received)
+        .await
+        .expect("the child requested its report");
+    loop {
+        let event = bounded("the child's first text delta", child.source.next())
+            .await
+            .expect("the child's report contains text");
+        let started = matches!(event, AssistantMessageEvent::TextDelta { .. });
+        child.output.push(event);
+        if started {
+            break;
+        }
+    }
+
+    // Both gates remain held until the re-attach assertions finish.
     remote
         .pump_until("the slow tool call to start", |frame| {
             matches!(frame, Frame::Event { event, .. }
@@ -5064,8 +5198,8 @@ async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
         "the re-attach neither dropped the running cell nor added a second: {state:?}",
     );
     assert_eq!(
-        cells[0]["command"],
-        serde_json::json!("sleep 3"),
+        cells[0],
+        serde_json::json!({"command": command, "description": "slow"}),
         "quiesce kept the cell's arguments, which no backfill can regenerate",
     );
     assert_eq!(
@@ -5074,6 +5208,16 @@ async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
         "the sub-agent's bracket is still open and its clock still running",
     );
 
+    while let Some(event) = bounded("the rest of the child's report", child.source.next()).await {
+        child.output.push(event);
+    }
+    oracle
+        .pump_until("the sub-agent to conclude", |frame| {
+            matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::SubAgentEnd { .. })))
+        })
+        .await;
+    bash.release().await;
     oracle.settle().await;
     remote.settle().await;
 
@@ -5179,13 +5323,26 @@ async fn a_task_that_ended_while_away_reads_as_ended_from_caught_up() {
     ignore = "slow: remote catch-up quiet window"
 )]
 async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
-    // A short report, so the sub concludes early in the parent's long sleep.
-    let fixture =
-        Fixture::with_provider(cut_provider(running_tool_and_sub_turn("done looking", 5))).await;
+    use futures::StreamExt;
+
+    let mut bash = BashGate::new().await;
+    let command = bash.command();
+    let (provider, received) =
+        HeldChildProvider::new(running_tool_and_sub_turn("done looking", &command));
+    let fixture = Fixture::build(provider, IdentityGate::local(), Duration::from_secs(30)).await;
     let session = fixture.create().await;
     let mut oracle = fixture.oracle(&session).await;
     let mut remote = fixture.remote(&session).await;
     fixture.prompt(&session, "do both").await;
+    bash.wait_until_blocked().await;
+    // The tool-start event must precede the child's last durable entry, so
+    // the cut retains the running cell and its arguments without a backfill.
+    let mut child = bounded("the child inference", received)
+        .await
+        .expect("the child requested its report");
+    while let Some(event) = bounded("the child's report", child.source.next()).await {
+        child.output.push(event);
+    }
 
     // Up to the usage update trailing the sub-agent's assistant message, which
     // is its last durable entry and the last event that entry projects. So the
@@ -5266,6 +5423,15 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
         "and the sweep behind it is idempotent",
     );
 
+    let state = remote.canonical();
+    let cells = running_cells(&state, "call-slow");
+    assert_eq!(cells.len(), 1, "the parent stayed blocked: {state:?}");
+    assert_eq!(
+        cells[0],
+        serde_json::json!({"command": command, "description": "slow"}),
+        "the blocked tool retains its exact arguments",
+    );
+    bash.release().await;
     oracle.settle().await;
     remote.settle().await;
     assert_converged(&remote, &oracle, "a sweep over a box open across the gap");

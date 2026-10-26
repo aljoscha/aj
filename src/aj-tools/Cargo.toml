@@ -33,7 +33,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 aj-agent = { path = "../aj-agent/", features = ["test-support"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [lints]
 workspace = true

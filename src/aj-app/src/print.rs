@@ -1031,11 +1031,15 @@ mod tests {
         );
         let sessions = TempDir::new().expect("sessions tempdir");
         let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        // Only scripted setup runs under virtual time. The resumed turn below
+        // executes a real Bash child and must use the wall clock.
+        tokio::time::pause();
         let _ = run_capture(
             &persistence,
             &["--print", "--scripted", "streaming-text", "legacy"],
         )
         .await;
+        tokio::time::resume();
         let id = persistence
             .get_latest_session_id()
             .expect("read latest")

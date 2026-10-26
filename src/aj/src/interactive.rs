@@ -9209,30 +9209,39 @@ mod tests {
         (app, writer, shell, root)
     }
 
-    /// Feed one byte to the app as the drive loop would, then pump the editor's
-    /// autocomplete like the drive loop does once per iteration. Yields and
-    /// sleeps a bounded number of times so the streaming walker and nucleo
-    /// matcher settle before the caller inspects the popup. Bounded so a stuck
-    /// session can never hang the test.
-    async fn type_and_settle_autocomplete(
+    /// Drive real keystrokes and autocomplete deliveries until the fixture's
+    /// expected matches are visible. The deadline only guards missing progress.
+    async fn type_autocomplete(
         app: &mut AsyncApp,
         writer: &mut PipeWriter,
         shell: &Rc<RefCell<Shell>>,
-        byte: u8,
+        bytes: &[u8],
+        expected_rows: usize,
     ) {
-        writer.write_all(&[byte]).expect("write key byte");
-        let event = app.next_input().await.expect("input event");
-        app.handle_input(event);
-        for _ in 0..80 {
-            tokio::task::yield_now().await;
-            shell
-                .borrow()
-                .view()
-                .editor
-                .borrow_mut()
-                .pump_autocomplete();
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let view = shell.borrow().view();
+        for byte in bytes {
+            writer.write_all(&[*byte]).expect("write key byte");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+            view.editor.borrow_mut().pump_autocomplete();
         }
+        tokio::time::timeout(SETTLE_DEADLINE, async {
+            loop {
+                view.editor.borrow_mut().pump_autocomplete();
+                if view.editor.borrow().autocomplete_popup_rows(100) == expected_rows {
+                    break;
+                }
+                let delivery =
+                    std::future::poll_fn(|cx| view.autocomplete_rx.borrow_mut().poll_recv(cx))
+                        .await
+                        .expect("autocomplete delivery channel is open");
+                view.editor
+                    .borrow_mut()
+                    .apply_autocomplete_delivery(delivery);
+            }
+        })
+        .await
+        .expect("the expected autocomplete matches never appeared");
     }
 
     /// A bounded draw context of `width x height` cells, matching the shape the
@@ -9270,10 +9279,6 @@ mod tests {
     /// the editor, so opening it never changes the editor block's height and so
     /// never shrinks the flex transcript or moves the input line and footer.
     /// The popup shrinks to fit the space above the editor on a short terminal.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: 80 one-millisecond autocomplete waits per byte"
-    )]
     #[tokio::test]
     async fn autocomplete_popup_is_an_overlay_above_the_fixed_editor() {
         let tmp = TempDir::new().unwrap();
@@ -9302,9 +9307,7 @@ mod tests {
         );
 
         // Open the popup with a query that matches every file.
-        for byte in b"@file" {
-            type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
-        }
+        type_autocomplete(&mut app, &mut writer, &shell, b"@file", 15).await;
         assert!(
             shell
                 .borrow()
@@ -9487,17 +9490,13 @@ mod tests {
         );
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: 80 one-millisecond autocomplete waits per byte"
-    )]
     #[tokio::test]
     async fn at_file_autocomplete_end_to_end_through_the_shell() {
         // End-to-end host wiring: `Shell::new` installs the `@`-file provider
         // rooted at the session cwd, typing `@` opens the streaming popup, the
         // narrowing keystrokes keep it, and Tab applies the fuzzy-matched path.
-        // We mirror the drive loop's per-iteration `pump_autocomplete` between
-        // keystrokes so the walker and matcher settle. Only `hello.md` matches
+        // We drive the initial list and its narrowed result through the host's
+        // delivery channel. Only `hello.md` matches
         // `hel`, and it is a file, so Tab yields `@hello.md ` (trailing space).
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("hello.md"), "hi").expect("write file");
@@ -9513,9 +9512,8 @@ mod tests {
                 .is_showing_autocomplete()
         );
 
-        for byte in b"@hel" {
-            type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
-        }
+        type_autocomplete(&mut app, &mut writer, &shell, b"@", 2).await;
+        type_autocomplete(&mut app, &mut writer, &shell, b"hel", 1).await;
         assert!(
             shell
                 .borrow()
@@ -9531,7 +9529,7 @@ mod tests {
             "the command palette must not open on `@`",
         );
 
-        type_and_settle_autocomplete(&mut app, &mut writer, &shell, b'\t').await;
+        type_autocomplete(&mut app, &mut writer, &shell, b"\t", 0).await;
         assert_eq!(shell.borrow().view().editor.borrow().text(), "@hello.md ");
         assert!(
             !shell
@@ -9708,6 +9706,19 @@ mod tests {
     async fn persist_session(world: &mut World) {
         handle_submit(world, "persist me".to_string()).await;
         settle(world).await;
+    }
+
+    /// Install a demo before its first turn when only its completed history
+    /// matters. Tests observing in-flight work must keep explicit staging.
+    fn install_unpaced_demo(world: &World, demo: &str) {
+        let mut scripts = aj_models::scripted::demos::lookup(demo).expect("known demo");
+        for script in &mut scripts {
+            for step in &mut script.steps {
+                step.delay = Duration::ZERO;
+            }
+        }
+        world.handles().run_config.lock().unwrap().main.provider =
+            Arc::new(aj_models::scripted::ScriptedProvider::new(scripts));
     }
 
     /// Point the focused session at a slowly streamed script, so a turn
@@ -10498,10 +10509,6 @@ mod tests {
     /// listing is a record in the log beside the frozen prompt it describes,
     /// so it replays exactly once, at the top, and reads the same as it did the
     /// day the session was made.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_resumed_session_opens_with_the_context_it_was_created_with() {
         let dir = TempDir::new().expect("tempdir");
@@ -10510,6 +10517,7 @@ mod tests {
             .into_iter()
             .find(|notice| notice.starts_with("Context:"))
             .expect("a fresh session opens with its context");
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let session = world.session().to_string();
         shut_down(&world).await;
@@ -10876,14 +10884,11 @@ mod tests {
 
     /// A resume has no created session for `--tag` to name, so the flag is
     /// reported rather than dropped.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_launch_tag_on_a_resume_says_it_has_nothing_to_name() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         persist_session(&mut world).await;
         let session = world.session().to_string();
         shut_down(&world).await;
@@ -12771,15 +12776,12 @@ mod tests {
     /// A submit reaches the host, and the frames the host publishes for it are
     /// what build the transcript: the submit itself renders nothing, and the
     /// message is on the session's log before any frame is folded.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_prompt_reaches_the_host_and_its_frames_build_the_transcript() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
+        install_unpaced_demo(&world, "streaming-text");
         handle_submit(&mut world, "hi there".to_string()).await;
         assert!(
             user_rows(&world).is_empty(),
@@ -12931,14 +12933,11 @@ mod tests {
     /// The drive loop discharges the same obligation at the bottom of each
     /// iteration. Nothing in phase 1 moves a head behind this client's back,
     /// so the command below stands in for the second writer that will.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_reset_is_discharged_by_a_re_attach() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let before = user_rows(&world);
         assert_eq!(before, vec!["seed"]);
@@ -13086,14 +13085,11 @@ mod tests {
     /// This covers the step the loop drives; that the loop routes a local
     /// `Closed` here at all is
     /// [`the_loop_re_attaches_an_evicted_local_stream`].
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn an_evicted_local_stream_is_re_attached() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         assert_eq!(user_rows(&world), vec!["seed"]);
         let before = CanonicalState::of(&world.chat.borrow(), world.client());
@@ -13130,14 +13126,11 @@ mod tests {
     /// The host really being gone still ends the shell: the re-attach is what
     /// tells that apart from an eviction, because a host that is gone refuses
     /// it.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn a_local_re_attach_after_the_host_is_gone_is_fatal() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, _) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         shut_down(&world).await;
 
@@ -13349,14 +13342,11 @@ mod tests {
     ///
     /// The frame arm is the only place that is decided, so a test that hands
     /// `advance_resume` a `Resume` of its own never reaches it.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn the_loop_re_attaches_an_evicted_local_stream() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let before = CanonicalState::of(&world.chat.borrow(), world.client());
         // The comparison below is not vacuous: the client's cursor sits under
@@ -13413,14 +13403,11 @@ mod tests {
     /// The local views read the live handles, so nothing on screen depends on
     /// this. The client's own model does, and it is the fold connect mode
     /// uses, so leaving it stale would leave the two paths unequal.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn an_attach_carries_the_task_table_and_queues() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let task = register_bash_task(&mut world, "sleep 100").await;
         world
@@ -20908,6 +20895,7 @@ mod tests {
     /// rebuild loop with real on-disk sessions.
     async fn create_disk_session(dir: &TempDir, prompt: &str) -> String {
         let mut world = scripted_world(dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, prompt).await;
         let id = world.session().to_string();
         // The host holds the session live (and its lock) until it shuts down,
@@ -20993,14 +20981,11 @@ mod tests {
 
     /// A running background task does not hold the user in a session either: it
     /// keeps running behind the switch, exactly as a turn does.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn new_session_is_allowed_while_background_work_runs() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         assert!(!world.client().working(), "no turn in flight");
         let _task = register_bash_task(&mut world, "sleep 100").await;
@@ -21056,14 +21041,11 @@ mod tests {
 
     /// While idle the session tree opens read-only, listing the current
     /// session's single branch (its first user message).
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn session_tree_opens_and_lists_the_branch_when_idle() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "tree branch prompt").await;
 
         assert!(matches!(
@@ -21123,10 +21105,6 @@ mod tests {
     /// marks the current session, and confirming a
     /// different row parks a resume request the drive loop turns into
     /// `SessionExit::Switch`.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn session_selector_fills_and_confirms_a_switch() {
         let dir = TempDir::new().expect("tempdir");
@@ -21136,6 +21114,7 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         // Give the current session recognizable on-disk content so its row
         // scans in and can carry the current-session marker.
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "current session prompt").await;
 
         refresh_browser_directory(&mut world).await;
@@ -21195,10 +21174,6 @@ mod tests {
     /// only reached if the overlay actually installed it: the chord is matched
     /// on the focus path, and a selector pushed as a bare list would swallow
     /// the press with nothing to show for it.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn the_selector_toggle_reveals_an_archived_session() {
         let dir = TempDir::new().expect("tempdir");
@@ -21206,6 +21181,7 @@ mod tests {
 
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "the session I am working in").await;
         world
             .persistence
@@ -21278,15 +21254,12 @@ mod tests {
 
     /// Confirming the current session reaches the frontend, which leaves a
     /// healthy session unchanged. Esc closes without asking.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn session_selector_current_is_noop_and_esc_cancels() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "current session prompt").await;
 
         // Confirm the pre-selected current row through the real input parser.
@@ -21336,10 +21309,6 @@ mod tests {
     /// The switch path: focusing another session re-attaches over the same
     /// Shell, selecting a session-owned tree so the transcript renders the new
     /// session's model and the pending box reads the new session's queues.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test]
     async fn switch_rebuilds_the_session_and_updates_exit_hint() {
         let dir = TempDir::new().expect("tempdir");
@@ -21347,6 +21316,7 @@ mod tests {
 
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "alpha session prompt").await;
         // Switch to beta over the same Shell.
         let moved = apply_focus_request(
@@ -26637,10 +26607,6 @@ mod tests {
     /// The completion popup belongs to the editor, so it starts where the editor
     /// does. Left at column zero it would cover the strip and sit adrift of the
     /// text it completes.
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: 80 one-millisecond autocomplete waits per byte"
-    )]
     #[tokio::test]
     async fn the_completion_popup_clears_the_strip() {
         let tmp = TempDir::new().expect("tempdir");
@@ -26651,9 +26617,7 @@ mod tests {
         shell.borrow().sidebar.borrow_mut().visible = true;
         shell.borrow().sidebar.borrow_mut().toggled = true;
 
-        for byte in b"@file" {
-            type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
-        }
+        type_autocomplete(&mut app, &mut writer, &shell, b"@file", 4).await;
         assert!(
             shell
                 .borrow()
@@ -34212,10 +34176,6 @@ mod tests {
         (inert_theme_watch(), None)
     }
 
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: paced streaming-text demo"
-    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn real_input_new_session_keeps_the_launch_env_armed() {
         let dir = TempDir::new().expect("tempdir");
