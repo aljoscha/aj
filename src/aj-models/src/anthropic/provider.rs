@@ -3,7 +3,7 @@
 //! Implements the unified [`Provider`] trait against Anthropic's
 //! `POST /v1/messages` streaming endpoint.
 //!
-//! Stateless — per-call HTTP knobs (auth, base URL, betas, caching) are
+//! Per-call HTTP options (auth, base URL, betas, caching) are
 //! derived from the per-call [`ModelInfo`] and [`StreamOptions`] so the
 //! same instance can serve any number of concurrent requests.
 
@@ -24,7 +24,7 @@ use crate::errors::{
     classify_anthropic_error, classify_anthropic_stop_reason, parse_retry_after, transport_error,
 };
 use crate::partial_json::parse_streaming_json;
-use crate::provider::Provider;
+use crate::provider::{HttpClient, Provider};
 use crate::registry::{
     ModelCost, ModelInfo, SpeedMode, calculate_cost, resolve_speed, supports_adaptive_thinking,
     validate_thinking_level,
@@ -50,8 +50,11 @@ const API_NAME: &str = "anthropic-messages";
 /// advertise fast mode are resolved to standard before either is sent.
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
-/// Stateless provider for the Anthropic Messages API.
-pub struct AnthropicProvider;
+/// Provider with a reusable HTTP transport for the Anthropic Messages API.
+#[derive(Default)]
+pub struct AnthropicProvider {
+    http: HttpClient,
+}
 
 impl Provider for AnthropicProvider {
     fn stream(
@@ -65,6 +68,7 @@ impl Provider for AnthropicProvider {
             context.clone(),
             options.clone(),
             ThinkingLevel::Off,
+            HttpClient::clone(&self.http),
         )
     }
 
@@ -79,6 +83,7 @@ impl Provider for AnthropicProvider {
             context.clone(),
             options.base.clone(),
             options.reasoning.clone(),
+            HttpClient::clone(&self.http),
         )
     }
 }
@@ -95,11 +100,12 @@ fn spawn_stream(
     context: Context,
     options: StreamOptions,
     reasoning: ThinkingLevel,
+    http: HttpClient,
 ) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
     tokio::spawn(async move {
-        run_stream(producer.clone(), model, context, options, reasoning).await;
+        run_stream(producer.clone(), model, context, options, reasoning, http).await;
         // Safety net: if `run_stream` exited without emitting a terminal
         // event the stream would otherwise hang. `end()` is a no-op once
         // a terminal event has been pushed.
@@ -117,8 +123,11 @@ async fn run_stream(
     context: Context,
     options: StreamOptions,
     reasoning: ThinkingLevel,
+    http: HttpClient,
 ) {
-    if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
+    if let Err(err) =
+        run_stream_inner(&producer, &model, &context, &options, &reasoning, &http).await
+    {
         producer.push(error_before_state(&model, None, err));
     }
 }
@@ -139,6 +148,7 @@ async fn run_stream_inner(
     context: &Context,
     options: &StreamOptions,
     reasoning: &ThinkingLevel,
+    http: &HttpClient,
 ) -> Result<(), AssistantError> {
     // Fast-path: caller already cancelled before we did any work.
     if let Some(token) = options.cancel.as_ref()
@@ -178,7 +188,7 @@ async fn run_stream_inner(
         return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
     }
 
-    let client = build_client(model, credential.key, reasoning, options);
+    let client = build_client(model, credential.key, reasoning, options, http);
     let request = build_request(model, context, options, reasoning);
 
     if let Some(cb) = options.on_payload.as_ref() {
@@ -279,13 +289,18 @@ fn build_client(
     api_key: String,
     reasoning: &ThinkingLevel,
     options: &StreamOptions,
+    http: &HttpClient,
 ) -> Client {
     let base_url = if model.base_url.is_empty() {
         None
     } else {
         Some(model.base_url.clone())
     };
-    let mut client = Client::new(base_url, api_key);
+    let mut client = Client::with_http_client(
+        base_url,
+        api_key,
+        http.get_or_init(reqwest::Client::new).clone(),
+    );
     // The interleaved-thinking beta is only valid on non-adaptive
     // reasoning models; adaptive models reject it (Opus 4.7) or treat
     // it as redundant. Send it only when reasoning is on AND the model
@@ -1624,7 +1639,7 @@ mod tests {
             }));
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                AnthropicProvider
+                AnthropicProvider::default()
                     .stream(&model, &Context::new("sys"), &options)
                     .result(),
             )
@@ -1722,7 +1737,7 @@ mod tests {
         let mut model = fake_model();
         model.base_url = base_url;
         let options = labeled_options(None);
-        let stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+        let stream = AnthropicProvider::default().stream(&model, &Context::new("system"), &options);
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
             .await
             .expect("provider stream terminates");
@@ -1758,8 +1773,11 @@ mod tests {
 
         let mut model = fake_model();
         model.base_url = base_url;
-        let stream =
-            AnthropicProvider.stream(&model, &Context::new("system"), &labeled_options(None));
+        let stream = AnthropicProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &labeled_options(None),
+        );
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
             .await
             .expect("provider stream terminates at EOF");
@@ -1812,7 +1830,8 @@ mod tests {
         model.base_url = server.base_url.clone();
         let token = CancellationToken::new();
         let options = labeled_options(Some(token.clone()));
-        let mut stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+        let mut stream =
+            AnthropicProvider::default().stream(&model, &Context::new("system"), &options);
 
         let start = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
@@ -1867,8 +1886,11 @@ mod tests {
 
         let mut model = fake_model();
         model.base_url = format!("http://{address}");
-        let stream =
-            AnthropicProvider.stream(&model, &Context::new("system"), &labeled_options(None));
+        let stream = AnthropicProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &labeled_options(None),
+        );
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
             .await
             .expect("provider stream terminates");
@@ -1882,8 +1904,11 @@ mod tests {
     async fn a_local_request_builder_error_records_that_nothing_served() {
         let mut model = fake_model();
         model.base_url = "not-a-url".to_string();
-        let stream =
-            AnthropicProvider.stream(&model, &Context::new("system"), &labeled_options(None));
+        let stream = AnthropicProvider::default().stream(
+            &model,
+            &Context::new("system"),
+            &labeled_options(None),
+        );
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
             .await
             .expect("provider stream terminates");
@@ -1903,7 +1928,7 @@ mod tests {
     async fn a_pre_resolve_cancel_records_that_nothing_served() {
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let stream = AnthropicProvider.stream(
+        let stream = AnthropicProvider::default().stream(
             &fake_model(),
             &Context::new("system"),
             &labeled_options(Some(cancel)),
@@ -1922,7 +1947,7 @@ mod tests {
         let token = CancellationToken::new();
         let mut options = labeled_options(Some(token.clone()));
         options.on_payload = Some(OnPayload::new(move |_| token.cancel()));
-        let stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+        let stream = AnthropicProvider::default().stream(&model, &Context::new("system"), &options);
 
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
             .await
@@ -1957,7 +1982,7 @@ mod tests {
         model.base_url = format!("http://{address}");
         let cancel = CancellationToken::new();
         let options = labeled_options(Some(cancel.clone()));
-        let stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+        let stream = AnthropicProvider::default().stream(&model, &Context::new("system"), &options);
         tokio::time::timeout(Duration::from_secs(5), accepted_rx)
             .await
             .expect("provider reaches fixture server")

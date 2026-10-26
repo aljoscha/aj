@@ -347,7 +347,7 @@ async fn a_preterminal_responses_failure_retries_once_and_persists_its_partial()
     ];
     let server = CountingSseServer::start(scripts).await;
     let model = model("openai-responses", format!("{}/v1", server.base_url));
-    let run_config = run_config(Arc::new(OpenAiResponsesProvider), model);
+    let run_config = run_config(Arc::new(OpenAiResponsesProvider::default()), model);
     let root = TempDir::new().expect("session root");
     let persistence = ConversationPersistence::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
@@ -399,7 +399,7 @@ async fn a_chat_finish_before_body_failure_is_not_reissued() {
     ];
     let server = CountingSseServer::start(scripts).await;
     let model = model("openai-completions", format!("{}/v1", server.base_url));
-    let run_config = run_config(Arc::new(OpenAiCompletionsProvider), model);
+    let run_config = run_config(Arc::new(OpenAiCompletionsProvider::default()), model);
     let root = TempDir::new().expect("session root");
     let persistence = ConversationPersistence::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
@@ -443,7 +443,7 @@ async fn a_responses_completion_before_body_failure_is_not_reissued() {
     ];
     let server = CountingSseServer::start(scripts).await;
     let model = model("openai-responses", format!("{}/v1", server.base_url));
-    let run_config = run_config(Arc::new(OpenAiResponsesProvider), model);
+    let run_config = run_config(Arc::new(OpenAiResponsesProvider::default()), model);
     let root = TempDir::new().expect("session root");
     let persistence = ConversationPersistence::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
@@ -489,7 +489,7 @@ async fn a_retryable_provider_terminal_persists_spend_but_accumulates_only_succe
     ];
     let server = CountingSseServer::start(scripts).await;
     let model = model("openai-responses", format!("{}/v1", server.base_url));
-    let run_config = run_config(Arc::new(OpenAiResponsesProvider), model);
+    let run_config = run_config(Arc::new(OpenAiResponsesProvider::default()), model);
     let root = TempDir::new().expect("session root");
     let persistence = ConversationPersistence::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);

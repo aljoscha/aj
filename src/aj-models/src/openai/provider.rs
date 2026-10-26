@@ -3,7 +3,7 @@
 //! Implements the unified [`Provider`] trait against OpenAI's
 //! `POST /chat/completions` streaming endpoint.
 //!
-//! Stateless — per-call HTTP knobs (auth, base URL, reasoning effort,
+//! Per-call HTTP options (auth, base URL, reasoning effort,
 //! tool choice) are derived from the per-call [`ModelInfo`] and
 //! [`StreamOptions`] so the same instance can serve any number of
 //! concurrent requests.
@@ -37,7 +37,7 @@ use crate::openai::responses::{
     tier_pricing,
 };
 use crate::partial_json::parse_streaming_json;
-use crate::provider::Provider;
+use crate::provider::{HttpClient, Provider};
 use crate::registry::{
     ModelCost, ModelInfo, SpeedMode, supports_verbosity, validate_thinking_level,
 };
@@ -55,8 +55,11 @@ use crate::types::{
 /// `api` field reported on assistant messages produced by this provider.
 const API_NAME: &str = "openai-completions";
 
-/// Stateless provider for the OpenAI Chat Completions API.
-pub struct OpenAiCompletionsProvider;
+/// Provider with a reusable HTTP transport for the OpenAI Chat Completions API.
+#[derive(Default)]
+pub struct OpenAiCompletionsProvider {
+    http: HttpClient,
+}
 
 impl Provider for OpenAiCompletionsProvider {
     fn stream(
@@ -70,6 +73,7 @@ impl Provider for OpenAiCompletionsProvider {
             context.clone(),
             options.clone(),
             ThinkingLevel::Off,
+            HttpClient::clone(&self.http),
         )
     }
 
@@ -84,6 +88,7 @@ impl Provider for OpenAiCompletionsProvider {
             context.clone(),
             options.base.clone(),
             options.reasoning.clone(),
+            HttpClient::clone(&self.http),
         )
     }
 }
@@ -100,11 +105,12 @@ fn spawn_stream(
     context: Context,
     options: StreamOptions,
     reasoning: ThinkingLevel,
+    http: HttpClient,
 ) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
     tokio::spawn(async move {
-        run_stream(producer.clone(), model, context, options, reasoning).await;
+        run_stream(producer.clone(), model, context, options, reasoning, http).await;
         // Safety net: if `run_stream` exited without emitting a terminal
         // event the stream would otherwise hang. `end()` is a no-op once
         // a terminal event has been pushed.
@@ -122,8 +128,11 @@ async fn run_stream(
     context: Context,
     options: StreamOptions,
     reasoning: ThinkingLevel,
+    http: HttpClient,
 ) {
-    if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
+    if let Err(err) =
+        run_stream_inner(&producer, &model, &context, &options, &reasoning, &http).await
+    {
         producer.push(error_message(&model, None, err));
     }
 }
@@ -145,6 +154,7 @@ async fn run_stream_inner(
     context: &Context,
     options: &StreamOptions,
     reasoning: &ThinkingLevel,
+    http: &HttpClient,
 ) -> Result<(), AssistantError> {
     if let Some(token) = options.cancel.as_ref()
         && token.is_cancelled()
@@ -184,7 +194,11 @@ async fn run_stream_inner(
     }
 
     let base_url = (!model.base_url.is_empty()).then(|| model.base_url.clone());
-    let client = Client::new(base_url, credential.key);
+    let client = Client::with_http_client(
+        base_url,
+        credential.key,
+        http.get_or_init(reqwest::Client::new).clone(),
+    );
     let request = build_request(model, context, options, reasoning);
 
     if let Some(cb) = options.on_payload.as_ref() {
@@ -1517,7 +1531,7 @@ mod tests {
             }));
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                OpenAiCompletionsProvider
+                OpenAiCompletionsProvider::default()
                     .stream(&model, &Context::new("sys"), &options)
                     .result(),
             )
@@ -2249,7 +2263,7 @@ mod tests {
         let token = CancellationToken::new();
         let options = labeled_options(token.clone());
         let mut stream =
-            OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         let delta = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -2289,7 +2303,8 @@ mod tests {
         model.base_url = format!("{}/v1", server.base_url);
         let token = CancellationToken::new();
         let options = labeled_options(token.clone());
-        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+        let stream =
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         server.wait_for_request().await;
         token.cancel();
@@ -2311,7 +2326,8 @@ mod tests {
         let token = CancellationToken::new();
         let mut options = labeled_options(token.clone());
         options.on_payload = Some(OnPayload::new(move |_| token.cancel()));
-        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+        let stream =
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
@@ -2330,7 +2346,8 @@ mod tests {
         let mut model = fake_model();
         model.base_url = format!("{}/v1", server.base_url);
         let options = labeled_options(CancellationToken::new());
-        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+        let stream =
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
@@ -2363,7 +2380,7 @@ mod tests {
         model.base_url = format!("{}/v1", server.base_url);
         let options = labeled_options(CancellationToken::new());
         let mut stream =
-            OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -2413,7 +2430,7 @@ mod tests {
         model.base_url = format!("{}/v1", server.base_url);
         let options = labeled_options(CancellationToken::new());
         let mut stream =
-            OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -2456,7 +2473,8 @@ mod tests {
         let mut model = fake_model();
         model.base_url = format!("{}/v1", server.base_url);
         let options = labeled_options(CancellationToken::new());
-        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+        let stream =
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
@@ -2487,7 +2505,8 @@ mod tests {
         let mut model = fake_model();
         model.base_url = format!("{}/v1", server.base_url);
         let options = labeled_options(CancellationToken::new());
-        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+        let stream =
+            OpenAiCompletionsProvider::default().stream(&model, &Context::new("system"), &options);
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
