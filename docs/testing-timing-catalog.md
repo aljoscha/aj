@@ -1,5 +1,107 @@
 # Test timing catalog
 
+## Queue-aware stream pacing
+
+The host HTTP writer keeps its 50 ms coalescing window, but does not start
+another wait while a reliable frame is queued behind snapshots. It drains
+that prefix in FIFO order. Closed queues also drain without starting another
+wait. Eligibility is a bounded queue inspection, with no additional buffers,
+tasks, timers, counters or cancellation machinery.
+
+### Where teardown time goes
+
+Temporary instrumentation of all 1,342 slow-inclusive `aj` binary tests at
+`40be38fa` recorded real and Tokio elapsed time separately. All passed.
+These are sums of overlapping calls, not workspace wall-time savings:
+
+| Shutdown boundary | Calls | Summed wall time | p95 | Maximum |
+| --- | ---: | ---: | ---: | ---: |
+| Gateway HTTP server | 146 | 66 ms | 0.53 ms | 21 ms |
+| Gateway control links | 147 | 24 ms | 0.42 ms | 1.16 ms |
+| Session host | 458 | 152 ms | 0.57 ms | 1.73 ms |
+| Host HTTP server | 289 | 2,750 ms | 50.53 ms | 172 ms |
+
+The gateway's 21 ms maximum was its deliberate stalled-client test, whose
+five-second grace ran on virtual time. Ordinary gateway teardown is not a
+worthwhile optimization target in this sample. The host HTTP tail instead
+shows the cost of pacing queued snapshots even after producer shutdown.
+No enrollment, withdrawal or history-cancellation hardening is included.
+
+A repeat with queue-aware pacing ran 1,343 tests successfully. The same 289
+host HTTP shutdowns totalled 1,831 ms, with a 51.5 ms maximum instead of
+172 ms. The remaining single-window tail is intentionally left alone.
+
+### Completion latency versus resource use
+
+The Linux-only opt-in profile uses real hosts, direct HTTP and gateway HTTP,
+generated replies, and one SSE connection carrying one or four sessions.
+It verifies complete replies and ordering, and waits for the process's socket
+count to return to at most its pre-fixture baseline after cleanup.
+
+Three isolated runs per variant, debug builds, compilation excluded:
+
+| Gateway workload | Maximum completion gap, baseline → queue-aware | Process CPU, baseline → queue-aware | Client SSE body bytes, baseline → queue-aware |
+| --- | ---: | ---: | ---: |
+| 1 session, 512-byte reply, 8 characters / 20 ms | 78 → 33 ms | 60 → 60 ms | 31,186 → 31,210 |
+| 4 sessions, same moderate rate | 383 → 35 ms | 120 → 120 ms | 58,765 → 59,549 |
+| 4 sessions, 16 KiB each, 64 characters / 2 ms | 373 → 42 ms | 270 → 250 ms | 418,128 → 425,257 |
+| 4 sessions, 16 KiB each, unpaced provider | 402 → 67 ms | 130 → 120 ms | 290,209 → 290,209 |
+
+Cells are medians. Completion gaps compare each HTTP-observed `AgentEnd` with
+an independently drained local attachment, then take the largest gap across
+sessions. These include scheduling and transport overhead, not just deliberate
+pacing, and are not publication-to-display latency guarantees. The moderate
+case is synthetic too, not a live-provider benchmark.
+
+CPU includes provider, persistence, observers and both sides of the transport,
+but excludes fixture setup/teardown. Counters have 10 ms resolution on this
+machine, so the result supports comparable CPU cost, not a CPU improvement
+claim. Bytes include attach setup and possible chunk read-ahead, exclude HTTP
+headers, and measure only the gateway's client-facing leg. Frame counts refer
+to parsed events rather than byte chunks.
+
+A diagnostic that removed pacing entirely cost 1,980 ms CPU and 9,301,563 body
+bytes for the four-session fast stream, roughly seven times the CPU and
+22 times the traffic of baseline. That diagnostic is not shipped. Direct-host
+measurements show the same latency improvement without the gateway hop.
+
+Run the profile alone, never alongside other Cargo or benchmark processes:
+
+```sh
+RUSTC_BOOTSTRAP=1 ./scripts/check-test-scratch.sh -p aj --bin aj \
+  remote::tests::stream_profile::profile_stream_pacing -- \
+  --ignored --exact --nocapture --test-threads=1
+getconf CLK_TCK # CPU ticks per second for the printed cpu_ticks counters
+```
+
+It stays ignored even with `slow-tests`. Reproducing the baseline requires
+removing only the `attachment.can_coalesce()` condition in `frame_stream`.
+The no-hold diagnostic bypasses that wait entirely. Restore production code
+before running correctness checks.
+
+The default-tier regression uses the real host and HTTP SSE body encoder with
+generated completions already queued, then freezes time only for inspection.
+It verifies distinct session snapshots and every reliable frame's payload and
+order. Removing the eligibility condition fails at the first unwanted pacing
+wait. The existing real-socket streaming-burst test checks retained coalescing.
+
+### Verification and iteration time
+
+Independent review approved the implementation and profiling method. Default
+workspace: **4,080 passed, 191 ignored**. Slow-inclusive: **4,262 passed,
+nine ignored**. The extra ignore is the opt-in profile, not a regression moved
+out of normal testing. The deterministic regression also passed ten repeats.
+Formatting, all-target Clippy/build, dependency guards and scratch-runner
+checks pass. All temporary instrumentation and counterfactual mutations are
+removed.
+
+Warm unfiltered default runs took **19.893 s and 18.172 s**, compared with
+20.312 s and 18.574 s before this change. Slow-inclusive wall time was
+**57.034 s**, compared with 57.173 s, effectively unchanged at this scale.
+Compilation was separate and no Cargo jobs competed during measurement.
+The important gain is remote completion latency, with a modest default-suite
+improvement rather than a large whole-workspace speedup.
+
 ## Host fixtures and gateway transport reuse
 
 The session-host harness uses the shared stateless OAuth providers with
@@ -38,9 +140,10 @@ The slow-inclusive run took **57.173 s**, versus 59.994 s. Its summed suite
 execution time was 52.564 s, versus 55.069 s. Coverage includes the repaired
 selectors and a new transport-lifetime regression rather than skipping them.
 
-### Gateway design questions found during investigation
+### Gateway lifecycle questions
 
-These are not changes in this pass:
+These remain unchanged. The teardown measurements above do not justify
+additional lifecycle machinery:
 
 - A real HTTP diagnostic reproduced an enrollment completing and establishing
   a control link after server and gateway shutdown returned. Shutdown does not
@@ -51,10 +154,6 @@ These are not changes in this pass:
 - Withdrawal cancels subscriptions, but an admitted request can resolve its
   target, wait for its upload, then forward after withdrawal. Whether withdrawal
   should revoke such pending work needs an explicit decision.
-- The host HTTP writer delays after every lossy frame. Distinct queued lossy
-  keys can therefore stack pacing windows ahead of a reliable frame, at odds
-  with the spec's single-window bound. This is a source-level finding, not a
-  measured end-to-end latency bound.
 
 ## Stream fences and fixture setup
 

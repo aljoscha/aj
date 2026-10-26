@@ -1049,12 +1049,15 @@ never be silently dropped for a connected client.
   never by in-place substitution, which would reorder content across a
   queued durable boundary. A lossy frame that meets a full queue with no
   older frame to replace is dropped.
-- A host's HTTP stream paces lossy frames: after writing one it writes
-  no further frame for about 50 ms, and same-key snapshots arriving
+- A host's HTTP stream paces lossy frames: after writing one it may wait
+  about 50 ms before reading again, and same-key snapshots arriving
   meanwhile coalesce in the queue as above. A fast client therefore
   receives a streaming reply as a handful of snapshots rather than one
-  per provider delta. A reliable frame may wait up to one such window,
-  never longer, and keeps its order. Attach blocks hold no lossy frames
+  per provider delta. Queued reliable frames suppress further pacing so
+  their preceding snapshots drain in FIFO order.
+  A reliable frame arriving during a wait pays at most that one pacing
+  window, not one per snapshot key ahead of it. Closed queues drain without
+  starting another wait. Attach blocks hold no lossy frames
   and are unaffected. A gateway's downstream inherits the pacing of its
   upstream streams.
 - Durable and reliable-transient frames are never dropped. If a client's

@@ -462,6 +462,12 @@ impl Attachment {
         !self.block_done && !self.block_complete.is_finished()
     }
 
+    /// Whether a bounded pause can coalesce live snapshots without holding
+    /// queued reliable frames. False during attach blocks and after closure.
+    pub fn can_coalesce(&self) -> bool {
+        self.block_done && self.live.frames.can_coalesce()
+    }
+
     /// The next frame, or `None` once the host closed the stream.
     pub async fn recv(&mut self) -> Option<Frame> {
         if self.cancelled.is_cancelled() {

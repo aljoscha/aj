@@ -234,6 +234,21 @@ impl<T> Receiver<T> {
     }
 }
 
+impl<T: OutboundFrame> Receiver<T> {
+    /// Whether waiting can coalesce snapshots without delaying a queued
+    /// reliable frame. A closed queue has nothing left to coalesce.
+    ///
+    /// This is a point-in-time observation, not a reservation. A caller that
+    /// delays reading must bound its wait even when this returns true.
+    pub fn can_coalesce(&self) -> bool {
+        let state = self.0.lock();
+        !state.closed
+            && state.frames.iter().all(|queued| {
+                queued.live && queued.frame.known_frame().is_some_and(Frame::is_lossy)
+            })
+    }
+}
+
 impl<T> State<T> {
     fn pop(&mut self) -> Option<T> {
         let queued = self.frames.pop_front()?;
