@@ -110,6 +110,7 @@ impl Splice {
         directory: watch::Receiver<Arc<MergedDirectory>>,
         tuning: Tuning,
         shutdown: &CancellationToken,
+        http: reqwest::Client,
     ) -> Self {
         let AttachPlan { groups, refused } = plan;
         let cancel = shutdown.child_token();
@@ -122,6 +123,7 @@ impl Splice {
                 sender.clone(),
                 cancel.clone(),
                 tuning.upstream_timeout,
+                http.clone(),
             ));
         }
         Self {
@@ -219,12 +221,13 @@ async fn attend(
     queue: Sender<DecodedFrame>,
     cancel: CancellationToken,
     answer_within: Duration,
+    http: reqwest::Client,
 ) {
     let sessions = group.namespaced();
     let ended = tokio::select! {
         _ = cancel.cancelled() => return,
         _ = group.serving.cancelled() => "its host's enrollment was withdrawn".to_string(),
-        ended = follow(&group, reachable, &queue, answer_within) => match ended {
+        ended = follow(&group, reachable, &queue, answer_within, &http) => match ended {
             Some(ended) => ended,
             // The client this was for went away, and a client that is gone is
             // owed nothing.
@@ -251,10 +254,11 @@ async fn follow(
     mut reachable: watch::Receiver<Arc<BTreeSet<String>>>,
     queue: &Sender<DecodedFrame>,
     answer_within: Duration,
+    http: &reqwest::Client,
 ) -> Option<String> {
     let not_reachable = format!("host {} is not reachable from this gateway", group.host_id);
     let reason = match &group.dial {
-        Some(address) => match dial(address, &group.attach, answer_within).await {
+        Some(address) => match dial(address, &group.attach, answer_within, http).await {
             Ok(events) => {
                 let sessions: Vec<String> = group
                     .attach
@@ -333,8 +337,9 @@ async fn dial(
     address: &HostAddress,
     attach: &[AttachRequest],
     answer_within: Duration,
+    http: &reqwest::Client,
 ) -> Result<RemoteEvents, RemoteError> {
-    RemoteClient::new(address.url())?
+    RemoteClient::with_http(address.url(), http.clone())?
         .with_open_timeout(answer_within)
         // The merged directory comes from the control link, so this stream
         // has no use for the host's own.

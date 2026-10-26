@@ -1,5 +1,61 @@
 # Test timing catalog
 
+## Host fixtures and gateway transport reuse
+
+The session-host harness uses the shared stateless OAuth providers with
+independent auth stores. Its live-sub-agent reattach case holds a generated
+child stream until the opening bracket has been inspected, then forwards every
+generated event. Parent and child scripts no longer depend on scheduling order.
+The case takes 77–81 ms instead of about 3 s and joins the default tier.
+
+The two reasoning-selector failures use an explicit reasoning-capable host
+catalog rather than expecting one in the ambient catalog. Real model
+confirmation, selector input, footer/log checks and session scoping remain.
+
+Each gateway owns a reusable typed HTTP transport, distinct from its bounded
+proxy transport. Enrollment, control-link reconnects, attached streams,
+previews and history reuse it. TLS/proxy settings and per-request, stream-open
+and silence deadlines retain their existing policies. Cancellation still
+belongs to each response. Idle pooled sockets may outlive withdrawal without
+keeping a subscription or reconnecting the withdrawn host.
+
+A real HTTP/SSE regression observes a stalled proxy request timing out, then
+requires fresh control and attached-stream updates and independent response
+cancellation. Substituting the bounded proxy transport for the typed transport
+fails that check at the control-stream lifetime assertion.
+
+### Verification and measurements
+
+All checks are unfiltered. Default: **4,078 passed, 190 ignored**.
+Slow-inclusive: **4,260 passed, eight ignored**. Both scratch guards pass.
+The pool/selector cases and promoted gate passed three additional repeats.
+Independent review, formatting, all-target Clippy/build, dependency boundaries
+and scratch-runner checks pass.
+
+With compilation separate and ordinary parallelism, warm default runs took
+20.312 s and **18.574 s**, versus 21.233 s and 20.274 s for `51012090`.
+The slow-inclusive run took **57.173 s**, versus 59.994 s. Its summed suite
+execution time was 52.564 s, versus 55.069 s. Coverage includes the repaired
+selectors and a new transport-lifetime regression rather than skipping them.
+
+### Gateway design questions found during investigation
+
+These are not changes in this pass:
+
+- A real HTTP diagnostic reproduced an enrollment completing and establishing
+  a control link after server and gateway shutdown returned. Shutdown does not
+  currently fence a pending enrollment handshake from committing.
+- History response bodies lack the independent shutdown cancellation used by
+  event splices. Source inspection indicates a backpressured history read can
+  retain upstream work after shutdown. This needs a dedicated runtime check.
+- Withdrawal cancels subscriptions, but an admitted request can resolve its
+  target, wait for its upload, then forward after withdrawal. Whether withdrawal
+  should revoke such pending work needs an explicit decision.
+- The host HTTP writer delays after every lossy frame. Distinct queued lossy
+  keys can therefore stack pacing windows ahead of a reliable frame, at odds
+  with the spec's single-window bound. This is a source-level finding, not a
+  measured end-to-end latency bound.
+
 ## Stream fences and fixture setup
 
 Profiling the default binary separated fixture cost from waiting. A fresh

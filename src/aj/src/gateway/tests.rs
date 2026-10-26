@@ -7881,6 +7881,95 @@ async fn a_host_that_answers_nothing_becomes_a_503() {
     serving.abort();
 }
 
+/// A timed-out ordinary request must not bound or cancel the gateway's shared
+/// control and attached event streams. Their response bodies own their lifetimes.
+#[tokio::test]
+async fn a_proxy_deadline_does_not_end_shared_transport_streams() {
+    let cue = Arc::new(tokio::sync::Notify::new());
+    let initial = serde_json::to_string(&fake_row("s-1")).unwrap();
+    let mut changed = fake_row("s-1");
+    changed.tag = Some("after the proxy deadline".into());
+    let fake = FakeHost::built(
+        "stream",
+        Script::Cued {
+            first: vec![
+                state_frame("s-1", "epoch"),
+                caught_up_frame("s-1", "epoch", 0),
+            ],
+            cue: Arc::clone(&cue),
+            then: vec![warning_frame("s-1", "epoch", "still streaming")],
+        },
+        vec![initial],
+        ControlScript::Republishes(vec![vec![serde_json::to_string(&changed).unwrap()]]),
+    )
+    .await;
+    let (url, serving, _) = wedged_host().await;
+    let fixture = Fixture::tuned(
+        TempDir::new().unwrap(),
+        vec![fake.address.clone(), HostAddress::parse(&url).unwrap()],
+        Tuning {
+            upstream_timeout: Duration::from_millis(200),
+            ..tuning()
+        },
+    )
+    .await;
+    fixture.until_connected("stream").await;
+    fixture.row("wedged:2026-01-01-00-00-00-000").await;
+    let mut events = fixture.attach(&[attach("stream:s-1")]).await;
+    decoded_until(
+        &mut events,
+        "the attached stream to open",
+        |frame| matches!(frame, DecodedFrame::Known(known) if is_caught_up(known.value())),
+    )
+    .await;
+
+    // A real stalled request establishes that the configured budget elapsed
+    // after both event streams opened, without a separate staging sleep.
+    let started = std::time::Instant::now();
+    let err = fixture
+        .client
+        .tree("wedged:2026-01-01-00-00-00-000")
+        .await
+        .unwrap_err();
+    assert_eq!(err.status(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    assert_eq!(err.code(), Some("host_unreachable"));
+    assert!(started.elapsed() >= fixture.tuning.upstream_timeout);
+    assert_eq!(fake.control_released(), 0, "the control body is still open");
+    assert_eq!(fake.released(), 0, "the attached body is still open");
+
+    fake.republish(0);
+    fixture
+        .until("a control update after the proxy deadline", |list| {
+            list.sessions
+                .iter()
+                .any(|row| row.tag.as_deref() == Some("after the proxy deadline"))
+                .then_some(())
+        })
+        .await;
+    cue.notify_one();
+    decoded_until(&mut events, "an event after the proxy deadline", |frame| {
+        matches!(frame, DecodedFrame::Known(known)
+            if matches!(known.value(), Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::Warning { text, .. }) if text == "still streaming")))
+    }).await;
+
+    drop(events);
+    bounded("the dropped response to release only its upstream", async {
+        while fake.released() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        fake.control_released(),
+        0,
+        "cancelling one response keeps the shared control stream"
+    );
+    fixture.shutdown().await;
+    fake.stop();
+    serving.abort();
+}
+
 /// A host that answers the handshake and the control stream, and then nothing
 /// at all: every other route hangs for as long as the connection lasts.
 async fn wedged_host() -> (
