@@ -233,8 +233,6 @@ fn parse_callback_request(path_and_query: &str) -> Option<CallbackParams> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use tokio::net::TcpStream;
 
     use super::*;
@@ -281,9 +279,7 @@ mod tests {
         let server =
             tokio::spawn(async move { await_callback(listener, "VERIFIER", &TEST_CONFIG).await });
 
-        // Synthesize a browser GET. We send it with a small delay so
-        // the server task has a chance to call `accept`.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The bound listener accepts connections before the server task runs.
         let response = send_get(port, "/callback?code=THE-CODE&state=VERIFIER").await;
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("Authentication successful"));
@@ -302,7 +298,6 @@ mod tests {
         let server =
             tokio::spawn(async move { await_callback(listener, "VERIFIER", &TEST_CONFIG).await });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let resp1 = send_get(port, "/favicon.ico").await;
         assert!(resp1.starts_with("HTTP/1.1 404"));
 
@@ -324,7 +319,6 @@ mod tests {
         let server =
             tokio::spawn(async move { await_callback(listener, "VERIFIER", &TEST_CONFIG).await });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let resp1 = send_get(port, "/callback?code=C&state=WRONG").await;
         assert!(resp1.starts_with("HTTP/1.1 400"));
 
@@ -346,7 +340,6 @@ mod tests {
         let server =
             tokio::spawn(async move { await_callback(listener, "VERIFIER", &TEST_CONFIG).await });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let resp = send_get(port, "/callback?error=access_denied").await;
         assert!(resp.starts_with("HTTP/1.1 400"));
         assert!(resp.contains("access_denied"));

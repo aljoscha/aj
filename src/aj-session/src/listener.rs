@@ -507,6 +507,9 @@ mod tests {
 
     #[tokio::test]
     async fn closing_a_persistence_fence_drains_admitted_writers_and_rejects_late_snapshots() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
         let (_dir, log) = fresh_log();
         let fence = PersistenceFence::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -518,41 +521,60 @@ mod tests {
         );
         let held = log.lock().await;
         let initial_len = held.len();
-        let admitted_listener = Arc::clone(&listener);
-        let admitted = tokio::spawn(async move {
-            admitted_listener(&AgentEvent::MessageEnd {
-                agent_id: AgentId::Main,
-                message: user_msg("admitted before close"),
-            })
-            .await
-        });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !admitted.is_finished(),
-            "the admitted listener is parked on the held log"
-        );
+        let event = AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: user_msg("admitted before close"),
+        };
+        let mut admitted = std::pin::pin!(listener(&event));
+        poll_fn(|cx| {
+            assert!(
+                admitted.as_mut().poll(cx).is_pending(),
+                "the admitted listener is parked on the held log"
+            );
+            Poll::Ready(())
+        })
+        .await;
 
         let closing_fence = fence.clone();
-        let closing = tokio::spawn(async move { closing_fence.close().await });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), async {
-                while !closing.is_finished() {
-                    tokio::task::yield_now().await;
-                }
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let closing = tokio::spawn(async move {
+            let mut close = std::pin::pin!(closing_fence.close());
+            poll_fn(|cx| {
+                assert!(
+                    close.as_mut().poll(cx).is_pending(),
+                    "close waits for the listener invocation admitted before it"
+                );
+                Poll::Ready(())
             })
+            .await;
+            pending_tx.send(()).expect("acknowledge pending close");
+            close.await;
+        });
+        pending_rx
             .await
-            .is_err(),
-            "close waits for the listener invocation admitted before it"
+            .expect("close is parked behind the admitted writer");
+        assert!(
+            fence.is_closed(),
+            "closing rejects new invocations while draining"
         );
 
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            listener(&AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: user_msg("invoked while close drains"),
+            }),
+        )
+        .await
+        .expect("a rejected listener must not wait for the held log")
+        .expect("closing listener is a no-op even while the log is held");
+
         drop(held);
-        admitted
+        admitted.await.expect("admitted append");
+        tokio::time::timeout(std::time::Duration::from_secs(5), closing)
             .await
-            .expect("admitted listener task")
-            .expect("admitted append");
-        closing.await.expect("fence close task");
+            .expect("the drained writer wakes close")
+            .expect("fence close task");
         let after_admitted = log.lock().await.len();
         assert_eq!(after_admitted, initial_len + 1, "the admitted write landed");
 

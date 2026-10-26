@@ -1,6 +1,98 @@
 # Test timing catalog
 
-## Implemented reductions
+## Follow-up sweep
+
+The follow-up to `6e65e588` removes incidental waits across runtime, providers,
+persistence, terminal widgets, host publication, Bash, and local/remote UI
+fixtures. It promotes **59 more tests** into the default suite:
+
+- 40 interactive tests, including locked-refusal stability and completed-history
+  fixtures that keep their generated events without presentation pacing.
+- 15 host tests covering publication, coalescing, cancellation equivalence,
+  persistence failure containment and wire-codec round trips.
+- The process-I/O budget test, real PTY resize test, and two simulated
+  unavailable-reap tests.
+
+| Representative test | Audit baseline | Targeted follow-up measurement |
+| --- | ---: | ---: |
+| Locked refusal across directory updates | 15.252 s | 0.313 s |
+| Detached-child cancel/kill equivalence, four scenarios | 9.251 s | 0.328 s |
+| Detached-writer persistence failure containment | 5.006 s | 0.114 s |
+| Directory process-I/O budget | 5.186 s | 0.328 s |
+| Simulated unavailable reap, direct/background | 4.024 s each | About 0.023 s each |
+| PTY resize | 0.536 s isolated | 0.069–0.078 s |
+
+The refusal test waits for the final directory transition to reach the UI and
+checks that `drive` returns neither a recovery continuation nor a directory
+reattach obligation. It no longer relies on a long quiet window to infer that
+no retry is scheduled. A mutation that reintroduced refusal retries failed.
+
+Publisher tests retain concurrent receivers and the generated relabel burst.
+A mutation that shortened the publisher's coalescing timer by 100 times failed
+the frame-count assertion. Real I/O counters, actual PTYs, Bash processes,
+signal handling, persisted bytes and generated message streams remain real.
+Only established timer/script phases use virtual time.
+
+Instantaneous remote turns exposed a fixture race: host-idle and client-idle
+flags could both be true before reply frames arrived. Settlement now also
+requires the client's applied durable position to reach the host's position,
+plus the lifecycle/task endings. A read-only `test-support` accessor exposes
+that applied position, explicitly not a reconnect cursor.
+
+Runtime status changes use pending-wait evidence. Fanout additionally checks
+that the registered waker fires. OAuth callbacks use already-bound listeners,
+reset rejection checks the real kernel accept queue after the owned request
+finishes, and debounce tests check the virtual boundary before and at expiry.
+Persistence tests use explicit file/message timestamps rather than ageing
+fixtures. A reviewed unbounded late-listener wait is guarded by a timeout.
+
+### Combined verification
+
+Warm default-suite runs took **23.639–24.304 s**, versus 22.524 s for the
+first-pass range. Default coverage grew by 59 tests rather than getting a
+shorter whole-workspace runtime. The main incremental-development gains are
+the affected tests and the expanded fast tier.
+
+The slow-inclusive run took **68.032 s** excluding compilation. Its summed
+test-suite execution time fell from **79.140 s to 61.930 s**, about **22%**.
+These are normal-parallelism runs, not sums of individual test durations.
+
+- Two unfiltered default runs reproduced only the known reasoning-model
+  selector failures documented below: 4,073 passed, two failed, 191 ignored.
+- Filtering exactly those two failures: default 4,073 passed / 191 ignored,
+  slow-inclusive 4,256 passed / eight ignored. Both scratch guards passed.
+- Workspace formatting, all-target Clippy with warnings denied, all-target
+  build, dependency-boundary guards and scratch-runner contract checks passed.
+- Independent reviews approved the combined changes and the final scripted
+  host phases. The late-listener watchdog finding was repaired and re-reviewed.
+
+### Deliberately retained timing
+
+- Real TERM/KILL escalation, capture-pipe drain and escaped-process survival
+  windows remain OS integration tests. Their production budgets are unchanged.
+- The RTK deadline retains process/PATH isolation. Spill-failure and mid-drain
+  tests retain observation/staging where child readiness alone would not prove
+  the required failure phase.
+- Host idle release and goal elapsed accounting use `std::time::Instant`.
+  Filesystem watcher delivery and cross-process lock exclusion are also real.
+  These need a separate boundary/design change, not just Tokio clock ticks.
+- Eight short sleeps in the synchronous queue tests arrange condvar waiters.
+  Waiter registration is not observable without extra coordination or a
+  concurrency-model harness. That machinery is not justified solely by these
+  small delays.
+- Remote quiet tails cover reliable transients beyond the durable cursor.
+  Remaining live-stream/backpressure/reconnect cases require their own phase
+  fences. Completed-history fixtures are not a substitute for those cases.
+- Vendored Code Mode's separate tests are not edited by this workspace sweep.
+  Their import boundary and existing virtual-clock/V8-thread coordination need
+  to remain intact.
+
+Conditional OS/readiness polls and generous failure deadlines are not fixed
+waits. They remain where no existing notification provides equivalent evidence.
+The remaining slow inventory is therefore not a claim that every timer literal
+still costs its full duration.
+
+## First-pass reductions (`6e65e588`)
 
 The inventory below records the audit baseline at `1bb64ae3`. The optimization
 pass uses three narrow mechanisms, without a general simulation framework:

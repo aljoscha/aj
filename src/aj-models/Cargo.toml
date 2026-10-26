@@ -42,6 +42,7 @@ anthropic-sdk = { path = "../anthropic-sdk" }
 aj-models = { path = ".", features = ["test-support"] }
 serde_json.workspace = true
 serial_test = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

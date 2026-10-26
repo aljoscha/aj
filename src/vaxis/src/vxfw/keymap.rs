@@ -481,8 +481,6 @@ impl<A: Clone + 'static, C: 'static> Widget for KeymapController<A, C> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::tty::TestTty;
     use crate::vaxis::{Options as VaxisOptions, Vaxis};
@@ -869,7 +867,6 @@ mod tests {
         let mut cmds = cmds;
         core.handle_command(&mut cmds);
         assert_eq!(core.timers.len(), 1);
-        std::thread::sleep(Duration::from_millis(1));
         let mut ctx = EventContext::new();
         core.check_timers(&mut ctx);
 
@@ -945,7 +942,6 @@ mod tests {
             Box::new(TestTty::new()),
         );
         core.handle_command(&mut cmds);
-        std::thread::sleep(Duration::from_millis(1));
         let mut ctx = EventContext::new();
         core.check_timers(&mut ctx);
         assert!(rig.controller.borrow().pending_sequence().is_none());

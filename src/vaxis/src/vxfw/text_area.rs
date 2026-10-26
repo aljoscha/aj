@@ -5688,7 +5688,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn suspend_rejects_queued_completions_and_keeps_the_original_channel() {
         let ed = TextArea::new();
         ed.borrow_mut()
@@ -5727,7 +5727,7 @@ mod tests {
         assert_eq!(ed.borrow().text(), "draft");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_applies_single_force_file_suggestion_without_showing_menu() {
         let mut ed = editor();
         ed.set_autocomplete_provider(Arc::new(MockProvider {
@@ -5758,7 +5758,7 @@ mod tests {
         assert_eq!(ed.text(), "Work");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shows_menu_when_force_file_has_multiple_suggestions() {
         let mut ed = editor();
         ed.set_autocomplete_provider(Arc::new(MockProvider {
@@ -5790,7 +5790,7 @@ mod tests {
         assert!(!ed.is_showing_autocomplete());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn keeps_suggestions_open_when_typing_in_force_mode() {
         let all_files = [
             item("readme.md"),
@@ -5843,7 +5843,7 @@ mod tests {
 
     /// The `@`-attachment context debounces: a synchronous burst of keystrokes
     /// coalesces into a single provider call once the window expires.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn debounces_at_autocomplete_while_typing() {
         struct RecordingProvider {
             calls: Arc<AtomicUsize>,
@@ -5901,7 +5901,18 @@ mod tests {
             "provider must not be called until the @ debounce window expires",
         );
 
+        let started = tokio::time::Instant::now();
+        tokio::task::yield_now().await; // Let the worker register its debounce timer.
+        tokio::time::advance(Duration::from_millis(19)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the debounce is still pending"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
         wait_autocomplete(&mut ed).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -5912,7 +5923,7 @@ mod tests {
 
     /// A `#` at a token boundary is a symbol trigger just like `@`, and debounces
     /// the same way.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn debounces_hash_autocomplete_while_typing() {
         struct RecordingProvider {
             calls: Arc<AtomicUsize>,
@@ -5964,7 +5975,18 @@ mod tests {
             "provider must not be called until the # debounce window expires",
         );
 
+        let started = tokio::time::Instant::now();
+        tokio::task::yield_now().await; // Let the worker register its debounce timer.
+        tokio::time::advance(Duration::from_millis(19)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the debounce is still pending"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
         wait_autocomplete(&mut ed).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -5975,7 +5997,7 @@ mod tests {
 
     /// A new request cancels the in-flight one: the first, slow call observes
     /// cancellation when a second request supersedes it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn aborts_active_at_autocomplete_when_typing_continues() {
         struct SlowProvider {
             calls: Arc<AtomicUsize>,
@@ -6103,7 +6125,7 @@ mod tests {
         (ed, count)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn typing_prose_does_not_call_provider() {
         let (mut ed, count) = counting_editor();
         type_settle(&mut ed, "hello world ").await;
@@ -6114,7 +6136,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn typing_a_bare_space_does_not_call_provider() {
         let (mut ed, count) = counting_editor();
         send(&mut ed, &char_key(' '));
@@ -6122,7 +6144,7 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn at_sign_after_whitespace_calls_provider() {
         let (mut ed, count) = counting_editor();
         send(&mut ed, &char_key('@'));
@@ -6137,7 +6159,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn at_sign_inside_a_word_does_not_call_provider() {
         let (mut ed, count) = counting_editor();
         type_settle(&mut ed, "user").await;
@@ -6154,7 +6176,7 @@ mod tests {
     /// Regression: with an `@` popup open, typing a space leaves the `@` token,
     /// so the Regular popup closes rather than re-dispatching into a raw
     /// directory listing of the working directory.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn space_leaving_at_token_closes_regular_popup() {
         let mut ed = editor();
         ed.set_autocomplete_provider(Arc::new(MockProvider {
@@ -6182,7 +6204,7 @@ mod tests {
 
     /// A narrowing character typed inside the `@` token keeps the Regular popup
     /// open, distinguishing genuine narrowing from leaving the token.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn narrowing_inside_at_token_keeps_regular_popup_open() {
         let mut ed = editor();
         ed.set_autocomplete_provider(Arc::new(MockProvider {
@@ -6206,7 +6228,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn enter_on_at_file_popup_applies_completion_but_does_not_submit() {
         struct AtProvider;
         #[async_trait]
@@ -6270,7 +6292,7 @@ mod tests {
         assert_eq!(ed.text(), "look at @src/main.rs");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn at_prefix_autocomplete_draws_single_full_path_column() {
         let mut ed = editor();
         // A distinctive theme so the top rule and the selected band carry
@@ -6371,7 +6393,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn popup_is_an_overlay_and_never_grows_the_editor_surface() {
         let mut ed = editor();
         ed.set_autocomplete_provider(Arc::new(MockProvider {
@@ -6423,7 +6445,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn popup_surface_clamps_rows_and_keeps_the_selection_visible() {
         let items: Vec<AutocompleteItem> = (0..10)
             .map(|n| {
@@ -6476,7 +6498,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn popup_directory_item_renders_with_a_trailing_slash() {
         let mut ed = editor();
         ed.set_autocomplete_provider(Arc::new(MockProvider {
@@ -6509,7 +6531,7 @@ mod tests {
         assert_eq!(dir_row.find("src/"), Some(0));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn popup_scrolls_when_selection_moves_past_the_window() {
         let items: Vec<AutocompleteItem> = (0..10)
             .map(|n| {

@@ -1874,6 +1874,34 @@ mod tests {
         ProcessGuard::arm(child, registry.track_cleanup()).expect("arm")
     }
 
+    /// A real Bash process connects at the phase under test and waits for EOF.
+    /// Holding the accepted socket prevents completion, and dropping it releases
+    /// the command even on assertion failure. Requires Bash network redirections.
+    struct BashGate(tokio::net::TcpListener);
+
+    impl BashGate {
+        async fn new() -> Self {
+            Self(
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind Bash gate"),
+            )
+        }
+
+        fn command(&self) -> String {
+            let port = self.0.local_addr().expect("gate address").port();
+            format!("IFS= read -r release < /dev/tcp/127.0.0.1/{port} || :")
+        }
+
+        async fn ready(&self) -> tokio::net::TcpStream {
+            tokio::time::timeout(Duration::from_secs(5), self.0.accept())
+                .await
+                .expect("Bash did not reach its gate")
+                .expect("accept Bash gate")
+                .0
+        }
+    }
+
     struct FailingReader;
 
     impl AsyncRead for FailingReader {
@@ -2090,14 +2118,11 @@ esac
     /// child, capture readers, and session cleanup lease.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for TERM grace and the reap timeout"
-    )]
     async fn direct_command_reap_bound_releases_capture_and_cleanup_ownership() {
-        let sleep = host_executable("sleep");
-        let child = Command::new(sleep)
-            .arg("30")
+        let gate = BashGate::new().await;
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(gate.command())
             .spawn()
             .expect("spawn unavailable direct-command fixture");
         let pid: i32 = child
@@ -2106,6 +2131,7 @@ esac
             .try_into()
             .expect("fixture pid fits i32");
         let mut fixture = FixtureProcess(Some(pid));
+        let _held = gate.ready().await;
         let registry = TaskRegistry::default();
         let stdout_reader = tokio::spawn(std::future::pending::<()>());
         let stderr_reader = tokio::spawn(std::future::pending::<()>());
@@ -2125,12 +2151,19 @@ esac
             process_is_live(pid),
             "the fixture must be live before its unavailable reap is modelled"
         );
+        // Only the modelled unavailable-reap windows use virtual time. The
+        // real child is already blocked, and neither signal can reach it.
+        tokio::time::pause();
+        let started = Instant::now();
         let result = tokio::time::timeout(
             KILL_GRACE + KILL_GRACE + Duration::from_secs(1),
             guard.terminate_user_command(),
         )
-        .await
-        .expect("direct-command termination exceeded both of its bounds");
+        .await;
+        let elapsed = started.elapsed();
+        tokio::time::resume();
+        let result = result.expect("direct-command termination exceeded both of its bounds");
+        assert!(elapsed >= KILL_GRACE + KILL_GRACE);
         assert_eq!(result, ProcessTermination::OwnershipReleased);
         assert!(
             process_is_live(pid),
@@ -2168,14 +2201,11 @@ esac
     /// driver record, capture readers, and process cleanup lease to be gone.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for TERM grace and the reap timeout"
-    )]
     async fn cancelled_background_command_settles_after_an_unavailable_reap() {
-        let sleep = host_executable("sleep");
-        let child = Command::new(sleep)
-            .arg("30")
+        let gate = BashGate::new().await;
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(gate.command())
             .spawn()
             .expect("spawn unavailable background-command fixture");
         let pid: i32 = child
@@ -2184,6 +2214,7 @@ esac
             .try_into()
             .expect("fixture pid fits i32");
         let mut fixture = FixtureProcess(Some(pid));
+        let _held = gate.ready().await;
         let mut ctx = DummyToolContext::default();
         let registry = ctx.task_registry();
         let stdout_reader = tokio::spawn(std::future::pending::<()>());
@@ -2235,11 +2266,20 @@ esac
             events,
         }));
 
+        assert!(process_is_live(pid), "the unavailable child must be live");
+        // The child is held at its gate and the readers are synthetic pending
+        // tasks. Only the driver's unavailable-reap policy needs to progress.
+        tokio::time::pause();
+        let started = Instant::now();
         assert!(registry.kill(id), "cancel the live background driver");
+        let quiesced = registry
+            .quiesce(KILL_GRACE + KILL_GRACE + Duration::from_secs(1))
+            .await;
+        let elapsed = started.elapsed();
+        tokio::time::resume();
+        assert!(elapsed >= KILL_GRACE + KILL_GRACE);
         assert!(
-            registry
-                .quiesce(KILL_GRACE + KILL_GRACE + Duration::from_secs(1))
-                .await,
+            quiesced,
             "the background driver exceeded the direct-command ownership bound"
         );
         assert_eq!(registry.status(id), Some(TaskStatus::Killed));
@@ -2665,25 +2705,26 @@ esac
     async fn cancellation_kills_command_and_marks_error() {
         let (mut ctx, _updates) = RecordingCtx::new();
         let token = ctx.cancellation();
-        // Trigger cancellation shortly after the bash command starts.
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            token.cancel();
-        });
+        let gate = BashGate::new().await;
 
         let start = Instant::now();
-        let outcome = BashTool::default()
-            .execute(
-                &mut ctx,
-                BashInput {
-                    command: "sleep 30".to_string(),
-                    timeout: 60,
-                    description: "test cancellation".to_string(),
-                    run_in_background: false,
-                },
-            )
-            .await
-            .expect("execute");
+        let tool = BashTool::default();
+        let call = tool.execute(
+            &mut ctx,
+            BashInput {
+                command: gate.command(),
+                timeout: 60,
+                description: "test cancellation".to_string(),
+                run_in_background: false,
+            },
+        );
+        tokio::pin!(call);
+        let _held = tokio::select! {
+            outcome = &mut call => panic!("command ended before cancellation: {outcome:?}"),
+            held = gate.ready() => held,
+        };
+        token.cancel();
+        let outcome = call.await.expect("execute");
         let elapsed = start.elapsed();
 
         assert!(
@@ -3622,20 +3663,23 @@ esac
     #[tokio::test]
     async fn the_grace_outlives_a_leader_that_exits_at_once() {
         let dir = TempDir::new().expect("create temp dir");
+        let gate = BashGate::new().await;
+        let leader_path = dir.path().join("leader-pid");
         let pid_path = dir.path().join("descendant-pid");
         let cleaned_path = dir.path().join("descendant-cleaned-up");
 
-        // The leader goes on the first signal. Its descendant needs
-        // half a second to finish cleaning up, far longer than the
-        // leader survives and far shorter than the grace.
+        // Hold the descendant's handler until the leader is observed dead.
+        // Reaping the leader must not cut short the group's real TERM grace.
         let command = format!(
-            "{{ trap \"sleep 0.5; echo done > '{cleaned}'; exit 0\" TERM; \
+            "trap 'exit 0' TERM; echo $$ > '{leader}'; \
+             {{ trap \"{gate}; echo done > '{cleaned}'; exit 0\" TERM; \
                 echo $BASHPID > '{pid}'; \
                 while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-             trap 'exit 0' TERM; \
              until [ -s '{pid}' ]; do sleep 0.01; done; \
              sleep 30",
             cleaned = cleaned_path.display(),
+            gate = gate.command(),
+            leader = leader_path.display(),
             pid = pid_path.display(),
             dir = dir.path().display(),
         );
@@ -3655,7 +3699,16 @@ esac
         )
         .await;
 
+        let held = gate.ready().await;
+        let leader = read_pid(&leader_path);
         let descendant = read_pid(&pid_path);
+        wait_until(|| !process_is_live(leader), "the leader to exit on TERM").await;
+        assert!(
+            process_is_live(descendant),
+            "the handler must outlive its leader"
+        );
+        assert!(!cleaned_path.exists(), "the handler must still be held");
+        drop(held);
         wait_until(
             || cleaned_path.exists(),
             "the descendant to finish its SIGTERM handler: a grace that ends when the \
@@ -3664,7 +3717,7 @@ esac
         .await;
         wait_until(
             || !process_is_live(descendant),
-            "the descendant to be killed once the grace is over",
+            "the descendant to exit after completing its TERM handler",
         )
         .await;
     }
@@ -4242,12 +4295,14 @@ esac
     #[tokio::test]
     async fn background_started_result_carries_id_and_spill_path() {
         let mut ctx = DummyToolContext::default();
+        let gate = BashGate::new().await;
+        let command = format!("echo hello; {}", gate.command());
         let spill_dir = TempDir::new().expect("create temp dir");
         let outcome = BashTool::new(false, Some(spill_dir.path().to_path_buf()))
             .execute(
                 &mut ctx,
                 BashInput {
-                    command: "echo hello; sleep 0.2".to_string(),
+                    command: command.clone(),
                     timeout: 30,
                     description: "test background start".to_string(),
                     run_in_background: true,
@@ -4255,13 +4310,13 @@ esac
             )
             .await
             .expect("execute");
-        // Immediacy is proven structurally: the started result has no
-        // exit code while the 200ms child is still sleeping.
+        let held = gate.ready().await;
+        // The started result arrives while completion is explicitly held.
 
         assert!(!outcome.is_error);
         let wire = extract_text(&outcome.content);
         assert!(
-            wire.starts_with("Started background task #1: echo hello; sleep 0.2"),
+            wire.starts_with(&format!("Started background task #1: {command}")),
             "wire: {wire:?}"
         );
         assert!(
@@ -4292,6 +4347,13 @@ esac
         );
 
         let registry = ctx.task_registry();
+        assert_eq!(registry.status(1), Some(TaskStatus::Running));
+        assert!(
+            registry
+                .drain_notices(aj_agent::events::AgentId::Main)
+                .is_empty()
+        );
+        drop(held);
         let status = await_terminal(&registry, 1).await;
         assert_eq!(status, aj_agent::tool::TaskStatus::Exited(Some(0)));
 
@@ -4305,7 +4367,9 @@ esac
         assert_eq!(notices.len(), 1);
         let body = &notices[0].body;
         assert!(
-            body.starts_with("Background task #1 finished: echo hello; sleep 0.2 — exit code 0"),
+            body.starts_with(&format!(
+                "Background task #1 finished: {command} — exit code 0"
+            )),
             "notice body: {body:?}"
         );
         assert!(body.contains("hello"), "notice body: {body:?}");
@@ -4395,13 +4459,17 @@ esac
     #[tokio::test]
     async fn background_ignores_timeout() {
         let mut ctx = DummyToolContext::default();
+        let gate = BashGate::new().await;
         // A zero-second timeout would kill the foreground path
         // immediately; the background task must run to its natural
         // exit anyway.
-        let (id, spill_path, _spill_dir) =
-            start_background(&mut ctx, "sleep 0.3; echo done", 0).await;
+        let command = format!("{}; echo done", gate.command());
+        let (id, spill_path, _spill_dir) = start_background(&mut ctx, &command, 0).await;
+        let held = gate.ready().await;
 
         let registry = ctx.task_registry();
+        assert_eq!(registry.status(id), Some(TaskStatus::Running));
+        drop(held);
         let status = await_terminal(&registry, id).await;
         assert_eq!(status, aj_agent::tool::TaskStatus::Exited(Some(0)));
         let on_disk = std::fs::read_to_string(&spill_path).expect("spill readable");

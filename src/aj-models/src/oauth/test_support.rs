@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -125,18 +124,14 @@ impl MockTokenServer {
         }
     }
 
-    /// Wait briefly for the spawned task to record a request and return
-    /// the most recent capture.
+    /// Return the most recent request after awaiting its response. The server
+    /// records each request before writing that response.
     pub async fn captured(&self) -> CapturedRequest {
-        for _ in 0..50 {
-            {
-                let lock = self.captured.lock().await;
-                if let Some(b) = lock.last() {
-                    return b.clone();
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("no request was captured by the mock server");
+        self.captured
+            .lock()
+            .await
+            .last()
+            .expect("no request was captured by the mock server")
+            .clone()
     }
 }

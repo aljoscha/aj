@@ -1065,7 +1065,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancellation_during_inter_event_delay_emits_aborted_terminal() {
         // Drive a script with a long delay between Start and Done so we
         // can cancel mid-flight and observe the aborted terminal.
@@ -1080,8 +1080,6 @@ mod tests {
                 partial: msg.clone(),
             })
             .push(
-                // Long enough that the cancel below races in well before
-                // this step gets delivered.
                 Duration::from_secs(60),
                 AssistantMessageEvent::Done {
                     reason: DoneReason::Stop,
@@ -1094,14 +1092,13 @@ mod tests {
             cancel: Some(token.clone()),
             ..StreamOptions::default()
         };
-        let stream = provider.stream(&fake_model(), &Context::new("system"), &options);
-
-        // Fire the cancel after the producer has had a chance to
-        // deliver the first (immediate) Start step and begin sleeping.
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            token.cancel();
-        });
+        let mut stream = provider.stream(&fake_model(), &Context::new("system"), &options);
+        assert!(matches!(
+            stream.next().await,
+            Some(AssistantMessageEvent::Start { .. })
+        ));
+        assert!(futures::poll!(stream.next()).is_pending());
+        token.cancel();
 
         let events = collect_events(stream).await;
         let last = events.last().expect("at least the aborted terminal");
@@ -1422,7 +1419,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn explicit_call_kind_survives_streaming_and_cancellation() {
         let source = "// 雪\nawait tools.read({x: `a\\b`});\n";
         for is_raw in [false, true] {

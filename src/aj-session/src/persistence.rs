@@ -988,10 +988,17 @@ mod tests {
         );
 
         let sidecar = dir.path().join("meta").join(format!("{id}.archived"));
+        let old_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        File::options()
+            .write(true)
+            .open(&sidecar)
+            .expect("open sidecar")
+            .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+            .expect("set old sidecar timestamp");
         let written_at = std::fs::metadata(&sidecar)
             .and_then(|meta| meta.modified())
             .expect("the sidecar's timestamp");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(written_at, old_mtime);
         persistence
             .write_archived(id, true)
             .expect("archiving an archived session is not an error");
@@ -1645,9 +1652,6 @@ mod tests {
             let mut log = ConversationLog::create(&persistence).expect("create");
             append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
             ids.push(log.session_id().to_string());
-            // Tiny sleep so the millisecond-resolution mint sees a fresh
-            // timestamp for each file.
-            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         persistence
             .write_tag(&ids[1], Some("fix-auth"))
@@ -1671,7 +1675,6 @@ mod tests {
             let mut log = ConversationLog::create(&persistence).expect("create");
             append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
             ids.push(log.session_id().to_string());
-            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         persistence.write_archived(&ids[1], true).expect("archive");
 
@@ -1904,18 +1907,41 @@ mod tests {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "world");
-        std::thread::sleep(std::time::Duration::from_millis(20));
         let mut view = ConversationView::user(&mut log);
         view.add_message(user_msg("follow-up"))
             .expect("append user2");
 
-        let p = preview_of(&persistence, log.session_id());
-        let min_expected = p.created_at + chrono::Duration::milliseconds(10);
+        let session_id = log.session_id().to_string();
+        let path = log.path().to_path_buf();
+        let mut entries: Vec<_> = log.entries_in_order().into_iter().cloned().collect();
+        drop(log);
+
+        // Persist out-of-order message times so neither file order nor mtime
+        // can stand in for the largest message timestamp.
+        let base = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut offsets = [1, 3, 2].into_iter();
+        let mut lines = String::new();
+        for entry in &mut entries {
+            let offset = if matches!(
+                entry.entry,
+                crate::log::ConversationEntryKind::Message { .. }
+            ) {
+                offsets.next().expect("three message entries")
+            } else {
+                4
+            };
+            entry.timestamp = Some(base + chrono::Duration::seconds(offset));
+            lines.push_str(&serde_json::to_string(entry).expect("serialize entry"));
+            lines.push('\n');
+        }
         assert!(
-            p.last_message_at >= min_expected,
-            "last_message_at = {}, expected >= {}",
-            p.last_message_at,
-            min_expected
+            offsets.next().is_none(),
+            "all three message times were used"
         );
+        std::fs::write(path, lines).expect("persist fixture timestamps");
+
+        let p = preview_of(&persistence, &session_id);
+        assert_eq!(p.message_count, 3);
+        assert_eq!(p.last_message_at, base + chrono::Duration::seconds(3));
     }
 }

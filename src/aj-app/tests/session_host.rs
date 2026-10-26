@@ -2684,10 +2684,6 @@ async fn two_sessions_on_one_host_stay_independent() {
 /// The rule is what keeps a busy session a client never asked for from
 /// filling that client's bounded queue and evicting it.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn a_stream_sees_nothing_from_a_session_it_did_not_attach() {
     let harness = Harness::new(Vec::new());
     let watched = harness.create().await;
@@ -2711,10 +2707,9 @@ async fn a_stream_sees_nothing_from_a_session_it_did_not_attach() {
 
     harness.prompt(&watched, "hi").await;
     let frames = client.pump_until_idle().await;
-    tokio::time::sleep(LIST_SETTLE).await;
     let frames: Vec<Frame> = frames
         .into_iter()
-        .chain(drained(&mut client.stream))
+        .chain(list_publisher_windows(&mut client.stream).await)
         .collect();
 
     assert!(
@@ -5995,6 +5990,9 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
     let harness = detached_sub_harness();
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
+    // Both providers are scripted and log appends are synchronous. Advance
+    // their relative pacing without ageing the host's real idle-grace clock.
+    tokio::time::pause();
     harness
         .prompt(&session, "look into it in the background")
         .await;
@@ -6097,6 +6095,7 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
             .any(|text| text.contains(PARENT_ANSWER)),
     };
     assert_no_dangling(&client.chat);
+    tokio::time::resume();
     harness.host.shutdown().await;
     ending
 }
@@ -6220,10 +6219,6 @@ fn assert_detached_sub_was_killed(ending: &DetachedEnding, parent: ParentTurn) {
 /// invented for a cancelled run, whether a status, a box report, a
 /// completion notice or a notice of its own, fails here.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: paced streaming on the successful path"
-)]
 async fn a_cancelled_detached_sub_ends_exactly_as_a_killed_task_does() {
     for parent in [ParentTurn::Ended, ParentTurn::Live] {
         let cancelled = end_detached_sub(EndDetached::Cancel, parent).await;
@@ -7890,10 +7885,6 @@ async fn a_persistence_failure_ends_the_materialization_and_a_reopen_rebuilds_it
 /// it ends only its own materialization: another session on the host keeps
 /// working and its bytes are untouched.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: paced streaming on the successful path"
-)]
 async fn a_detached_writers_persistence_failure_ends_only_its_session() {
     let harness = detached_sub_harness();
     let affected = harness.create().await;
@@ -7918,6 +7909,9 @@ async fn a_detached_writers_persistence_failure_ends_only_its_session() {
         .join(format!("{healthy}.jsonl"));
     let healthy_baseline = std::fs::read(&healthy_path).expect("read healthy baseline bytes");
 
+    // Only scripted providers run here. The append fault and byte comparisons
+    // still exercise the real synchronous log I/O.
+    tokio::time::pause();
     harness
         .prompt(&affected, "run the detached persistence fault")
         .await;
@@ -8013,6 +8007,7 @@ async fn a_detached_writers_persistence_failure_ends_only_its_session() {
         torn_bytes,
         "healthy-session work appended after the affected torn tail"
     );
+    tokio::time::resume();
     harness.host.shutdown().await;
 }
 
@@ -9212,6 +9207,31 @@ async fn settled(harness: &Harness, session: &str, last_seq: u64) {
 // 14. List frames
 // ---------------------------------------------------------------------------
 
+/// Observe a pending refresh and any duplicate tail over three publisher
+/// windows, reading concurrently so queue replacement cannot hide duplicates.
+///
+/// Call only after attach/commands or the terminal idle frame have completed,
+/// with no turn or external I/O still in flight. The publisher reads in-memory
+/// rows, so these windows can use Tokio time. This does not advance the host's
+/// real idle-grace clock or fence unrelated transient deliveries.
+async fn list_publisher_windows(stream: &mut Attachment) -> Vec<Frame> {
+    tokio::time::pause();
+    let mut frames = Vec::new();
+    let _ = tokio::time::timeout(LIST_WINDOW * 3, async {
+        loop {
+            frames.push(
+                stream
+                    .recv()
+                    .await
+                    .expect("the publisher observer stays open"),
+            );
+        }
+    })
+    .await;
+    tokio::time::resume();
+    frames
+}
+
 /// `list` frames carry the whole directory with per-session status, and a
 /// busy turn does not produce one frame per event.
 ///
@@ -9221,10 +9241,6 @@ async fn settled(harness: &Harness, session: &str, last_seq: u64) {
 /// own contract is
 /// [`distinct_directories_inside_one_window_reach_a_client_as_one_frame`].
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn list_frames_carry_the_directory_and_not_one_per_event() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -9248,11 +9264,8 @@ async fn list_frames_carry_the_directory_and_not_one_per_event() {
     .await;
 
     harness.prompt(&session, "hi").await;
-    let frames = until_idle(&mut stream).await;
-    // Give the debounce tick room to publish whatever it coalesced.
-    tokio::time::sleep(LIST_SETTLE).await;
-    let mut frames = frames;
-    frames.extend(drained(&mut stream));
+    let mut frames = until_idle(&mut stream).await;
+    frames.extend(list_publisher_windows(&mut stream).await);
 
     let lists: Vec<&Frame> = frames
         .iter()
@@ -9291,10 +9304,6 @@ async fn list_frames_carry_the_directory_and_not_one_per_event() {
 /// was, so its deltas do not wake the list publisher at all, let alone send a
 /// frame.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: real delta-only publication observation window"
-)]
 async fn streaming_deltas_alone_do_not_wake_the_list_publisher() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -9326,14 +9335,20 @@ async fn streaming_deltas_alone_do_not_wake_the_list_publisher() {
         )
     })
     .await;
-    // Whatever the prompt's own durable appends and the busy flip marked has
-    // been composed by the end of one window.
-    let settle = Instant::now() + LIST_SETTLE;
-    while let Ok(Some(_)) = tokio::time::timeout_at(settle.into(), stream.recv()).await {}
+    // The first update establishes the delta-only phase. No external I/O is
+    // needed until the reply ends, so its pacing and publisher windows can
+    // advance together. Drain the prompt's durable appends and busy flip first.
+    tokio::time::pause();
+    let settle = tokio::time::Instant::now() + LIST_WINDOW * 3;
+    while let Ok(Some(_)) = tokio::time::timeout_at(settle, stream.recv()).await {}
     let before = harness.host.list_builds();
-    let window = Instant::now() + LIST_WINDOW * 2;
+    assert!(
+        before > 0,
+        "the prompt woke the publisher before measurement"
+    );
+    let window = tokio::time::Instant::now() + LIST_WINDOW * 2;
     let mut measured = Vec::new();
-    while let Ok(Some(frame)) = tokio::time::timeout_at(window.into(), stream.recv()).await {
+    while let Ok(Some(frame)) = tokio::time::timeout_at(window, stream.recv()).await {
         measured.push(frame);
     }
     let after = harness.host.list_builds();
@@ -9362,6 +9377,7 @@ async fn streaming_deltas_alone_do_not_wake_the_list_publisher() {
         "{updates} streaming deltas woke the list publisher",
     );
     until_idle(&mut stream).await;
+    tokio::time::resume();
     harness.host.shutdown().await;
 }
 
@@ -9396,16 +9412,11 @@ const RELABEL_STEP: Duration = Duration::from_millis(5);
 /// the next one, so a client that only drains at the end sees one frame
 /// whatever the publisher did, and the tick would be unobservable.
 ///
-/// The timing assumption is that the burst spans far fewer coalescing windows
-/// than it has labels. Wall clock enters only through that ratio, which the
-/// guard below asserts rather than assumes: a machine loaded enough to
-/// stretch the burst past it fails loudly instead of passing on a bound it
-/// would meet with or without the tick.
+/// Once attach has completed, commands on this live session do their sidecar
+/// writes synchronously. Only the burst's pacing and publisher timers remain,
+/// so virtual time can drive them without racing external I/O. The burst must
+/// span far fewer windows than labels or the frame bound proves nothing.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn distinct_directories_inside_one_window_reach_a_client_as_one_frame() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
@@ -9421,13 +9432,13 @@ async fn distinct_directories_inside_one_window_reach_a_client_as_one_frame() {
     // Creating and attaching marked the directory dirty. Let the publisher
     // finish with that and park, so the burst opens a window of its own
     // instead of landing in the tail of one already running.
-    tokio::time::sleep(LIST_SETTLE).await;
-    drained(&mut stream);
+    list_publisher_windows(&mut stream).await;
+    tokio::time::pause();
 
     let host = harness.host.clone();
     let id = session.clone();
     let burst = tokio::spawn(async move {
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         for index in 0..RELABELS {
             host.command(
                 &id,
@@ -9453,9 +9464,8 @@ async fn distinct_directories_inside_one_window_reach_a_client_as_one_frame() {
     let burst = bounded("the relabelling to finish", burst)
         .await
         .expect("the relabelling task");
-    // Whatever the tick was still holding when the last label landed.
-    tokio::time::sleep(LIST_SETTLE).await;
-    frames.extend(drained(&mut stream));
+    tokio::time::resume();
+    frames.extend(list_publisher_windows(&mut stream).await);
 
     let labels: Vec<Option<String>> = directories(&frames)
         .iter()
@@ -9471,15 +9481,13 @@ async fn distinct_directories_inside_one_window_reach_a_client_as_one_frame() {
     // One frame per window the burst spanned, one for the window that carries
     // its tail, and one for a boundary landing between two labels.
     let allowed = windows + 2;
-    // A stretched burst spans windows of its own, and one frame per window is
-    // what a publisher produces with or without the tick, so past this ratio
-    // the bound below is met either way.
+    // Keep the fixture discriminating: too many windows would permit one
+    // frame per label even without coalescing.
     assert!(
         allowed * 2 <= RELABELS,
         "setting {RELABELS} labels took {burst:?}, which spans {windows} \
-         coalescing windows and allows {allowed} frames: this machine is too \
-         loaded to tell a coalesced burst from an uncoalesced one, so this \
-         test measures nothing",
+         coalescing windows and allows {allowed} frames: the burst cannot \
+         distinguish a coalesced publisher from an uncoalesced one",
     );
     assert!(
         labels.len() <= allowed,
@@ -9535,12 +9543,8 @@ fn directories(frames: &[Frame]) -> Vec<Vec<SessionSummary>> {
 
 /// The refresh path performs no filesystem work at all: every
 /// directory read the host does is attributable to an enumeration point, and a
-/// streaming turn, which marks the directory dirty on every event, is not one.
+/// streaming turn's durable appends and busy transitions are not one.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn a_turns_refreshes_never_read_the_directory() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -9565,10 +9569,8 @@ async fn a_turns_refreshes_never_read_the_directory() {
 
     let before = harness.host.store_directory_reads();
     harness.prompt(&session, "hi").await;
-    let frames = until_idle(&mut stream).await;
-    tokio::time::sleep(LIST_SETTLE).await;
-    let mut frames = frames;
-    frames.extend(drained(&mut stream));
+    let mut frames = until_idle(&mut stream).await;
+    frames.extend(list_publisher_windows(&mut stream).await);
 
     let event_count = events(&frames).len();
     assert!(
@@ -9592,10 +9594,6 @@ async fn a_turns_refreshes_never_read_the_directory() {
 /// working directory, so a sibling's session is a conflict to
 /// surface when asked, not a workload to poll for.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn a_siblings_session_appears_at_the_next_enumeration_point() {
     let harness = Harness::new(vec![finalized_text_message("hi back")]);
     let session = harness.create().await;
@@ -9615,10 +9613,8 @@ async fn a_siblings_session_appears_at_the_next_enumeration_point() {
     let sibling = sibling_log(&harness, "2020-01-01-00-00-00-999");
     // A turn's worth of refreshes, none of which may go looking.
     harness.prompt(&session, "hi").await;
-    let frames = until_idle(&mut stream).await;
-    tokio::time::sleep(LIST_SETTLE).await;
-    let mut frames = frames;
-    frames.extend(drained(&mut stream));
+    let mut frames = until_idle(&mut stream).await;
+    frames.extend(list_publisher_windows(&mut stream).await);
     let published = directories(&frames);
     assert!(!published.is_empty(), "the directory was published");
     assert!(
@@ -9641,11 +9637,13 @@ async fn a_siblings_session_appears_at_the_next_enumeration_point() {
             .any(|entry| entry.id == sibling),
         "the listing found the sibling's log",
     );
+    tokio::time::pause();
     frames_until(&mut stream, "the sibling to be published", |frame| {
         matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == sibling))
     })
     .await;
+    tokio::time::resume();
     drop(stream);
     harness.host.shutdown().await;
 }
@@ -9677,17 +9675,23 @@ async fn a_siblings_session_is_attachable_before_it_is_listed() {
 /// long-running host sees what the store holds now rather than what it held
 /// when the host started.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn a_fresh_stream_enumerates_the_store() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
+    let mut watching = harness.host.attach(&[]).await.expect("directory observer");
+    list_publisher_windows(&mut watching).await;
+    assert!(harness.host.list_builds() > 0, "the create was refreshed");
     let sibling = sibling_log(&harness, "2020-01-01-00-00-00-998");
-    // Past the debounce of the create above, so the frame below can only have
-    // come from the attach.
-    tokio::time::sleep(LIST_SETTLE).await;
+    assert!(
+        harness
+            .host
+            .published_directory()
+            .await
+            .sessions
+            .iter()
+            .all(|row| row.id != sibling),
+        "the sibling is not yet known to the publisher",
+    );
 
     let mut stream = harness
         .host
@@ -9762,33 +9766,20 @@ async fn the_hosts_own_changes_need_no_enumeration() {
     harness.host.shutdown().await;
 }
 
-/// No two `list` frames in a row carry the same directory. Dirty is marked on
-/// every session event and most events move nothing a directory row shows, so
-/// unsuppressed a streaming turn republishes one payload at the debounce rate
-/// for the length of the turn.
+/// Refreshes of identical rows do not repeat a directory already delivered.
+/// Reapplying a tag wakes the real publisher without changing any row field,
+/// so the build counter distinguishes suppression from a publisher that never
+/// ran. A subsequent turn must still publish its changed durable position.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn an_unchanged_directory_is_not_published_again() {
-    let harness = Harness::with_provider(scripted(
-        vec![
-            // Long and slow, so the turn spans many coalescing ticks and an
-            // unsuppressed publisher has room to repeat itself.
-            finalized_text_message(&"a slowly streamed answer ".repeat(40)),
-            finalized_text_message("and a second answer"),
-        ],
-        1,
-        Duration::from_millis(2),
-    ));
+    let harness = Harness::new(vec![
+        finalized_text_message("a recorded answer"),
+        finalized_text_message("and a second answer"),
+    ]);
     let session = harness.create().await;
     let mut stream = harness
         .host
-        .attach(&[AttachRequest {
-            session: session.clone(),
-            cursor: None,
-        }])
+        .attach(&[attach_request(&session)])
         .await
         .expect("attach");
     frames_until(&mut stream, "caught_up", |frame| {
@@ -9797,37 +9788,54 @@ async fn an_unchanged_directory_is_not_published_again() {
     .await;
 
     harness.prompt(&session, "hi").await;
-    let frames = until_idle(&mut stream).await;
-    tokio::time::sleep(LIST_SETTLE).await;
-    let mut frames = frames;
-    frames.extend(drained(&mut stream));
+    let mut frames = until_idle(&mut stream).await;
+    frames.extend(list_publisher_windows(&mut stream).await);
     let published = directories(&frames);
-    assert!(
-        published.len() >= 2,
-        "the turn published {} directories, too few for the check below to mean \
-         anything",
-        published.len(),
-    );
+    let settled = published.last().expect("the idle directory was published");
+    let row = settled
+        .iter()
+        .find(|entry| entry.id == session)
+        .expect("the session's row");
+    assert!(!row.working);
+    assert!(row.last_seq.is_some_and(|seq| seq > 0));
+    let mark = row.last_seq;
     for pair in published.windows(2) {
         assert_ne!(pair[0], pair[1], "the same directory was published twice");
     }
 
-    let settled = published.last().expect("a directory").clone();
-    let mark = settled
-        .iter()
-        .find(|entry| entry.id == session)
-        .expect("the session's row")
-        .last_seq;
+    for _ in 0..3 {
+        let before = harness.host.list_builds();
+        harness
+            .host
+            .command(&session, Command::Tag { tag: None })
+            .await
+            .expect("reapply the same tag");
+        assert_eq!(
+            &harness.host.published_directory().await.sessions,
+            settled,
+            "the refresh must have genuinely unchanged rows",
+        );
+        let frames = list_publisher_windows(&mut stream).await;
+        assert!(
+            harness.host.list_builds() > before,
+            "the publisher must actually compose the unchanged rows"
+        );
+        assert!(
+            directories(&frames).is_empty(),
+            "an unchanged directory was published again: {frames:?}"
+        );
+    }
 
-    // A real change still gets through, so the suppression is not just a
-    // cheaper way of publishing nothing. The mark, because a turn shorter than
-    // the coalescing window can be over before `working` is ever sampled.
     harness.prompt(&session, "again").await;
-    frames_until(&mut stream, "the second turn to be published", |frame| {
-        matches!(frame, Frame::List { sessions, .. }
-            if sessions.iter().any(|entry| entry.id == session && entry.last_seq > mark))
-    })
-    .await;
+    let mut frames = until_idle(&mut stream).await;
+    frames.extend(list_publisher_windows(&mut stream).await);
+    assert!(
+        directories(&frames)
+            .last()
+            .expect("the changed directory was published")
+            .iter()
+            .any(|entry| entry.id == session && !entry.working && entry.last_seq > mark)
+    );
     drop(stream);
     harness.host.shutdown().await;
 }
@@ -9974,10 +9982,6 @@ async fn attach_serves_its_initial_directory_without_waiting_for_a_refresh() {
 /// client attaching to a host whose directory has not moved in hours is still
 /// served a snapshot. Nothing else on the stream carries one.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
     let harness = Harness::new(vec![finalized_text_message("recorded")]);
     let session = harness.create().await;
@@ -9993,14 +9997,12 @@ async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
         matches!(frame, Frame::CaughtUp { .. })
     })
     .await;
-    // Quiesce, so the directory the second client needs is one the first has
-    // already been sent and a republish would otherwise be suppressed.
-    loop {
-        tokio::time::sleep(LIST_SETTLE).await;
-        if directories(&drained(&mut settled)).is_empty() {
-            break;
-        }
-    }
+    frames_until(&mut settled, "the first client's directory", |frame| {
+        matches!(frame, Frame::List { sessions, .. }
+            if sessions.iter().any(|entry| entry.id == session))
+    })
+    .await;
+    assert!(directories(&list_publisher_windows(&mut settled).await).is_empty());
 
     let mut fresh = harness
         .host
@@ -10093,10 +10095,6 @@ async fn list_frames_report_a_working_session() {
 /// as on-disk only until it happens to emit an event, and an
 /// attached-but-idle session emits none.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn a_materialization_publishes_the_directory() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
     let dormant = harness.create().await;
@@ -10139,9 +10137,9 @@ async fn a_materialization_publishes_the_directory() {
     })
     .await;
     assert!(listed(&settled, false), "filtered above");
-    tokio::time::sleep(LIST_SETTLE).await;
     assert!(
-        drained(&mut stream)
+        list_publisher_windows(&mut stream)
+            .await
             .iter()
             .all(|frame| !matches!(frame, Frame::List { .. })),
         "no directory change is still pending",
@@ -10157,11 +10155,13 @@ async fn a_materialization_publishes_the_directory() {
         }])
         .await
         .expect("attach the dormant session");
+    tokio::time::pause();
     let frames = frames_until(&mut stream, "the directory to report it live", |frame| {
         matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == dormant && entry.live))
     })
     .await;
+    tokio::time::resume();
     assert!(listed(&frames, true), "filtered above");
 
     drop(attached);
@@ -10182,10 +10182,6 @@ async fn tag_of(host: &SessionHost, session: &str) -> Option<String> {
 /// it takes it off both. It is display metadata, so this is the only place it
 /// shows: no log entry, no `state` frame.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn a_tag_reaches_the_row_and_the_directory() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
@@ -10204,8 +10200,7 @@ async fn a_tag_reaches_the_row_and_the_directory() {
     assert_eq!(tag_of(&harness.host, &session).await, None);
     // Past the debounce of everything above, so a directory frame from here on
     // can only be one the tag earned.
-    tokio::time::sleep(LIST_SETTLE).await;
-    drained(&mut stream);
+    list_publisher_windows(&mut stream).await;
 
     harness
         .host
@@ -10217,6 +10212,7 @@ async fn a_tag_reaches_the_row_and_the_directory() {
         )
         .await
         .expect("the tag is accepted");
+    tokio::time::pause();
     frames_until(&mut stream, "the label to be published", |frame| {
         matches!(frame, Frame::List { sessions, .. }
         if sessions.iter().any(|entry| {
@@ -10224,6 +10220,7 @@ async fn a_tag_reaches_the_row_and_the_directory() {
         }))
     })
     .await;
+    tokio::time::resume();
     assert_eq!(
         tag_of(&harness.host, &session).await.as_deref(),
         Some("fix-auth"),
@@ -10238,18 +10235,19 @@ async fn a_tag_reaches_the_row_and_the_directory() {
         "the label is in the store, where another host would find it",
     );
 
-    tokio::time::sleep(LIST_SETTLE).await;
-    drained(&mut stream);
+    list_publisher_windows(&mut stream).await;
     harness
         .host
         .command(&session, Command::Tag { tag: None })
         .await
         .expect("clearing is accepted");
+    tokio::time::pause();
     frames_until(&mut stream, "the label to be dropped", |frame| {
         matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session && entry.tag.is_none()))
     })
     .await;
+    tokio::time::resume();
     assert_eq!(tag_of(&harness.host, &session).await, None);
     assert_eq!(
         harness
@@ -10636,10 +10634,6 @@ async fn archived_of(host: &SessionHost, session: &str) -> Option<bool> {
 /// the only place it shows: nothing about the session's state changed, so
 /// there is no `state` frame and no entry in the log.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn an_archive_reaches_the_row_and_the_directory() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
@@ -10659,19 +10653,20 @@ async fn an_archive_reaches_the_row_and_the_directory() {
     assert!(!before.archived);
     // Past the debounce of everything above, so a directory frame from here on
     // can only be one the archive earned.
-    tokio::time::sleep(LIST_SETTLE).await;
-    drained(&mut stream);
+    list_publisher_windows(&mut stream).await;
 
     harness
         .host
         .command(&session, Command::Archive { archived: true })
         .await
         .expect("the archive is accepted");
+    tokio::time::pause();
     let frames = frames_until(&mut stream, "the bit to be published", |frame| {
         matches!(frame, Frame::List { sessions, .. }
         if sessions.iter().any(|entry| entry.id == session && entry.archived))
     })
     .await;
+    tokio::time::resume();
     let after = summary(&harness.host, &session).await.expect("listed");
     assert!(
         after.archived,
@@ -10697,18 +10692,19 @@ async fn an_archive_reaches_the_row_and_the_directory() {
         "the bit is in the store, where another host would find it",
     );
 
-    tokio::time::sleep(LIST_SETTLE).await;
-    drained(&mut stream);
+    list_publisher_windows(&mut stream).await;
     harness
         .host
         .command(&session, Command::Archive { archived: false })
         .await
         .expect("unarchiving is accepted");
+    tokio::time::pause();
     frames_until(&mut stream, "the bit to be dropped", |frame| {
         matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session && !entry.archived))
     })
     .await;
+    tokio::time::resume();
     assert_eq!(archived_of(&harness.host, &session).await, Some(false));
     assert!(
         !harness
@@ -13126,10 +13122,6 @@ async fn shutdown_of_idle_sessions_is_fast_and_releases_every_lock() {
 /// healthy until a stream writer existed, which is why the check lives here
 /// rather than waiting for one.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: 600ms list-publisher settling windows"
-)]
 async fn every_published_frame_round_trips_through_the_wire_codec() {
     let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(5)));
     let session = harness.create().await;
@@ -13146,8 +13138,10 @@ async fn every_published_frame_round_trips_through_the_wire_codec() {
     })
     .await;
 
+    tokio::time::pause();
     harness.prompt(&session, "delegate it").await;
     frames.extend(until_idle(&mut stream).await);
+    tokio::time::resume();
     // A settings change as well, for the notice and `state` frames the host
     // synthesizes itself.
     harness
@@ -13168,9 +13162,8 @@ async fn every_published_frame_round_trips_through_the_wire_codec() {
         })
         .await,
     );
-    // Give the directory tick room, so a `list` frame is in the sample too.
-    tokio::time::sleep(LIST_SETTLE).await;
-    frames.extend(drained(&mut stream));
+    // Include the idle directory after the turn and settings state frames.
+    frames.extend(list_publisher_windows(&mut stream).await);
 
     // The same history as a full backfill: projected `MessageEnd`s, the
     // sub-agent bracketing, and the conclusion sweep behind `caught_up`.
