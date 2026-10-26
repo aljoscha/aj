@@ -59,10 +59,9 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// cumulative snapshot of the whole message so far. Written as they come, a
 /// client that keeps up receives every snapshot, and the bytes grow with the
 /// square of the reply's length. Holding the writer this long lets newer
-/// snapshots replace the queued one, so a reply costs one snapshot per
-/// window. The price is up to one window of added latency on streaming text,
-/// and on a reliable frame that happens to follow a lossy one. Short enough
-/// that streaming still reads as continuous.
+/// snapshots replace the queued one. Queued reliable frames flush their prefix
+/// without further pacing. The window bounds the added pacing delay for a
+/// reliable frame while keeping streaming updates visually continuous.
 const LOSSY_PACE: Duration = Duration::from_millis(50);
 
 /// How long [`RemoteServer::shutdown`] waits for in-flight streams.
@@ -893,11 +892,13 @@ fn list_frames(params: &[(String, String)]) -> Result<ListFrames, ApiError> {
 /// re-attaches. A block's only waits are the session's log lock, which appends
 /// hold briefly, and the client reading it, which is not silence on its side.
 ///
-/// After a lossy frame the writer holds off for [`LOSSY_PACE`] before reading
-/// the next one. Holding outside [`Attachment::recv`] is what coalesces: the
-/// frames published meanwhile wait in the outbound queue, where a newer
-/// snapshot replaces the queued one of its key. Attach blocks carry no lossy
-/// frames, so a block is never held.
+/// After a lossy frame the writer holds off for [`LOSSY_PACE`] while the queue
+/// can coalesce. Frames published meanwhile stay in the outbound queue, where
+/// a newer snapshot replaces the queued one of its key. Queued reliable frames
+/// suppress further holds, so distinct snapshot keys cannot stack pacing
+/// windows ahead of a completion. Reading stays FIFO, without a second buffer.
+/// A reliable frame arriving during a hold waits at most that one window.
+/// Attach blocks carry no lossy frames, so a block is never held.
 fn frame_stream(
     attachment: Attachment,
     idle: Duration,
@@ -905,7 +906,9 @@ fn frame_stream(
     let start = (attachment, None);
     futures::stream::unfold(Some(start), move |state| async move {
         let (mut attachment, held_until) = state?;
-        if let Some(deadline) = held_until {
+        if let Some(deadline) = held_until
+            && attachment.can_coalesce()
+        {
             tokio::time::sleep_until(deadline).await;
         }
         let frame = loop {
@@ -1156,6 +1159,140 @@ impl From<IdentityError> for ApiError {
                 _ => err.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_pacing_tests {
+    use super::*;
+    use aj_agent::events::AgentEvent;
+    use aj_app::test_support::finalized_text_message;
+    use aj_models::types::{TextContent, UserContent};
+    use eventsource_stream::Eventsource;
+    use futures::{FutureExt, StreamExt};
+
+    use crate::remote::tests::{HostHandles, bounded, scripted, scripted_host};
+
+    #[tokio::test]
+    async fn queued_completions_do_not_wait_behind_snapshot_pacing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host = scripted_host(
+            &dir,
+            scripted(
+                vec![finalized_text_message("a generated reply"); 2],
+                1,
+                Duration::ZERO,
+            ),
+            HostHandles::new(&dir),
+            None,
+        );
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            requests.push(AttachRequest {
+                session: host.create().await.unwrap(),
+                cursor: None,
+            });
+        }
+        let mut reference = host.attach(&requests).await.unwrap();
+        let mut outgoing = host.attach(&requests).await.unwrap();
+        for attachment in [&mut reference, &mut outgoing] {
+            bounded("the attach tail", async {
+                let mut caught_up = 0;
+                loop {
+                    match attachment.recv().await.unwrap() {
+                        Frame::CaughtUp { .. } => caught_up += 1,
+                        Frame::List { .. } => {
+                            assert_eq!(caught_up, requests.len());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+        }
+        for request in &requests {
+            assert!(matches!(
+                host.command(
+                    &request.session,
+                    Command::Prompt {
+                        agent: AgentId::Main,
+                        content: vec![UserContent::Text(TextContent {
+                            text: "reply".into(),
+                            text_signature: None
+                        })],
+                    }
+                )
+                .await
+                .unwrap(),
+                CommandOutcome::Accepted
+            ));
+        }
+        let expected = bounded("generated completions", async {
+            let mut ends = 0;
+            let mut reliable = Vec::new();
+            while ends < requests.len() {
+                let frame = reference.recv().await.unwrap();
+                if let Frame::Event { event, .. } = &frame
+                    && matches!(
+                        event.known(),
+                        Some(AgentEvent::AgentEnd {
+                            agent_id: AgentId::Main,
+                            ..
+                        })
+                    )
+                {
+                    ends += 1;
+                }
+                if !frame.is_lossy() {
+                    reliable.push(serde_json::to_value(frame).unwrap());
+                }
+            }
+            reliable
+        })
+        .await;
+
+        // All producers have reached AgentEnd before freezing time. Only the
+        // already-queued frames and the real HTTP body encoder are polled here.
+        tokio::time::pause();
+        let mut body = Box::pin(
+            Sse::new(frame_stream(outgoing, HEARTBEAT))
+                .into_response()
+                .into_body()
+                .into_data_stream()
+                .eventsource(),
+        );
+        let mut actual = Vec::new();
+        let mut snapshots = std::collections::BTreeSet::new();
+        while actual.len() < expected.len() {
+            let event = body
+                .next()
+                .now_or_never()
+                .expect("queued reliable frames must not wait on a pacing timer")
+                .expect("open HTTP body")
+                .expect("encoded SSE");
+            let frame: Frame = serde_json::from_str(&event.data).unwrap();
+            if frame.is_lossy() {
+                if let Frame::Event { session, event, .. } = &frame
+                    && matches!(event.known(), Some(AgentEvent::MessageUpdate { .. }))
+                {
+                    snapshots.insert(session.clone());
+                }
+            } else {
+                actual.push(serde_json::to_value(frame).unwrap());
+            }
+        }
+        assert!(
+            snapshots.len() == requests.len(),
+            "distinct session snapshots precede completions"
+        );
+        assert_eq!(
+            actual, expected,
+            "all reliable frames retain their order and payloads"
+        );
+        drop(body);
+        tokio::time::resume();
+        host.shutdown().await;
     }
 }
 

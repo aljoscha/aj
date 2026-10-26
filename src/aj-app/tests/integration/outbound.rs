@@ -181,6 +181,34 @@ fn snapshots() -> Vec<Frame> {
     frames
 }
 
+#[tokio::test]
+async fn coalescing_waits_are_only_useful_for_open_snapshot_only_queues() {
+    let (tx, mut rx, _) = queue::<DecodedFrame>(8);
+    assert!(rx.can_coalesce());
+    tx.offer(decoded(state(1)));
+    assert!(rx.can_coalesce());
+    // Inspect beyond the front snapshot, including unfamiliar one-shot frames.
+    for frame in [
+        decoded(reliable("finished")),
+        serde_json::from_str(r#"{"kind":"future_frame"}"#).unwrap(),
+    ] {
+        tx.offer(frame);
+        assert!(!rx.can_coalesce());
+        drain(&mut rx);
+        tx.offer(decoded(state(2)));
+    }
+    drain(&mut rx);
+    assert!(tx.send_paced(decoded(state(3))).await);
+    assert!(!rx.can_coalesce(), "paced frames cannot be superseded");
+    drain(&mut rx);
+    tx.offer(decoded(state(4)));
+    assert!(rx.can_coalesce());
+    tx.close();
+    assert!(!rx.can_coalesce(), "closed queues only drain");
+    assert_eq!(drain(&mut rx), vec![value(state(4))]);
+    assert!(!rx.can_coalesce());
+}
+
 fn key_contract<T: OutboundFrame + Serialize>(convert: impl Fn(Frame) -> T) {
     let frames = snapshots();
     for replacement in &frames {

@@ -61,6 +61,9 @@ use tempfile::TempDir;
 
 pub(crate) mod provider_usage;
 
+#[cfg(target_os = "linux")]
+mod stream_profile;
+
 use super::*;
 use crate::control::{Control, ControlError, ControlFrame};
 use crate::remote::identity::{
