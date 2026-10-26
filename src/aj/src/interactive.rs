@@ -9593,7 +9593,7 @@ mod tests {
     ) -> World {
         layers.user.spill_dir = spill_dir_in(dir);
         let args = Args::parse_from(["aj", "--scripted", demo]);
-        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let auth = AuthStorage::for_test(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let world = build_world(&args, layers, &[], &auth, &persistence, idle_grace)
             .await
@@ -9795,7 +9795,7 @@ mod tests {
     /// session written by a prior [`scripted_world`] is found on disk.
     async fn resumed_world(dir: &TempDir, demo: &str, session_id: &str) -> World {
         let args = Args::parse_from(["aj", "--scripted", demo, "continue", session_id]);
-        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let auth = AuthStorage::for_test(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let world = build_world(&args, default_layers(), &[], &auth, &persistence, None)
             .await
@@ -10558,7 +10558,7 @@ mod tests {
     /// line it is about. The store stays inside `dir`.
     async fn world_from_argv(dir: &TempDir, argv: &[&str]) -> Result<World> {
         let args = Args::parse_from(argv);
-        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let auth = AuthStorage::for_test(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let world = build_world(
             &args,
@@ -13683,7 +13683,7 @@ mod tests {
         env: &str,
     ) -> (World, Rc<RefCell<Shell>>) {
         let args = Args::parse_from(["aj", "--scripted", demo, "--env", env]);
-        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let auth = AuthStorage::for_test(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let world = build_world(
             &args,
@@ -23510,7 +23510,7 @@ mod tests {
         }
 
         async fn with_args(dir: &TempDir, args: Args) -> RemoteHost {
-            let auth = AuthStorage::new(dir.path().join("auth.json"));
+            let auth = AuthStorage::for_test(dir.path().join("auth.json"));
             let persistence = ConversationPersistence::new(dir.path().join("sessions"));
             let ComposedHost { host, .. } =
                 compose_host(&args, layers_spilling_into(dir), &auth, &persistence, None)
@@ -23742,7 +23742,7 @@ mod tests {
         let connected = dial_at(url, &client_config(), &nothing_stated(), argv)
             .await
             .expect("connect to the scripted host");
-        let auth = AuthStorage::new(dir.path().join("client-auth.json"));
+        let auth = AuthStorage::for_test(dir.path().join("client-auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("client-sessions"));
         let world =
             build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
@@ -26717,7 +26717,7 @@ mod tests {
                 Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
                 None => world_and_shell(&dir, "streaming-text").await,
             };
-            let auth = AuthStorage::new(dir.path().join("auth.json"));
+            let auth = AuthStorage::for_test(dir.path().join("auth.json"));
             for provider in ["anthropic", "openai-codex"] {
                 auth.insert_account(
                     provider,
@@ -26824,7 +26824,7 @@ mod tests {
             assert!(!provider.is_empty());
             // This is the host's store in both modes. The remote client's own
             // store stays empty, so reading it cannot satisfy the test.
-            let auth = AuthStorage::new(dir.path().join("auth.json"));
+            let auth = AuthStorage::for_test(dir.path().join("auth.json"));
             for label in ["", "Provider default", "Unnamed account", "default"] {
                 auth.insert_account(
                     &provider,
@@ -29580,7 +29580,7 @@ mod tests {
         let connected = dial_at(&url, &client_config(), &nothing_stated(), &[])
             .await
             .expect("connect to the scripted host");
-        let auth = AuthStorage::new(client_dir.path().join("client-auth.json"));
+        let auth = AuthStorage::for_test(client_dir.path().join("client-auth.json"));
         let persistence = ConversationPersistence::new(client_dir.path().join("client-sessions"));
         let mut world =
             build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
@@ -31555,7 +31555,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&host_before).contains("usage-owner-work-secret"));
 
         let unread_root = client_dir.path().join("must-stay-unread");
-        let unread_auth = AuthStorage::new(unread_root.join("auth.json"));
+        let unread_auth = AuthStorage::for_test(unread_root.join("auth.json"));
         unread_auth.get("openai-codex").await.unwrap();
         assert!(
             unread_root.exists(),
@@ -32796,11 +32796,19 @@ mod tests {
     /// loop, using the real adapters. Tails deliberately omit the first marker.
     #[cfg_attr(
         not(feature = "slow-tests"),
-        ignore = "slow: 500-millisecond task-output polling windows"
+        ignore = "slow: real task-output reads and UI across three adapters"
     )]
     #[tokio::test]
     async fn task_output_scrollback_local_direct_and_gateway() {
         use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
+
+        async fn poll_tick() {
+            // Advance one polling interval, then return to real time before
+            // waiting for file reads, HTTP responses or terminal input.
+            tokio::time::pause();
+            tokio::time::advance(crate::task_output::POLL_INTERVAL).await;
+            tokio::time::resume();
+        }
 
         struct FileOutput(PathBuf);
         impl TaskOutputSource for FileOutput {
@@ -32910,8 +32918,16 @@ mod tests {
                             .unwrap();
                         file.write_all(b"LIVE-APPEND\n").unwrap();
                         writer.write_all(b"G").unwrap();
+                        poll_tick().await;
                         visible(&shell, "LIVE-APPEND").await;
                         writer.write_all(&[0x0b]).unwrap();
+                        assert_eq!(
+                            tokio::time::timeout(SETTLE_DEADLINE, registry.wait_terminal(id))
+                                .await
+                                .expect("the real adapter delivers the kill"),
+                            Some(TaskStatus::Killed),
+                        );
+                        poll_tick().await;
                         visible(&shell, "killed").await;
                     }
                     writer.write_all(b"\r").unwrap();
@@ -34154,7 +34170,7 @@ mod tests {
             "continue",
             &legacy,
         ]);
-        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let auth = AuthStorage::for_test(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let world = build_world(
             &args,
@@ -34290,7 +34306,7 @@ mod tests {
             "--env",
             "BEADS_ACTOR=session-actor",
         ]);
-        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let auth = AuthStorage::for_test(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let world = build_world(
             &args,

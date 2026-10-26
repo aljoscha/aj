@@ -550,7 +550,7 @@ pub(crate) struct HostHandles {
 impl HostHandles {
     pub(crate) fn new(dir: &TempDir) -> Self {
         Self {
-            auth: AuthStorage::new(dir.path().join("auth.json")),
+            auth: AuthStorage::for_test(dir.path().join("auth.json")),
             config: Arc::new(StdMutex::new(harness_config(dir))),
             layers: Arc::new(StdMutex::new(ConfigLayers {
                 user: Config::default(),
@@ -1151,16 +1151,35 @@ impl Attached {
         }
     }
 
-    /// Fold up to `count` frames, answering how many were folded.
-    ///
-    /// Stops early when the stream goes quiet: the exact frame count of a
-    /// chunked turn varies with the host's coalescing, and a cut past the end
-    /// of the turn is a valid cut rather than a reason to hang.
+    /// Finish an idle attachment, including lifecycle repairs after caught_up.
+    /// The initial list is read from the live queue only after the entire block
+    /// producer has finished. Use this only on quiescent, list-enabled fixtures,
+    /// not as a turn-completion fence for an attach during running work.
+    async fn finish_idle_attach(&mut self) {
+        self.pump_until("the directory after the attach tail", |frame| {
+            matches!(frame, Frame::List { .. })
+        })
+        .await;
+    }
+
+    /// Fold a generated cut's frames, stopping at an isolated turn's live idle
+    /// state if coalescing made this run shorter than the calibration.
     async fn pump_frames(&mut self, count: usize) -> usize {
         for folded in 0..count {
-            match tokio::time::timeout(QUIET, self.source.recv()).await {
-                Ok(Some(frame)) => self.apply(frame),
-                Ok(None) | Err(_) => return folded,
+            let frame = bounded("a cut frame or the end of its turn", self.source.recv())
+                .await
+                .expect("the cut stream must not end before the turn");
+            let ended = matches!(
+                frame,
+                Frame::State {
+                    opens_block: false,
+                    working: false,
+                    ..
+                }
+            );
+            self.apply(frame);
+            if ended {
+                return folded + 1;
             }
         }
         count
@@ -4930,6 +4949,8 @@ async fn converges_after_a_cut(scenario: CutScenario, cut: usize) -> CutRun {
     let session = fixture.create().await;
     let mut oracle = fixture.oracle(&session).await;
     let mut remote = fixture.remote(&session).await;
+    oracle.finish_idle_attach().await;
+    remote.finish_idle_attach().await;
     fixture.prompt(&session, "do the thing").await;
 
     let folded = remote.pump_frames(cut).await;
@@ -4941,7 +4962,7 @@ async fn converges_after_a_cut(scenario: CutScenario, cut: usize) -> CutRun {
     remote.reattach().await;
     // Finished sub-agents' lifecycle repair frames follow caught_up, so the
     // attach block alone is not the end of the client's catch-up work.
-    remote.settle().await;
+    remote.finish_idle_attach().await;
 
     scenario.assert_completed(&oracle.canonical());
     assert_converged_across_a_cut(&remote, &oracle, &format!("a cut after {folded} frames"));
@@ -5026,6 +5047,7 @@ async fn sweep(scenario: CutScenario, seed: u64, count: usize) -> CutTally {
         let fixture = Fixture::with_provider(cut_provider(scenario.script())).await;
         let session = fixture.create().await;
         let mut remote = fixture.remote(&session).await;
+        remote.finish_idle_attach().await;
         fixture.prompt(&session, "do the thing").await;
         let mut count = 0;
         let mut durable = false;
@@ -5033,7 +5055,14 @@ async fn sweep(scenario: CutScenario, seed: u64, count: usize) -> CutTally {
             .pump_until("the turn to finish", |frame| {
                 count += 1;
                 durable |= frame.durable_seq().is_some();
-                matches!(frame, Frame::State { working: false, .. })
+                matches!(
+                    frame,
+                    Frame::State {
+                        opens_block: false,
+                        working: false,
+                        ..
+                    }
+                )
             })
             .await;
         assert!(durable, "the calibration observed durable turn history");

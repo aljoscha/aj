@@ -1,5 +1,73 @@
 # Test timing catalog
 
+## Stream fences and fixture setup
+
+Profiling the default binary separated fixture cost from waiting. A fresh
+HTTP client took about 27 ms, and each auth fixture constructed two OAuth
+clients. `AuthStorage::for_test` reuses the stateless default provider objects
+through the existing injection seam. Each store still owns its credential
+file, runtime overrides, provider registration map and read counter. An auth
+boundary test checks isolation and parity with the default provider registry.
+No TLS checks, provider capabilities or production constructors are bypassed.
+
+The generated remote cut sweeps use ordered progress instead of a quiet tail:
+
+- On a quiescent attachment, the first directory frame follows the complete
+  block producer, including lifecycle repairs after `CaughtUp`.
+- An isolated scripted turn ends at its live idle state. A generated cut past
+  that point stops there rather than waiting for 300 ms of silence.
+- Calibration still counts actual frames, cuts remain seeded and generated,
+  and interruption and missed-transient preconditions remain asserted.
+
+This is not a universal settlement fence. Attachments during running work,
+independent background tasks and settings notices need their own completion
+conditions. Their generic quiet-tail helper is unchanged.
+
+The task-output viewer advances one polling interval after appending bytes and
+after the real adapter confirms the kill. Real time resumes before waiting for
+file reads, HTTP responses and terminal input. All three adapters still run.
+The stalled-client shutdown test proves actual socket backpressure and upstream
+release in real time, then lets the unchanged five-second grace elapse
+virtually with the unread client still held. Five isolated repeats went from
+6.88–6.93 s to 1.80–2.06 s. These composed cases remain in the slow tier.
+
+### Combined measurements and verification
+
+Compared with `fab69d01`, using normal parallelism and excluding compilation:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Warm default run, filtering the two known failures | 23.590 s | 20.110 s |
+| Default `aj` binary execution | 12.691 s | 9.227 s |
+| Slow-inclusive run, same two filters | 68.032 s | 59.994 s |
+| Summed slow-inclusive suite execution | 61.930 s | 55.069 s |
+| Task-output scrollback, full run | 4.878 s | 2.168 s |
+| Generated tool-turn cuts, full run | 3.780 s | 1.956 s |
+| Generated sub-agent cuts, full run | 3.428 s | 2.182 s |
+| Generated missed-transient cuts, full run | 3.682 s | 2.450 s |
+
+Two unfiltered warm default runs took 21.233 s and 20.274 s and reproduced
+only the two known selector failures: 4,074 passed, two failed, 191 ignored.
+With exactly those two filtered, default and slow-inclusive scratch guards
+passed. The full run had 4,257 passed and eight ignored. The five changed
+timing-sensitive integration cases also passed three further combined repeats.
+
+Independent review, workspace formatting, all-target Clippy with warnings
+denied, all-target build, dependency boundaries and scratch-runner contracts
+passed. No additional slow tests were promoted. Remaining HTTP-client
+construction and transport pacing are real costs, not incidental sleeps.
+Production transport reuse would be a separate change, not a reason to bypass
+TLS/proxy initialization in tests.
+
+### Coverage limit found by mutation
+
+Suppressing the post-`CaughtUp` conclusion sweep does **not** fail generated
+sub-agent convergence: block bracketing already closes the box and the
+convergent comparison does not prove delivery of each transient. The dedicated
+`a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent` test does fail
+at its explicit sweep observation. It remains unchanged. Generated convergence
+is not a substitute for that wire-boundary assertion.
+
 ## Follow-up sweep
 
 The follow-up to `6e65e588` removes incidental waits across runtime, providers,

@@ -6945,7 +6945,7 @@ async fn a_shutdown_ends_a_spliced_stream_and_its_upstreams() {
 /// Its stream is polled only when there is room to write to it, so it never
 /// observes the shutdown token at all. What ends its upstreams is the token
 /// behind them: the splice's own, a child of the serving port's.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: real socket backpressure and drain"
@@ -6989,9 +6989,14 @@ async fn a_shutdown_releases_a_stalled_clients_upstreams() {
         "the gateway shut down and the host still holds a subscriber for a client \
          that stopped reading",
     );
+    // The upstream release above is observed in real time. With the client
+    // still unread, the server's grace can elapse virtually. Gateway cleanup
+    // cancels and joins the control link without waiting for peer I/O.
+    tokio::time::pause();
     bounded("the shutdown to finish", shutting)
         .await
         .expect("the shutdown task");
+    tokio::time::resume();
     drop(events);
     fake.stop();
 }
