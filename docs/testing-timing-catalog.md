@@ -1,5 +1,91 @@
 # Test timing catalog
 
+## Implemented reductions
+
+The inventory below records the audit baseline at `1bb64ae3`. The optimization
+pass uses three narrow mechanisms, without a general simulation framework:
+
+- Completed-history UI fixtures retain every generated demo event but omit
+  presentation delays. Live-stream scenarios keep their own staging.
+- Autocomplete tests drive the actual host delivery channel until the expected
+  rows are visible, instead of sleeping after every byte.
+- Task-output tests use the real registry with controlled output/status
+  transitions. They prove the read is pending before completion or cancellation.
+  The timeout case advances Tokio time to just before and exactly at expiry.
+
+Print's legacy-session setup uses virtual time only for its scripted first
+turn. Time resumes before the continuation executes a real Bash child. The
+Bash progress test needs no staging delay because it observes a leading-edge
+update.
+
+Two remote catch-up tests use a real Bash process blocked on a test-owned
+socket instead of 3/5-second sleeps. A held generated child stream establishes
+the required live/completed child state before the parent is released. Closing
+the socket on failure releases the command without scratch files.
+
+### Tier reassessment
+
+Nineteen tests move into the default fast suite: the fourteen lifecycle/selector
+tests installing an unpaced demo, `real_input_new_session_keeps_the_launch_env_armed`
+through unpaced disk-session setup, the three autocomplete popup tests, and
+`block_timeout_is_not_an_error`.
+
+| Changed group | Baseline | Targeted measurement |
+| --- | --- | --- |
+| Fourteen lifecycle/selector cases | About 1–2 s each | 100–330 ms each |
+| Three autocomplete popup cases | 836–847 ms each | 10–15 ms each |
+| Task-output overlap, terminal completion, cancellation | 200/200/100 ms staging plus scheduling | Under 1 ms each |
+| Task-output timeout | Full 1 s wall time | Under 1 ms, still verifies the full virtual deadline |
+| Legacy print continuation | 1.030 s isolated | 0.141 s isolated |
+| Bash leading-edge update | 300 ms staging plus process overhead | About 3 ms |
+| Catch-up with tool and child live | 4.357 s | 0.91–0.92 s across five repetitions |
+| Catch-up with no durable suffix | 6.372 s | 1.11–1.12 s across five repetitions |
+
+The fourteen lifecycle cases plus three autocomplete cases totalled 19.886 s
+of individual test time in the audit run and 2.346 s in the targeted run.
+These sums are not elapsed suite savings, since tests run concurrently.
+
+The two remote cases stay in the slow tier because their shared 300 ms quiet
+tails remain. Those cover reliable terminal events beyond the durable cursor.
+Real process escalation, pipe drain, socket-backpressure and survival windows
+also remain slow. Promotion follows removal of the actual delay, not a relaxed
+assertion or a shorter failure timeout.
+
+### Iteration cost and verification
+
+The default workspace suite was measured with `--no-fail-fast`, normal test
+parallelism and per-test JSON timings. Build time was recorded separately.
+The comparable warm runs were **22.419 s before and 22.524 s after**, including
+the runner overhead. Summed test-suite times were 18.903 s and 18.865 s.
+This is effectively unchanged whole-suite iteration time with nineteen more
+tests enabled, not a claimed fast-suite speedup. Targeted reruns of the changed
+tests are much faster.
+
+The initial baseline artifact build took 44.328 s. Warm `cargo test --no-run`
+checks took about 0.23 s. A run overlapping other Cargo work was excluded from
+the timing comparison. Compilation and unrelated fixture setup remain separate
+iteration costs.
+
+The unfiltered fast suite passed 4,014 tests, ignored 250, and reproduced only
+the two reasoning-model fixture failures documented below. Independent review
+approved the test-boundary changes and the real-process gates. The gate's
+`/dev/tcp` requires Bash network redirections, available on the Ubuntu CI test
+runner. The print review's incidental context-window change was removed by
+using phase-local virtual time instead of a provider override.
+
+A temporary mutation delayed the production task-output timeout by an extra
+second. The virtual-time test failed at the promised expiry. The mutation was
+then removed. Workspace Clippy, all-target build, formatting, dependency guards
+and scratch-runner contract checks passed.
+
+With only those two reproduced baseline failures explicitly filtered, the
+scratch-guard runs passed **4,014 fast tests** and **4,256 fast-plus-slow tests**,
+both without residue. The full run ignored eight opt-in/helper/doctest cases.
+Its summed suite time was 79.140 s, compared with 83.966 s across the audit's
+baseline targets. This remains a single-run comparison, not a benchmark claim.
+The unfiltered workspace is still not green because of the two existing
+reasoning-model fixture failures.
+
 ## Scope and interpretation
 
 Audit of the workspace at `1bb64ae3`, on 2026-10-26. This catalogs tests whose
