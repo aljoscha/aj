@@ -70,6 +70,42 @@ because of overhead outside reported test execution. Slow-inclusive took
 scratch-guard regressions passed. No profiling instrumentation is retained in
 the source tree.
 
+### Client-ownership check
+
+The dependency optimization is development-build tuning, not a replacement
+for transport reuse. The recorded **591 constructions cover the whole default
+`aj` test binary**, not one session or turn. Reconciliation with the caller
+profile gives:
+
+| Owner or caller | Constructions |
+| --- | ---: |
+| 117 gateway instances, each with proxy and control pools | 234 |
+| Connect-mode launch calls across 75 tests | 115 |
+| Gateway fixtures' shared raw/typed client | 93 |
+| Standard remote fixtures' client | 37 |
+| Other typed fixture clients | 94 |
+| Raw HTTP probes | 18 |
+
+The production connect entry point constructs one client and retains it in
+`Control`. Reattachment and session operations reuse that control. Gateway
+links, reconnect attempts, history requests and stream splices clone the
+gateway-owned transport rather than rebuilding it. The proxy pool carries a
+total request deadline, while the control pool must support long-lived streams.
+Inference turns clone the selected provider, whose transport is initialized
+once. OAuth clients belong to the shared auth registry and are reused for
+refresh. No per-turn client-construction defect was found in those paths.
+The large count primarily reflects independent fixtures and launch matrices.
+
+There are smaller production reuse opportunities outside that measured cause:
+`aj-models/src/usage.rs` constructs a transport per authenticated account fetch
+or Codex reset, despite adapters being owned by the host. Adapter-owned reuse
+would be a natural cleanup for repeated Usage opens/refreshes. Also,
+`aj-models/src/refresh.rs` constructs two clients while fetching the two sources
+for a single catalog update. That rare operation needs at most operation-local
+reuse, not a global cache. Neither finding justifies sharing pools between
+independent test hosts or changing TLS policy. This follow-up was source and
+recorded-profile analysis, not a fresh production-traffic benchmark.
+
 ## Runner overhead and nextest evaluation
 
 At `b0655a6c`, timestamped Cargo, test-runner and rustdoc wrappers separated
