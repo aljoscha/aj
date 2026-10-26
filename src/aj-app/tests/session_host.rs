@@ -198,7 +198,7 @@ impl Harness {
             defaults: RunConfigDefaults::fixed(run_config),
             restore: None,
             persistence: persistence.clone(),
-            auth: AuthStorage::new(dir.path().join("auth.json")),
+            auth: AuthStorage::for_test(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
             name: None,
             idle_grace,
@@ -267,7 +267,7 @@ impl Harness {
             defaults: RunConfigDefaults::fixed(snapshot(scripted(messages, 0, Duration::ZERO))),
             restore: None,
             persistence: self.persistence.clone(),
-            auth: AuthStorage::new(dir.path().join("auth.json")),
+            auth: AuthStorage::for_test(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
             name: None,
             idle_grace,
@@ -2491,7 +2491,7 @@ async fn the_host_id_is_claimed_not_written_over() {
         defaults: RunConfigDefaults::fixed(snapshot(scripted(Vec::new(), 0, Duration::ZERO))),
         restore: None,
         persistence: harness.persistence.clone(),
-        auth: AuthStorage::new(harness._dir.path().join("auth.json")),
+        auth: AuthStorage::for_test(harness._dir.path().join("auth.json")),
         working_directory: harness._dir.path().to_path_buf(),
         name: None,
         idle_grace: None,
@@ -2539,7 +2539,7 @@ async fn a_host_reports_the_name_it_was_given_or_derives_one() {
             defaults: RunConfigDefaults::fixed(snapshot(scripted(Vec::new(), 0, Duration::ZERO))),
             restore: None,
             persistence: harness.persistence.clone(),
-            auth: AuthStorage::new(harness._dir.path().join("auth.json")),
+            auth: AuthStorage::for_test(harness._dir.path().join("auth.json")),
             working_directory,
             name: name.map(str::to_string),
             idle_grace: None,
@@ -8813,15 +8813,69 @@ async fn attaching_during_a_sub_agent_continuation_leaves_its_bracket_open() {
 /// settings: without them a client that had lost the box would re-open it as
 /// an unlabelled foreground run.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: paced streaming on the successful path"
-)]
 async fn attaching_with_a_cursor_inside_a_live_sub_run_resynthesizes_its_start() {
-    // The parent and the background child share the provider, so which of the
-    // two long messages each gets is up to their interleaving. Both are long,
-    // so the child's run outlives the attach either way.
-    let harness = Harness::with_provider(scripted(
+    use aj_models::provider::Provider;
+    use aj_models::streaming::AssistantMessageEventStream;
+
+    struct HeldInference {
+        source: AssistantMessageEventStream,
+        output: AssistantMessageEventStream,
+    }
+    impl Drop for HeldInference {
+        fn drop(&mut self) {
+            // A failed assertion must not strand the inference consumer.
+            self.output.end();
+        }
+    }
+    struct HeldChild {
+        parent: Arc<ScriptedProvider>,
+        child: Arc<ScriptedProvider>,
+        held: StdMutex<Option<tokio::sync::oneshot::Sender<HeldInference>>>,
+    }
+    impl Provider for HeldChild {
+        fn stream(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::StreamOptions,
+        ) -> AssistantMessageEventStream {
+            let child = matches!(context.messages.first(),
+                Some(aj_models::types::Message::User(user))
+                    if user.content.iter().any(|content| matches!(content,
+                        UserContent::Text(text) if text.text == "look into it")));
+            if !child {
+                return self.parent.stream(model, context, options);
+            }
+            let output = AssistantMessageEventStream::new();
+            let held = HeldInference {
+                source: self.child.stream(model, context, options),
+                output: output.clone(),
+            };
+            assert!(
+                self.held
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one child inference")
+                    .send(held)
+                    .is_ok(),
+                "the test owns the child's release"
+            );
+            output
+        }
+        fn stream_simple(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::SimpleStreamOptions,
+        ) -> AssistantMessageEventStream {
+            self.stream(model, context, &options.base)
+        }
+    }
+
+    // Separate scripts make the answers independent of parent/child scheduling.
+    // Hold the generated child stream until the reattach has been inspected.
+    let parent = scripted(
         vec![
             calling(
                 "kicking that off",
@@ -8832,14 +8886,25 @@ async fn attaching_with_a_cursor_inside_a_live_sub_run_resynthesizes_its_start()
             finalized_text_message(
                 "meanwhile, here is a long answer streamed one character at a time",
             ),
-            finalized_text_message("and the background sub-agent reporting back at similar length"),
-            // The task's completion notice wakes the parent once the child is
-            // done, which runs one more inference.
             finalized_text_message("noted, thanks"),
         ],
         1,
-        Duration::from_millis(20),
-    ));
+        Duration::ZERO,
+    );
+    let (held, received) = tokio::sync::oneshot::channel();
+    let mut run = snapshot(Arc::clone(&parent));
+    run.main.provider = Arc::new(HeldChild {
+        parent,
+        child: scripted(
+            vec![finalized_text_message(
+                "and the background sub-agent reporting back at similar length",
+            )],
+            1,
+            Duration::ZERO,
+        ),
+        held: StdMutex::new(Some(held)),
+    });
+    let harness = Harness::with_run_config(run, Vec::new(), None, None);
     let session = harness.create().await;
     let mut all_along = Client::attach(&harness.host, &session).await;
     let mut rewinding = Client::attach(&harness.host, &session).await;
@@ -8860,6 +8925,9 @@ async fn attaching_with_a_cursor_inside_a_live_sub_run_resynthesizes_its_start()
             let _ = client.client.apply(&mut client.chat, frame.clone());
         }
     }
+    let mut child = bounded("the held child inference", received)
+        .await
+        .expect("child reached its gate");
     let spawn_root = spawn_root.expect("both clients saw the spawn");
     let epoch = rewinding.client.cursor().expect("a committed cursor").epoch;
 
@@ -8932,6 +9000,15 @@ async fn attaching_with_a_cursor_inside_a_live_sub_run_resynthesizes_its_start()
         aj_app::chat::SubAgentStatus::Running,
         "so the client keeps rendering a running box",
     );
+
+    // Terminal generation precedes the drain, so every generated event is
+    // forwarded, including the final report. No provider pacing is needed.
+    let report = bounded("the generated child report", child.source.result()).await;
+    assert_eq!(report.stop_reason, aj_models::types::StopReason::Stop);
+    for event in child.source.drain_ready() {
+        child.output.push(event);
+    }
+    drop(child);
 
     for client in [&mut rewinding, &mut all_along] {
         let frames = settle(&harness, &session, &mut client.stream).await;
@@ -13227,7 +13304,7 @@ async fn branch_restore_harness() -> (Harness, String, String, String) {
     use aj_models::types::ThinkingLevel;
     let dir = TempDir::new().unwrap();
     let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-    let auth = AuthStorage::new(dir.path().join("auth.json"));
+    let auth = AuthStorage::for_test(dir.path().join("auth.json"));
     for name in ["historical", "active"] {
         auth.insert_account(
             "openai",
