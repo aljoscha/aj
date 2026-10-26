@@ -389,6 +389,17 @@ impl AuthStorage {
         Self::with_providers(path, default_oauth_providers())
     }
 
+    /// An isolated fixture store using shared, stateless default OAuth providers.
+    /// Credentials, runtime overrides and provider registrations belong to this
+    /// store. Only the default providers' HTTP clients are reused. Fixtures that
+    /// exercise OAuth requests should inject their own providers instead.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(path: PathBuf) -> Self {
+        static PROVIDERS: std::sync::OnceLock<HashMap<String, Arc<dyn OAuthProvider>>> =
+            std::sync::OnceLock::new();
+        Self::with_providers(path, PROVIDERS.get_or_init(default_oauth_providers).clone())
+    }
+
     /// Build a storage rooted at `path` with a caller-supplied OAuth
     /// provider registry. Used by tests that want to inject mock
     /// providers (so refresh flows don't hit the real network) and by
@@ -1858,6 +1869,63 @@ mod tests {
             key.map(|resolved| resolved.key).as_deref(),
             Some("from-runtime")
         );
+    }
+
+    #[tokio::test]
+    async fn shared_fixture_providers_keep_auth_stores_isolated() {
+        let dir = TempDir::new().unwrap();
+        let left = AuthStorage::for_test(dir.path().join("left.json"));
+        let right = AuthStorage::for_test(dir.path().join("right.json"));
+        let defaults = AuthStorage::new(dir.path().join("defaults.json"));
+        let providers = defaults.oauth_provider_ids().await;
+        assert_eq!(left.oauth_provider_ids().await, providers);
+        assert_eq!(right.oauth_provider_ids().await, providers);
+
+        let provider = "fixture-without-an-env-binding";
+        left.insert_account(provider, "", AuthCredential::ApiKey { key: "left".into() })
+            .await
+            .unwrap();
+        assert!(right.get(provider).await.unwrap().is_none());
+        right
+            .insert_account(
+                provider,
+                "",
+                AuthCredential::ApiKey {
+                    key: "right".into(),
+                },
+            )
+            .await
+            .unwrap();
+        left.set_runtime_api_key(provider, "override".into()).await;
+        assert_eq!(
+            left.get_api_key(provider, None).await.unwrap().unwrap().key,
+            "override"
+        );
+        assert_eq!(
+            right
+                .get_api_key(provider, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .key,
+            "right"
+        );
+        left.remove_runtime_api_key(provider).await;
+        assert_eq!(
+            left.get_api_key(provider, None).await.unwrap().unwrap().key,
+            "left"
+        );
+
+        left.register_oauth_provider(Arc::new(RacingLoginProvider {
+            path: left.path().to_path_buf(),
+            race: StdMutex::new(LoginRace::None),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .await;
+        assert!(left.oauth_provider("stub").await.is_ok());
+        assert_eq!(right.oauth_provider_ids().await, providers);
+        let fresh = AuthStorage::for_test(dir.path().join("fresh.json"));
+        assert_eq!(fresh.oauth_provider_ids().await, providers);
     }
 
     /// Stored API key is returned when no runtime override or env var

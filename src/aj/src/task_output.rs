@@ -39,7 +39,7 @@ use crate::transcript::faint;
 /// line, the status line, and a blank separator.
 const HEADER_ROWS: u16 = 3;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A single in-flight read. Its future owns only the addressed host and session,
 /// so a focus change cannot redirect an answer to another task.
