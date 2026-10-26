@@ -14585,8 +14585,7 @@ mod tests {
     #[tokio::test]
     async fn palette_selector_cancel_returns_to_palette_confirm_returns_to_editor() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell, mut app, mut writer, root) =
-            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let (mut world, shell, mut app, mut writer, root) = thinking_world_shell_app(&dir).await;
         select_host_thinking_model(&mut world, &shell).await;
 
         // Open the palette (depth 1).
@@ -17858,6 +17857,60 @@ mod tests {
         shell_app(world).await
     }
 
+    /// A local host with a selectable reasoning model. Sessions start on the
+    /// scripted model so tests still exercise real model confirmation before
+    /// editing thinking. No inference runs against the registered API.
+    async fn thinking_world_shell_app(
+        dir: &TempDir,
+    ) -> (World, Rc<RefCell<Shell>>, AsyncApp, PipeWriter, WidgetRef) {
+        let handles = crate::remote::tests::HostHandles::new(dir);
+        let auth = handles.auth.clone();
+        auth.set_runtime_api_key("openai", "host-key".into()).await;
+        let run = crate::remote::tests::snapshot(crate::remote::tests::scripted(
+            Vec::new(),
+            0,
+            Duration::ZERO,
+        ));
+        let mut setup = crate::remote::tests::host_setup(dir, run, handles, None);
+        setup.catalog = Arc::new(vec![ModelInfo {
+            provider: "openai".into(),
+            api: "openai-responses".into(),
+            id: "selector-reasoning".into(),
+            name: "Selector reasoning".into(),
+            base_url: "https://unused.invalid/v1".into(),
+            reasoning: true,
+            reasoning_options: vec![aj_models::registry::ReasoningOption::Effort {
+                values: vec![
+                    aj_models::types::ThinkingLevel::Low,
+                    aj_models::types::ThinkingLevel::High,
+                ],
+            }],
+            ..aj_app::test_support::scripted_model_info()
+        }]);
+        let persistence = setup.persistence.clone();
+        let host = aj_app::host::SessionHost::new(setup).expect("reasoning-capable host");
+        let session = host.create().await.expect("create session");
+        let connected = Connected {
+            control: Control::local(host),
+            session,
+            working_directory: Some(dir.path().to_path_buf()),
+            host_label: None,
+            created: true,
+        };
+        let mut world = build_connect_world(
+            &Args::parse_from(["aj"]),
+            connected,
+            default_layers(),
+            &[],
+            &auth,
+            &persistence,
+        )
+        .await
+        .expect("build world over local host");
+        world.local = Some(world.host().local_handles(world.session()).await.unwrap());
+        shell_app(launched(world).await).await
+    }
+
     /// Pair an already-composed world with the test shell and terminal app.
     async fn shell_app(
         world: World,
@@ -19088,8 +19141,8 @@ mod tests {
     #[tokio::test]
     async fn thinking_selector_updates_footer_and_is_session_scoped() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell, mut app, mut writer, root) =
-            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let (mut world, shell, mut app, mut writer, root) = thinking_world_shell_app(&dir).await;
+        let host_user_before = world.control.config(world.session()).await.unwrap().user;
         select_host_thinking_model(&mut world, &shell).await;
 
         assert!(matches!(
@@ -19139,6 +19192,11 @@ mod tests {
             world.config_layers.lock().unwrap().user.thinking,
             Config::default().thinking,
             "the persisted default was left untouched"
+        );
+        assert_eq!(
+            world.control.config(world.session()).await.unwrap().user,
+            host_user_before,
+            "the host's user config was left untouched"
         );
         // But the session log records it so a resume restores it.
         let recorded = {
