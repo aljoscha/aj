@@ -1224,6 +1224,12 @@ and ends its splices with `reset`, including one still dialing. The
 client's re-attach is then refused per session with `unknown_session`,
 its stream and other hosts' sessions untouched.
 
+Typed upstream requests share a gateway-owned HTTP connection pool. Idle
+pooled connections may remain until ordinary pool eviction after withdrawal,
+but do not keep a subscription or reconnect a withdrawn host. Request and
+stream deadlines are unchanged by pooling. The bounded forwarding transport
+is separate from the transport for long-lived event streams.
+
 A gateway's `list` frames and `GET /v1/sessions` carry the enrolled
 hosts beside the rows in `hosts`: `{id?, address?, name?,
 working_directory?, unreachable}`. A host is named by exactly one of

@@ -234,14 +234,19 @@ async fn session_previews(
                 .find(|row| row.id.as_deref() == Some(group.host_id.as_str()))
                 .and_then(|row| row.name.clone())
                 .unwrap_or_else(|| group.host_id.clone());
+            let client = group
+                .dial
+                .as_ref()
+                .ok_or_else(|| "host is unreachable".to_string())
+                .and_then(|address| {
+                    state
+                        .gateway
+                        .remote_client(address)
+                        .map_err(|e| e.to_string())
+                });
             async move {
                 let result = async {
-                    let address = group
-                        .dial
-                        .as_ref()
-                        .ok_or_else(|| "host is unreachable".to_string())?;
-                    let client = crate::remote::RemoteClient::new(address.url())
-                        .map_err(|e| e.to_string())?;
+                    let client = client?;
                     let sessions: Vec<String> =
                         group.attach.iter().map(|r| r.session.clone()).collect();
                     client.session_previews(&sessions).await.map_err(|e| {
@@ -327,12 +332,16 @@ async fn read_prompt_history(
                         .gateway
                         .create_target(Some(id))
                         .map_err(|error| error.to_string())
+                })
+                .and_then(|target| {
+                    state
+                        .gateway
+                        .remote_client(&target.address)
+                        .map_err(|e| e.to_string())
                 });
             crate::remote::history::snapshots(move |updates| async move {
                 let result = async {
-                    let target = target?;
-                    let client = crate::remote::RemoteClient::new(target.address.url())
-                        .map_err(|e| e.to_string())?;
+                    let client = target?;
                     client
                         .stream_prompt_history(None, updates)
                         .await

@@ -211,6 +211,25 @@ pub(crate) struct RemoteClient {
 impl RemoteClient {
     /// A client against `base`, which must be an absolute http(s) URL.
     pub(crate) fn new(base: &str) -> Result<Self, RemoteError> {
+        Self::build(base, None)
+    }
+
+    /// A reusable transport for typed requests and event streams. Deadlines
+    /// belong to individual requests, stream opening and stream silence, so
+    /// this transport has no total or read timeout.
+    pub(crate) fn http_transport() -> Result<reqwest::Client, reqwest::Error> {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+    }
+
+    /// Bind an address to a shared transport built by [`Self::http_transport`].
+    /// Do not supply a bounded proxy client or endpoint-specific default auth.
+    pub(crate) fn with_http(base: &str, http: reqwest::Client) -> Result<Self, RemoteError> {
+        Self::build(base, Some(http))
+    }
+
+    fn build(base: &str, http: Option<reqwest::Client>) -> Result<Self, RemoteError> {
         let url = reqwest::Url::parse(base).map_err(|err| RemoteError::InvalidUrl {
             url: base.to_string(),
             reason: err.to_string(),
@@ -221,9 +240,10 @@ impl RemoteClient {
                 reason: "expected an absolute http or https URL".to_string(),
             });
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()?;
+        let http = match http {
+            Some(http) => http,
+            None => Self::http_transport()?,
+        };
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,

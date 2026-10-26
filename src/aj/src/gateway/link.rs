@@ -41,6 +41,7 @@ impl Link {
         directory: Arc<Directory>,
         recorder: Recorder,
         tuning: Tuning,
+        http: reqwest::Client,
     ) -> Self {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run(
@@ -49,6 +50,7 @@ impl Link {
             recorder,
             tuning,
             cancel.clone(),
+            http,
         ));
         Self {
             address,
@@ -79,6 +81,7 @@ async fn run(
     recorder: Recorder,
     tuning: Tuning,
     cancel: CancellationToken,
+    http: reqwest::Client,
 ) {
     let mut delay = tuning.reconnect_delay;
     loop {
@@ -89,7 +92,7 @@ async fn run(
         // drops that wait (see `Recorder::write_down`).
         let outcome = tokio::select! {
             _ = cancel.cancelled() => return,
-            outcome = attempt(&address, &directory, &recorder) => outcome,
+            outcome = attempt(&address, &directory, &recorder, &http) => outcome,
         };
         match outcome {
             Attempt::Ended(reason) => {
@@ -127,8 +130,13 @@ enum Attempt {
 
 /// One attempt: dial, settle the host's id, then pump its directory until the
 /// stream ends.
-async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Recorder) -> Attempt {
-    let client = match RemoteClient::new(address.url()) {
+async fn attempt(
+    address: &HostAddress,
+    directory: &Directory,
+    recorder: &Recorder,
+    http: &reqwest::Client,
+) -> Attempt {
+    let client = match RemoteClient::with_http(address.url(), http.clone()) {
         Ok(client) => client,
         Err(err) => return Attempt::Failed(err.to_string()),
     };

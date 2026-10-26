@@ -180,6 +180,9 @@ struct GatewayInner {
     /// Deliberately not a [`RemoteClient`]: that one is typed per route, and the
     /// proxy's whole point is to carry a request it does not read.
     http: reqwest::Client,
+    /// Typed requests, control links and splices share this pool. Unlike the
+    /// proxy transport it has no total timeout: event bodies may stay open.
+    control_http: reqwest::Client,
     tuning: Tuning,
 }
 
@@ -276,6 +279,7 @@ impl Gateway {
             writing: TokioMutex::new(()),
             links: StdMutex::new(HashMap::new()),
             http: proxy_client(tuning.upstream_timeout)?,
+            control_http: RemoteClient::http_transport().map_err(GatewayError::Http)?,
             tuning,
         });
         let gateway = Self { inner };
@@ -324,8 +328,9 @@ impl Gateway {
     /// moment on, restarts included.
     pub(crate) async fn enroll(&self, address: &str) -> Result<HostSummary, GatewayError> {
         let address = HostAddress::parse(address)?;
-        let client =
-            RemoteClient::new(address.url()).map_err(|source| GatewayError::Unreachable {
+        let client = self
+            .remote_client(&address)
+            .map_err(|source| GatewayError::Unreachable {
                 address: address.clone(),
                 source,
             })?;
@@ -441,7 +446,15 @@ impl Gateway {
             self.inner.directory.subscribe(),
             self.inner.tuning,
             shutdown,
+            self.inner.control_http.clone(),
         )
+    }
+
+    fn remote_client(
+        &self,
+        address: &HostAddress,
+    ) -> Result<RemoteClient, crate::remote::RemoteError> {
+        RemoteClient::with_http(address.url(), self.inner.control_http.clone())
     }
 
     /// The client the proxy forwards with.
@@ -476,6 +489,7 @@ impl Gateway {
             Arc::clone(&self.inner.directory),
             self.recorder(),
             self.inner.tuning,
+            self.inner.control_http.clone(),
         );
         if let Some(previous) = self.links().insert(address, link) {
             // Only reachable if an address were enrolled twice, which the
