@@ -293,7 +293,11 @@ pub const COMMANDS: &[Command] = &[
 /// plus overrides) and flattens by provider in catalog order so the
 /// resulting list preserves the registry's intentional ordering.
 pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
-    let registry = ModelRegistry::load();
+    model_catalog(&ModelRegistry::load())
+}
+
+/// Flatten an existing registry in provider/catalog order.
+pub(crate) fn model_catalog(registry: &ModelRegistry) -> Arc<Vec<ModelInfo>> {
     let mut models = Vec::new();
     for provider in registry.providers() {
         for info in registry.models(provider) {

@@ -184,13 +184,15 @@ impl RunConfigDefaults {
     }
 
     /// Capture launch provenance while leaving config-backed values live.
+    /// `registry` is the host's startup snapshot, also used for initial model
+    /// resolution and the catalog exposed to its clients.
     pub fn layered(
         args: &Args,
         config: &Config,
         startup: RunConfigSnapshot,
         speed: Option<Speed>,
         auth: &AuthStorage,
-        restore: Option<&RestoreContext>,
+        registry: Arc<ModelRegistry>,
     ) -> Self {
         Self {
             startup,
@@ -207,9 +209,7 @@ impl RunConfigDefaults {
                     .clone()
                     .or_else(|| config.model_name.clone()),
                 scripted: args.scripted.is_some(),
-                registry: restore
-                    .map(|restore| Arc::clone(&restore.registry))
-                    .unwrap_or_else(|| Arc::new(ModelRegistry::load())),
+                registry,
                 auth: auth.clone(),
             },
         }
@@ -411,15 +411,16 @@ pub(crate) fn resolve_model_defaults(
 /// registry so the binary owns provider dispatch, API-key resolution,
 /// and speed-driven headers. Both apply the CLI > env > config
 /// model-selection precedence through [`ModelSelection`].
+/// The caller supplies the registry snapshot used by this startup.
 pub fn build_initial_run_config(
     args: &Args,
     config: &Config,
     auth: &AuthStorage,
     thinking: Option<ThinkingConfig>,
     speed: Option<Speed>,
+    registry: Arc<ModelRegistry>,
 ) -> Result<(RunConfigSnapshot, Option<RestoreContext>)> {
     let selection = ModelSelection::merge(args, config);
-    let registry = Arc::new(ModelRegistry::load());
     let main = if let Some(name) = &args.scripted {
         let scripted = crate::scripted::resolve_or_explain(name)?;
         let key = (
@@ -1034,6 +1035,7 @@ mod tests {
 
     #[test]
     fn scripted_launch_model_overrides_still_outrank_persisted_defaults() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from([
             "aj",
@@ -1048,12 +1050,17 @@ mod tests {
         let mut config = Config::default();
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
-        let (startup, restore) =
-            build_initial_run_config(&args, &config, &auth, thinking, speed.clone())
-                .expect("scripted startup run config");
+        let (startup, _restore) = build_initial_run_config(
+            &args,
+            &config,
+            &auth,
+            thinking,
+            speed.clone(),
+            Arc::clone(&registry),
+        )
+        .expect("scripted startup run config");
         let startup_key = startup.main.model_key.clone();
-        let defaults =
-            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+        let defaults = RunConfigDefaults::layered(&args, &config, startup, speed, &auth, registry);
 
         config.model_api = Some("anthropic".to_string());
         config.model_name = Some("claude-opus-5".to_string());
@@ -1066,6 +1073,7 @@ mod tests {
     /// lookup, and never produces a `RestoreContext`.
     #[test]
     fn scripted_run_config_uses_merged_provider_id() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from([
             "aj",
@@ -1074,9 +1082,15 @@ mod tests {
             "--model-api",
             "openai",
         ]);
-        let (run_config, restore) =
-            build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None, None)
-                .expect("scripted run config");
+        let (run_config, restore) = build_initial_run_config(
+            &args,
+            &Config::default(),
+            &empty_auth(&dir),
+            None,
+            None,
+            Arc::clone(&registry),
+        )
+        .expect("scripted run config");
         assert!(restore.is_none(), "scripted path never restores settings");
         assert_eq!(run_config.main.model_key.0, "openai");
         assert_eq!(run_config.main.model_key.1, "scripted/streaming-text");
@@ -1084,11 +1098,18 @@ mod tests {
 
     #[test]
     fn scripted_run_config_defaults_provider_id_when_unset() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
-        let (run_config, _restore) =
-            build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None, None)
-                .expect("scripted run config");
+        let (run_config, _restore) = build_initial_run_config(
+            &args,
+            &Config::default(),
+            &empty_auth(&dir),
+            None,
+            None,
+            Arc::clone(&registry),
+        )
+        .expect("scripted run config");
         assert_eq!(
             run_config.main.model_key.0,
             Config::default().model_api.expect("default provider")
@@ -1096,21 +1117,83 @@ mod tests {
     }
 
     #[test]
+    fn supplied_registry_resolves_startup_defaults_and_restore_models() {
+        use aj_models::registry::{CATALOG_SCHEMA_VERSION, Catalog, OverridesFile};
+
+        let models = ["supplied-main", "supplied-oracle"]
+            .map(|id| ModelInfo {
+                id: id.into(),
+                name: id.into(),
+                provider: "openai".into(),
+                api: "openai-responses".into(),
+                base_url: "https://supplied.invalid/v1".into(),
+                ..crate::test_support::scripted_model_info()
+            })
+            .to_vec();
+        let registry = Arc::new(ModelRegistry::from_catalog_with_overrides(
+            Catalog {
+                schema_version: CATALOG_SCHEMA_VERSION,
+                updated_at: 0,
+                source: "supplied fixture".into(),
+                models,
+            },
+            OverridesFile { overrides: vec![] },
+            "supplied fixture",
+        ));
+        let dir = TempDir::new().expect("tempdir");
+        let auth = empty_auth(&dir);
+        let args = Args::parse_from([
+            "aj",
+            "--model-api",
+            "openai",
+            "--model-name",
+            "supplied-main",
+        ]);
+        let config = Config {
+            model_api: Some("openai".into()),
+            model_name: Some("supplied-main".into()),
+            thinking: Some(ConfigThinkingLevel::Off),
+            oracle_model_api: Some("openai".into()),
+            oracle_model_name: Some("supplied-oracle".into()),
+            oracle_thinking: Some(ConfigThinkingLevel::Off),
+            ..Config::default()
+        };
+        let (startup, restore) =
+            build_initial_run_config(&args, &config, &auth, None, None, Arc::clone(&registry))
+                .expect("supplied startup models resolve");
+        let catalog = crate::commands::model_catalog(&registry);
+        let defaults =
+            RunConfigDefaults::layered(&args, &config, startup.clone(), None, &auth, registry);
+        let session = defaults.resolve(&config, &auth).expect("session defaults");
+        let restore = restore.expect("registry-backed startup restores settings");
+        for run in [startup, session] {
+            for (role, id) in [
+                (&run.main, "supplied-main"),
+                (&run.oracle, "supplied-oracle"),
+            ] {
+                assert_eq!(role.model_key, ("openai".into(), id.into()));
+                assert_eq!(role.model_info.base_url, "https://supplied.invalid/v1");
+                let exposed = catalog.iter().find(|model| model.id == id).unwrap();
+                let restored = restore.registry.get("openai", id).unwrap();
+                let selected = serde_json::to_value(role.model_info.as_ref()).unwrap();
+                assert_eq!(serde_json::to_value(exposed).unwrap(), selected);
+                assert_eq!(serde_json::to_value(restored).unwrap(), selected);
+            }
+        }
+    }
+
+    #[test]
     fn startup_and_new_sessions_resolve_independent_role_defaults() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
         let auth = empty_auth(&dir);
         let args = Args::parse_from(["aj"]);
         let config = Config::default();
-        let (startup, restore) = build_initial_run_config(&args, &config, &auth, None, None)
-            .expect("built-in defaults resolve");
-        let defaults = RunConfigDefaults::layered(
-            &args,
-            &config,
-            startup.clone(),
-            None,
-            &auth,
-            restore.as_ref(),
-        );
+        let (startup, _restore) =
+            build_initial_run_config(&args, &config, &auth, None, None, Arc::clone(&registry))
+                .expect("built-in defaults resolve");
+        let defaults =
+            RunConfigDefaults::layered(&args, &config, startup.clone(), None, &auth, registry);
         let session = defaults.resolve(&config, &auth).expect("session defaults");
         for run in [startup, session] {
             assert_eq!(
@@ -1126,6 +1209,7 @@ mod tests {
 
     #[test]
     fn session_defaults_reresolve_live_config_but_freeze_model_url() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from(["aj"]);
         let mut config = Config {
@@ -1141,9 +1225,15 @@ mod tests {
         };
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
-        let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
-                .expect("startup run config");
+        let (startup, _restore) = build_initial_run_config(
+            &args,
+            &config,
+            &empty_auth(&dir),
+            thinking,
+            speed.clone(),
+            Arc::clone(&registry),
+        )
+        .expect("startup run config");
         let oracle = startup.oracle.clone();
         assert_eq!(
             oracle.model_key,
@@ -1151,8 +1241,7 @@ mod tests {
         );
         assert_eq!(oracle.thinking, Some(ThinkingConfig::XHigh));
         let auth = empty_auth(&dir);
-        let defaults =
-            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+        let defaults = RunConfigDefaults::layered(&args, &config, startup, speed, &auth, registry);
 
         config.model_name = Some("gpt-5.5".to_string());
         config.model_url = Some("https://later.example/v1".to_string());
@@ -1204,6 +1293,7 @@ mod tests {
 
     #[test]
     fn launch_values_stay_above_later_config_defaults() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from([
             "aj",
@@ -1221,12 +1311,17 @@ mod tests {
         let mut config = Config::default();
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
-        let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
-                .expect("startup run config");
+        let (startup, _restore) = build_initial_run_config(
+            &args,
+            &config,
+            &empty_auth(&dir),
+            thinking,
+            speed.clone(),
+            Arc::clone(&registry),
+        )
+        .expect("startup run config");
         let auth = empty_auth(&dir);
-        let defaults =
-            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+        let defaults = RunConfigDefaults::layered(&args, &config, startup, speed, &auth, registry);
 
         config.model_api = Some("anthropic".to_string());
         config.model_name = Some("claude-opus-5".to_string());
@@ -1248,6 +1343,7 @@ mod tests {
 
     #[test]
     fn partial_launch_model_overrides_merge_with_live_config_per_field() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
 
         let args = Args::parse_from(["aj", "--model-api", "openai-codex"]);
@@ -1258,12 +1354,24 @@ mod tests {
         };
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
-        let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
-                .expect("startup run config");
+        let (startup, _restore) = build_initial_run_config(
+            &args,
+            &config,
+            &empty_auth(&dir),
+            thinking,
+            speed.clone(),
+            Arc::clone(&registry),
+        )
+        .expect("startup run config");
         let auth = empty_auth(&dir);
-        let defaults =
-            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+        let defaults = RunConfigDefaults::layered(
+            &args,
+            &config,
+            startup,
+            speed,
+            &auth,
+            Arc::clone(&registry),
+        );
         config.model_name = Some("gpt-5.5".to_string());
         let run = defaults
             .resolve(&config, &auth)
@@ -1280,12 +1388,17 @@ mod tests {
         };
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
-        let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
-                .expect("startup run config");
+        let (startup, _restore) = build_initial_run_config(
+            &args,
+            &config,
+            &empty_auth(&dir),
+            thinking,
+            speed.clone(),
+            Arc::clone(&registry),
+        )
+        .expect("startup run config");
         let auth = empty_auth(&dir);
-        let defaults =
-            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+        let defaults = RunConfigDefaults::layered(&args, &config, startup, speed, &auth, registry);
         config.model_api = Some("openai".to_string());
         let run = defaults
             .resolve(&config, &auth)
@@ -1303,12 +1416,19 @@ mod tests {
     /// `stream_options` the agent build reads directly.
     #[test]
     fn prepare_log_stamps_session_id_onto_run_config() {
+        let registry = Arc::new(ModelRegistry::load());
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
         let config = Config::default();
-        let (run_config, _restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), None, None)
-                .expect("scripted run config");
+        let (run_config, _restore) = build_initial_run_config(
+            &args,
+            &config,
+            &empty_auth(&dir),
+            None,
+            None,
+            Arc::clone(&registry),
+        )
+        .expect("scripted run config");
         assert!(run_config.session_id.is_none());
         assert!(run_config.main.stream_options.session_id.is_none());
 
@@ -1412,11 +1532,17 @@ pub fn compose_host(
     let name = args
         .host_name()
         .map_err(|err| anyhow::anyhow!("--name: {err}"))?;
-    let (run_config, restore) =
-        build_initial_run_config(args, &config, auth, thinking, speed.clone())?;
-    let defaults =
-        RunConfigDefaults::layered(args, &config, run_config, speed, auth, restore.as_ref());
-    let catalog = crate::commands::load_model_catalog();
+    let registry = Arc::new(ModelRegistry::load());
+    let (run_config, restore) = build_initial_run_config(
+        args,
+        &config,
+        auth,
+        thinking,
+        speed.clone(),
+        Arc::clone(&registry),
+    )?;
+    let catalog = crate::commands::model_catalog(&registry);
+    let defaults = RunConfigDefaults::layered(args, &config, run_config, speed, auth, registry);
     let config = Arc::new(StdMutex::new(config));
     let layers = Arc::new(StdMutex::new(layers));
     let host = SessionHost::new(HostSetup {
