@@ -34,7 +34,8 @@ Sections: [measurements](#measured-hotspots),
 
 ## Measured hotspots
 
-One Linux debug-build sample per target, with normal test parallelism and the slow tier enabled.
+One Linux debug-build sample per target, with normal test parallelism and the
+slow tier enabled.
 These are individual elapsed times, not additive suite costs or estimated
 savings. Shared serial-test locks and machine load can inflate individual
 results. Compilation is excluded.
@@ -60,7 +61,7 @@ results. Compilation is excluded.
 The binary suite took 45.650 s. The other crates' test suites totalled
 36.243 s, and the binary crate's integration suites totalled 2.073 s.
 There were 181 passing tests at or above one second across those runs.
-That is a prioritization signal, not 180 independently removable seconds.
+Individual durations are not additive estimates of removable suite time.
 
 ### Reproduction and failures
 
