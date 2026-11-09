@@ -5990,6 +5990,7 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
     let harness = detached_sub_harness();
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
+    let mut observed = Vec::new();
     // Both providers are scripted and log appends are synchronous. Advance
     // their relative pacing without ageing the host's real idle-grace clock.
     tokio::time::pause();
@@ -6012,12 +6013,8 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
     .await;
     let task = bounded("the child's run to reach the state under test", async {
         loop {
-            let list = harness.host.sessions().await.expect("sessions");
-            let working = list
-                .sessions
-                .iter()
-                .find(|row| row.id == session)
-                .is_some_and(|row| row.working);
+            observed.extend(client.drain_into_fold());
+            let working = client.client.working();
             let reached = match parent {
                 ParentTurn::Live => working,
                 ParentTurn::Ended => !working,
@@ -6055,6 +6052,7 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
     for frame in &frames {
         let _ = client.client.apply(&mut client.chat, frame.clone());
     }
+    observed.extend(frames);
     let state = client.canonical();
     let (box_status, box_finished) = sub_box(&state, 1);
     let task_status = harness
@@ -6086,7 +6084,7 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
         box_finished,
         task_notices: task_notices(&state),
         notices: all_notices(&state),
-        errors: errors(&only(frames, &session)),
+        errors: errors(&only(observed, &session)),
         child_answered_in_full: assistant_rows(&client.chat, AgentId::Sub(1))
             .iter()
             .any(|text| text.contains(CHILD_ANSWER)),
@@ -7917,12 +7915,8 @@ async fn a_detached_writers_persistence_failure_ends_only_its_session() {
         .await;
     bounded("the child to outlive its parent turn", async {
         loop {
-            let list = harness.host.sessions().await.expect("sessions");
-            let parent_idle = list
-                .sessions
-                .iter()
-                .find(|row| row.id == affected)
-                .is_some_and(|row| !row.working);
+            affected_client.drain_into_fold();
+            let parent_idle = !affected_client.client.working();
             if parent_idle && running_agent_task(&harness, &affected).await.is_some() {
                 return;
             }

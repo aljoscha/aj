@@ -155,17 +155,10 @@ async fn goal(host: &SessionHost, session: &str) -> Goal {
 
 async fn wait_goal(h: &Harness, session: &str, status: GoalStatus) -> Goal {
     bounded("goal to stop and its turn to finish", async {
+        let mut client = Client::attach(&h.host, session).await;
         loop {
-            let working = h
-                .host
-                .sessions()
-                .await
-                .unwrap()
-                .sessions
-                .iter()
-                .find(|row| row.id == session)
-                .unwrap()
-                .working;
+            client.drain_into_fold();
+            let working = client.client.working();
             if !working {
                 // Read the subtotal after observing idle, not before a final
                 // inference can finish between these two host requests.
