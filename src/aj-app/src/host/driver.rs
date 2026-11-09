@@ -317,7 +317,6 @@ impl Driver {
             entry.map(|entry| super::durable_event(entry, branch_settings)),
             event,
         );
-        self.refresh_state();
         if !self.session.is_draining()
             && let Some((owner, conditional)) = trigger
             && self.automatic_wake_allowed(owner)
@@ -327,6 +326,7 @@ impl Driver {
         {
             self.wake(owner);
         }
+        self.refresh_state();
     }
 
     fn apply_lifecycle(&mut self, event: &AgentEvent) {
@@ -570,18 +570,28 @@ impl Driver {
         }
     }
 
-    /// Publish a `state` frame and mark the list dirty when `working` changed,
-    /// which is the flag a client seeds its spinner from and the one that
-    /// self-heals an `AgentEnd` it missed.
+    /// Publish Main's turn state separately from the directory's session-wide
+    /// activity. A yielded Main can still own running background work.
     fn refresh_state(&self) {
         let working = self.turns.is_busy(&self.lifecycle, AgentId::Main);
+        let session_working = !self.turns.is_empty()
+            || !self.lifecycle.running_agents().is_empty()
+            || !self.lifecycle.compacting_agents().is_empty()
+            || self
+                .session
+                .core
+                .task_registry
+                .snapshot()
+                .iter()
+                .any(|task| task.status == TaskStatus::Running);
         let mut changed = false;
         self.session.publish_state(&self.shared.fanout, |status| {
-            changed = status.working != working;
+            changed = status.session_working != session_working;
+            status.session_working = session_working;
+            let main_changed = status.working != working;
             status.working = working;
-            changed
+            main_changed
         });
-        // The flag is a row field too, and a wake flips it without an event.
         if changed {
             self.shared.fanout.mark_list_dirty();
         }

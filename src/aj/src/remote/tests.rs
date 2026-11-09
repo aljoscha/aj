@@ -704,6 +704,95 @@ struct BashGate {
     process: Option<tokio::net::TcpStream>,
 }
 
+#[tokio::test]
+async fn directory_stays_working_while_main_yields_to_background_work() {
+    let mut bash = BashGate::new().await;
+    let fixture = Fixture::new(vec![
+        calling(
+            "",
+            "background",
+            "bash",
+            serde_json::json!({
+                "command": bash.command(),
+                "description": "wait for release",
+                "run_in_background": true
+            }),
+        ),
+        calling("", "wait", "yield", serde_json::json!({})),
+        finalized_text_message("background work finished"),
+    ])
+    .await;
+    let session = fixture.create().await;
+    let mut local = fixture.oracle(&session).await;
+    let mut remote = fixture.remote(&session).await;
+    local.finish_idle_attach().await;
+    remote.finish_idle_attach().await;
+    fixture.prompt(&session, "start background work").await;
+    bash.wait_until_blocked().await;
+    for client in [&mut local, &mut remote] {
+        client
+            .pump_until("Main yielded", |frame| {
+                matches!(
+                    frame,
+                    Frame::State {
+                        opens_block: false,
+                        working: false,
+                        ..
+                    }
+                )
+            })
+            .await;
+        assert!(
+            !client.client.working(),
+            "Main's turn state stays independent"
+        );
+        assert!(
+            client
+                .chat
+                .tasks()
+                .values()
+                .any(|task| task.status == aj_agent::tool::TaskStatus::Running)
+        );
+        assert!(client.transport.row(&session).await.working);
+        client
+            .pump_until("session-wide working list", |frame| {
+                matches!(frame,
+                    Frame::List { sessions, .. } if sessions.iter().any(|row|
+                        row.id == session && row.working)
+                )
+            })
+            .await;
+    }
+    bash.release().await;
+    for client in [&mut local, &mut remote] {
+        client
+            .pump_until("automatic wake", |frame| {
+                matches!(frame,
+                    Frame::Event { event, .. } if matches!(event.known(),
+                        Some(AgentEvent::AgentStart { agent_id: AgentId::Main, .. }))
+                )
+            })
+            .await;
+        client
+            .pump_until("session-wide idle list", |frame| {
+                matches!(frame,
+                    Frame::List { sessions, .. } if sessions.iter().any(|row|
+                        row.id == session && !row.working)
+                )
+            })
+            .await;
+        assert!(!client.transport.row(&session).await.working);
+        assert!(
+            client
+                .chat
+                .tasks()
+                .values()
+                .all(|task| task.status != aj_agent::tool::TaskStatus::Running)
+        );
+    }
+    fixture.shutdown().await;
+}
+
 impl BashGate {
     async fn new() -> Self {
         Self {

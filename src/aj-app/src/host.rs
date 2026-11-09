@@ -2185,6 +2185,7 @@ impl SessionHost {
             epoch: mint_epoch(),
             last_seq: log.last_seq(),
             working: false,
+            session_working: false,
             settings,
             oracle_settings,
             goal,
@@ -2862,7 +2863,7 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
     SessionSummary {
         id: session.id().to_string(),
         live: true,
-        working: status.working,
+        working: status.session_working,
         last_seq: Some(status.last_seq),
         last_activity: status.last_activity,
         tag: status.tag.clone(),

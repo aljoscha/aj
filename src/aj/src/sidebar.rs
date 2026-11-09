@@ -154,7 +154,7 @@ pub(crate) enum RowStatus {
     Unreachable,
     /// Another writer holds the session's lock.
     Locked,
-    /// A turn is running.
+    /// An agent, compaction, or background task is running in the session.
     Working,
     /// Idle, and it has produced output since the user last looked at it.
     Unseen,

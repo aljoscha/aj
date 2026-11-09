@@ -628,6 +628,8 @@ pub fn normalize_host_name(name: &str) -> Result<Option<String>, HostNameError> 
 pub struct SessionSummary {
     pub id: String,
     pub live: bool,
+    /// Any agent turn, compaction, or background task is running in the session.
+    /// Unlike `Frame::State::working`, this is not scoped to Main.
     pub working: bool,
     /// The session's durable high-water mark. A host sets it exactly when
     /// [`Self::live`] is set, and a reader may rely on that only as

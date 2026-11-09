@@ -981,9 +981,11 @@ Per-session row fields in `list` frames and `GET /v1/sessions`:
 
 - `id`: the session id (section 5.2).
 - `live`: materialized in the host, vs on-disk only.
-- `working`: the main agent has a turn in flight (section 5.3). Live
-  background sub-agents surface through the task table (section 5.3), not
-  here.
+- `working`: any agent turn, compaction, or background task is running in
+  the session. A main agent yielding while its background work continues
+  leaves this true. Unlike `state.working` (section 5.3), this is session-wide
+  activity, not Main's turn state. It does not mean user input is required
+  when false.
 - `last_activity`: host-clock timestamp on every row. For a live row it
   is the last durable event the host observed, and a release hands that
   stamp to the cold row. The log's mtime stands in only where the host

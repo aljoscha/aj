@@ -123,6 +123,8 @@ pub(crate) struct SessionStatus {
     /// Whether the **main** agent has a turn in flight. Says nothing about
     /// sub-agents, whose liveness travels through lifecycle events.
     pub(crate) working: bool,
+    /// Session-wide activity for directory rows, independent of Main's turn.
+    pub(crate) session_working: bool,
     /// The settings the next main turn runs against, cached off the run
     /// config so a `state` frame needs no lock of its own.
     pub(crate) settings: AgentSettings,
