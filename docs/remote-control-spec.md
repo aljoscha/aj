@@ -1450,6 +1450,22 @@ Session selection asks for one of three things:
   every positional after the url is launch input, so "create this named
   session" is not expressible.
 
+Explicit `--model-api`, `--model-name`, `--model-url`, `--thinking`,
+`--speed`, `--account`, and `--default-account` select settings for a new
+session only. They require `connect --new` in remote mode and are accepted
+on either side of the subcommand. Bare connect rejects these flags before
+contacting the host, even when it would create a session because none exists.
+It retains its attach-or-create behavior using defaults. Environment and
+config values remain creation defaults, not explicit flags, and do not
+change an attached session. Use interactive settings to change existing sessions.
+`--api-key` is local-only and is rejected on connect. Configure credentials
+on the host instead.
+
+Local new interactive and print sessions accept the same settings flags,
+including `--api-key`. Explicit settings flags are rejected on `continue`,
+`serve`, `gateway`, and utility subcommands. Host defaults come from config
+and environment. Resume still accepts prompt text and file attachments.
+
 `--tag <label>` names the session a run creates. `--host <id>` names the
 host a create through a multi-host gateway is for (section 5.6): an id,
 or a prefix only one host answers to, resolved client-side. A value that

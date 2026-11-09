@@ -24,7 +24,6 @@ use aj_app::actions::AjAction;
 use aj_app::chat::{ChatState, NoticeLevel, NoticeRow};
 use aj_app::cli::args::{
     Args, Command as CliCommand, ENV_WITHOUT_A_CREATE, HOST_WITHOUT_A_CREATE, TAG_WITHOUT_A_CREATE,
-    THINKING_WITHOUT_A_CREATE,
 };
 use aj_app::client::{Attach, Refusal, SessionClient};
 use aj_app::commands::CommandAction;
@@ -575,9 +574,6 @@ async fn build_connect_world(
     }
     if !created && args.connect_host().is_some() {
         rows.push(warning_event(HOST_WITHOUT_A_CREATE));
-    }
-    if !created && args.thinking.is_some() {
-        rows.push(warning_event(THINKING_WITHOUT_A_CREATE));
     }
     if !created && args.has_launch_env() {
         rows.push(warning_event(ENV_WITHOUT_A_CREATE));
@@ -10792,10 +10788,9 @@ mod tests {
     }
 
     /// A local interactive run carries `--thinking` through the real composed
-    /// host path into the session run config. The flag applies here, so the
-    /// attach-only warning must not appear.
+    /// host path into the session run config.
     #[tokio::test]
-    async fn the_thinking_flag_reaches_the_composed_local_run_without_a_warning() {
+    async fn the_thinking_flag_reaches_the_composed_local_run() {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             layers_spilling_into(&dir).effective().thinking,
@@ -10820,13 +10815,6 @@ mod tests {
         assert_eq!(
             thinking, None,
             "the composed local path dropped the CLI thinking level",
-        );
-        assert!(
-            !main_notices(&world)
-                .iter()
-                .any(|notice| notice == THINKING_WITHOUT_A_CREATE),
-            "an applied local flag was reported as unused: {:?}",
-            main_notices(&world),
         );
         shut_down(&world).await;
     }
@@ -32847,59 +32835,25 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// A thinking flag cannot change a session this run merely attached, so it
-    /// is reported at the connect world's visible transcript surface. With no
-    /// flag there is nothing to report, and a create applies its flag rather
-    /// than reporting it.
     #[tokio::test]
-    async fn a_thinking_flag_on_connect_attach_reports_itself_only_when_present() {
+    async fn connect_requires_new_for_thinking_and_applies_it_on_creation() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let session = remote.host.create().await.expect("a session to attach");
+        let error =
+            Args::try_parse_from(["aj", "connect", remote.url().as_str(), "--thinking", "high"])
+                .expect_err("attach flags must fail before connecting");
+        assert!(error.to_string().contains("requires --new"));
 
-        let flagged = connect_world(&dir, &remote, &["--thinking", "high"]).await;
-        assert_eq!(
-            flagged.session(),
-            session,
-            "the fixture created a new session instead of attaching",
-        );
-        assert!(
-            main_notices(&flagged)
-                .iter()
-                .any(|notice| notice == THINKING_WITHOUT_A_CREATE),
-            "the unused flag was silent at the user surface: {:?}",
-            main_notices(&flagged),
-        );
-        drop(flagged);
-
-        let control_args = Args::parse_from(["aj", "connect", remote.url().as_str()]);
-        assert!(
-            control_args.thinking.is_none(),
-            "the no-flag control inherited AJ_THINKING and measures nothing",
-        );
-        let unflagged = connect_world(&dir, &remote, &[]).await;
-        assert_eq!(unflagged.session(), session, "the control also attaches");
-        assert!(
-            !main_notices(&unflagged)
-                .iter()
-                .any(|notice| notice == THINKING_WITHOUT_A_CREATE),
-            "an absent flag produced an unused-flag warning: {:?}",
-            main_notices(&unflagged),
-        );
-        drop(unflagged);
+        let attached = connect_world(&dir, &remote, &[]).await;
+        assert_eq!(attached.session(), session);
+        drop(attached);
 
         let created = connect_world(&dir, &remote, &["--new", "--thinking", "off"]).await;
-        assert_ne!(
-            created.session(),
-            session,
-            "the create control attached the fixture session and cannot test the created guard",
-        );
-        assert!(
-            !main_notices(&created)
-                .iter()
-                .any(|notice| notice == THINKING_WITHOUT_A_CREATE),
-            "an applied connect-create flag was reported as unused: {:?}",
-            main_notices(&created),
+        assert_ne!(created.session(), session);
+        assert_eq!(
+            created.client().settings().expect("created state").thinking,
+            "off",
         );
         drop(created);
         remote.shutdown().await;

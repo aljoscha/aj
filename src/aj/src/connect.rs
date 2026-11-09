@@ -76,22 +76,6 @@ pub(crate) async fn connect(
     };
     let (session, created) =
         resolve_session(&control, launch.session(), host, settings, tag, session_env).await?;
-    if !created && let Some(selection) = args.account_selection() {
-        let current = control
-            .accounts(&session, None)
-            .await
-            .context("could not read the host's current account selection")?;
-        control
-            .command(
-                &session,
-                aj_app::host::Command::Account {
-                    provider: current.provider,
-                    account: selection.name,
-                },
-            )
-            .await
-            .context("could not apply the session account choice")?;
-    }
     Ok(Connected {
         control,
         session,
@@ -667,7 +651,7 @@ mod tests {
             let url = self.server.url();
             let mut line = vec!["aj", "connect", &url];
             line.extend_from_slice(argv);
-            let args = args(&line);
+            let args = Args::try_parse_from(&line)?;
             let launch = args
                 .connect_launch()
                 .expect("connect args parse as connect");
@@ -780,10 +764,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_flags_select_host_credentials_on_create_and_attach() {
+    async fn account_flags_apply_only_on_creation_and_attachment_preserves_selection() {
         let peer = Peer::start().await;
         let auth = aj_models::auth::AuthStorage::new(peer._dir.path().join("auth.json"));
-        for label in ["", "work"] {
+        for label in ["", "work", "default"] {
             auth.insert_account(
                 "scripted",
                 label,
@@ -794,26 +778,19 @@ mod tests {
             .await
             .unwrap();
         }
-        let created = peer.dial(&["--new", "--account", "work"]).await;
-        assert!(created.created);
-        let session = created.session;
-        assert_eq!(
-            peer.control
-                .accounts(&session, None)
-                .await
-                .unwrap()
-                .selected
-                .as_deref(),
-            Some("work")
-        );
         for (flags, selected) in [
+            (vec!["--account", "work"], Some("work")),
             (vec!["--account", ""], Some("")),
-            (vec![], Some("")),
+            (vec!["--account", "default"], Some("default")),
             (vec!["--default-account"], None),
+            (vec![], None),
         ] {
-            let mut argv = vec![session.as_str()];
+            let mut argv = vec!["--new"];
             argv.extend(flags);
-            let attached = peer.dial(&argv).await;
+            let created = peer.dial(&argv).await;
+            assert!(created.created);
+            let session = created.session;
+            let attached = peer.dial(&[&session]).await;
             assert!(!attached.created);
             assert_eq!(attached.session, session);
             assert_eq!(
@@ -825,21 +802,37 @@ mod tests {
                     .as_deref(),
                 selected
             );
+
+            for flags in [
+                vec!["--account", "work"],
+                vec!["--account", ""],
+                vec!["--default-account"],
+            ] {
+                let mut argv = vec![session.as_str()];
+                argv.extend(flags);
+                let error = peer
+                    .try_dial(&argv)
+                    .await
+                    .err()
+                    .expect("explicit attach choice refused");
+                assert!(error.downcast_ref::<clap::Error>().is_some(), "{error:#}");
+                assert_eq!(
+                    peer.control
+                        .accounts(&session, None)
+                        .await
+                        .unwrap()
+                        .selected
+                        .as_deref(),
+                    selected
+                );
+            }
         }
         let error = peer
-            .try_dial(&[&session, "--account", "missing"])
+            .try_dial(&["--new", "--account", "missing"])
             .await
             .err()
-            .expect("missing account refused");
+            .expect("missing creation account refused");
         assert!(format!("{error:#}").contains("missing"));
-        assert_eq!(
-            peer.control
-                .accounts(&session, None)
-                .await
-                .unwrap()
-                .selected,
-            None
-        );
         peer.shutdown().await;
     }
 

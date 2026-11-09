@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use aj_conf::ConfigThinkingLevel;
 use aj_session::{SessionEnvError, TagError, normalize_tag, validate_session_env};
 use aj_wire::{HostNameError, normalize_host_name};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 
 /// Why repeated `--env KEY=VALUE` launch arguments are invalid.
@@ -47,30 +47,30 @@ pub enum LaunchEnvError {
 /// ```
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Model API to use (e.g. `anthropic`, `openai`, `openai-codex`,
+    /// New-session model API (e.g. `anthropic`, `openai`, `openai-codex`,
     /// `openrouter`).
-    #[arg(long, env = "MODEL_API")]
+    #[arg(long, global = true, env = "MODEL_API")]
     pub model_api: Option<String>,
 
-    /// Override the model endpoint URL.
-    #[arg(long, env = "MODEL_URL")]
+    /// Override the new session's model endpoint URL.
+    #[arg(long, global = true, env = "MODEL_URL")]
     pub model_url: Option<String>,
 
-    /// Model name to use (provider-specific identifier).
-    #[arg(long, env = "MODEL_NAME")]
+    /// New-session model name (provider-specific identifier).
+    #[arg(long, global = true, env = "MODEL_NAME")]
     pub model_name: Option<String>,
 
-    /// API key for the resolved provider, applied as a runtime
+    /// API key for a new local session, applied as a runtime
     /// override for this run only. Takes precedence over env vars
     /// and any credential stored in `~/.aj/auth.json`, and is never
     /// written to disk. Intentionally has no `env =` binding so the
     /// only way to supply it is the explicit flag (provider-specific
     /// env vars like `ANTHROPIC_API_KEY` remain the env path).
-    #[arg(long, conflicts_with_all = ["account", "default_account"])]
+    #[arg(long, global = true, conflicts_with_all = ["account", "default_account"])]
     pub api_key: Option<String>,
 
-    /// Pin the resolved provider to this stored account for the session being
-    /// opened, including resume. An empty value selects the unnamed account.
+    /// Pin the new session's provider to this stored account.
+    /// An empty value selects the unnamed account.
     #[arg(
         long,
         global = true,
@@ -79,21 +79,21 @@ pub struct Args {
     )]
     pub account: Option<String>,
 
-    /// Use the resolved provider's shared default in the session being opened.
+    /// Use the provider's shared default account in the new session.
     #[arg(long, global = true, conflicts_with = "account")]
     pub default_account: bool,
 
-    /// Shared Main/Oracle inference speed: standard, fast, ultrafast, flex,
+    /// New-session shared Main/Oracle inference speed: standard, fast, ultrafast, flex,
     /// or a model-advertised mode. Unsupported models use standard speed.
-    #[arg(long, env = "AJ_SPEED")]
+    #[arg(long, global = true, env = "AJ_SPEED")]
     pub speed: Option<String>,
 
-    /// Thinking effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+    /// New-session Main thinking effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
     /// or `max`.
     ///
     /// Global so local, print, and `connect --new` runs share one spelling and
-    /// the same CLI > env > config precedence. A connect run that attaches an
-    /// existing session reports that the flag could not be applied.
+    /// the same CLI > env > config precedence. Explicit session-setting flags
+    /// require a new session. Remote creation requires `connect --new`.
     #[arg(long, global = true, env = "AJ_THINKING", value_name = "LEVEL")]
     pub thinking: Option<ConfigThinkingLevel>,
 
@@ -256,7 +256,43 @@ impl Args {
         T: Into<OsString> + Clone,
     {
         let argv = argv.into_iter().map(Into::into).collect::<Vec<_>>();
-        let mut parsed = <CliParser as Parser>::try_parse_from(argv.clone())?.args;
+        let matches = CliParser::command().try_get_matches_from(argv.clone())?;
+        let mut parsed = CliParser::from_arg_matches(&matches)?.args;
+        // Environment bindings remain defaults even on commands that cannot
+        // accept an explicit session choice. ArgMatches retains the provenance
+        // that the typed fields no longer distinguish.
+        for id in [
+            "model_api",
+            "model_name",
+            "model_url",
+            "thinking",
+            "speed",
+            "account",
+            "default_account",
+            "api_key",
+        ] {
+            if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+                continue;
+            }
+            let flag = id.replace('_', "-");
+            let message = match &parsed.command {
+                None => continue,
+                Some(Command::Connect { new: true, .. }) if id != "api_key" => continue,
+                Some(Command::Connect { .. }) if id == "api_key" => format!(
+                    "--{flag} is only supported for new local sessions. Configure credentials on the host instead."
+                ),
+                Some(Command::Connect { .. }) => format!(
+                    "--{flag} requires --new when connecting. To change an existing session, use interactive settings."
+                ),
+                _ => format!(
+                    "--{flag} only applies when creating a session. Use interactive settings to change an existing session, or config to set host defaults."
+                ),
+            };
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                message,
+            ));
+        }
         parsed.env = explicit_global_arguments(&argv, "--env", None).unwrap_or_default();
         if let Some(allow) = explicit_global_arguments(&argv, "--allow", Some(',')) {
             parsed.allow = allow;
@@ -271,22 +307,11 @@ impl Args {
                 "--account, --default-account, and --api-key cannot be combined",
             ));
         }
-        if parsed.account_selection().is_some()
-            && !matches!(
-                parsed.command,
-                None | Some(Command::Continue { .. }) | Some(Command::Connect { .. })
-            )
-        {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ArgumentConflict,
-                "--account and --default-account require a session to open",
-            ));
-        }
         Ok(parsed)
     }
 
-    /// An explicit session-account choice. Omission preserves the saved choice,
-    /// while `--default-account` clears the resolved provider's pin.
+    /// An explicit new-session account choice. `--default-account` selects
+    /// the provider default rather than a named account.
     pub fn account_selection(&self) -> Option<aj_wire::AccountSelection> {
         if self.default_account {
             Some(aj_wire::AccountSelection { name: None })
@@ -561,14 +586,6 @@ pub const TAG_WITHOUT_A_CREATE: &str = "--tag has nothing to name: this run resu
 pub const HOST_WITHOUT_A_CREATE: &str = "--host has nothing to point at: this run attached an existing session rather than \
      creating one, and a session stays on the host that holds it.";
 
-/// What a connect run says when `--thinking` had no created session to set.
-///
-/// Attaching observes an existing session. Applying a launch-time setting to
-/// it would silently turn attach into a mutation, so the run reports the flag
-/// instead.
-pub const THINKING_WITHOUT_A_CREATE: &str = "--thinking has nothing to set: this run attached an existing session rather than \
-     creating one, and attaching does not change that session's thinking level.";
-
 /// What a run says when `--env` was armed but its primary gesture resumed.
 pub const ENV_WITHOUT_A_CREATE: &str = "--env applies only to sessions this run creates. The resumed or attached session keeps the environment recorded in its own log.";
 
@@ -723,6 +740,108 @@ mod tests {
     }
 
     #[test]
+    fn session_flags_require_creation_independent_of_subcommand_placement() {
+        for flag in [
+            "--model-api=openai",
+            "--model-name=gpt-5.5",
+            "--model-url=https://example.test",
+            "--thinking=high",
+            "--speed=fast",
+            "--account=work",
+            "--default-account",
+            "--api-key=synthetic",
+        ] {
+            for command in [
+                vec![],
+                vec!["--print", "hello"],
+                vec!["connect", "http://host", "--new"],
+                vec!["connect", "http://host"],
+                vec!["connect", "http://host", "id"],
+                vec!["continue"],
+                vec!["--print", "continue", "id", "prompt"],
+                vec!["serve"],
+                vec!["gateway"],
+                vec!["list-sessions"],
+                vec!["update-models"],
+            ] {
+                let allowed = command.is_empty()
+                    || command == ["--print", "hello"]
+                    || (command.contains(&"--new") && !flag.starts_with("--api-key"));
+                for before in [true, false] {
+                    let mut argv = vec!["aj"];
+                    if before {
+                        argv.push(flag);
+                    }
+                    argv.extend(command.iter().copied());
+                    if !before {
+                        argv.push(flag);
+                    }
+                    let result = Args::try_parse_from(&argv);
+                    assert_eq!(result.is_ok(), allowed, "{argv:?}: {result:?}");
+                    if let Err(error) = result {
+                        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                        assert!(error.to_string().contains(flag.split('=').next().unwrap()));
+                    }
+                }
+            }
+        }
+        let resumed = parse(&["aj", "continue", "id", "prompt", "@file"]);
+        assert!(
+            matches!(resumed.command, Some(Command::Continue { prompt, .. }) if prompt == ["prompt", "@file"])
+        );
+    }
+
+    #[test]
+    fn environment_session_defaults_do_not_count_as_explicit_flags() {
+        const SENTINEL: &str = "AJ_TEST_SESSION_DEFAULTS_CHILD";
+        if let Some(path) = std::env::var_os(SENTINEL) {
+            for command in [
+                vec!["serve"],
+                vec!["continue", "id"],
+                vec!["connect", "http://host"],
+                vec!["gateway"],
+                vec!["list-sessions"],
+                vec!["update-models"],
+            ] {
+                let args = parse(&[vec!["aj"], command].concat());
+                assert_eq!(args.model_api.as_deref(), Some("openai"));
+                assert_eq!(args.model_name.as_deref(), Some("env-model"));
+                assert_eq!(args.model_url.as_deref(), Some("https://example.test"));
+                assert_eq!(args.thinking, Some(ConfigThinkingLevel::High));
+                assert_eq!(args.speed.as_deref(), Some("fast"));
+            }
+            let args = parse(&["aj", "connect", "http://host", "--new", "--thinking=off"]);
+            assert_eq!(args.thinking, Some(ConfigThinkingLevel::Off));
+            assert!(Args::try_parse_from(["aj", "continue", "--thinking=off"]).is_err());
+            std::fs::write(path, "observed").unwrap();
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let sentinel = dir.path().join("observed");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::args::tests::environment_session_defaults_do_not_count_as_explicit_flags",
+                "--nocapture",
+            ])
+            .env("MODEL_API", "openai")
+            .env("MODEL_NAME", "env-model")
+            .env("MODEL_URL", "https://example.test")
+            .env("AJ_THINKING", "high")
+            .env("AJ_SPEED", "fast")
+            .env(SENTINEL, &sentinel)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "observed");
+    }
+
+    #[test]
     fn account_flags_distinguish_omission_default_and_exact_empty_identity() {
         assert!(parse(&["aj"]).account_selection().is_none());
         for (flag, expected) in [
@@ -731,9 +850,9 @@ mod tests {
             ("--account=default", Some("default")),
         ] {
             for argv in [
-                vec!["aj", flag, "continue"],
-                vec!["aj", "continue", flag],
-                vec!["aj", "connect", "http://localhost:6161", flag],
+                vec!["aj", flag],
+                vec!["aj", flag, "connect", "http://localhost:6161", "--new"],
+                vec!["aj", "connect", "http://localhost:6161", "--new", flag],
             ] {
                 assert_eq!(
                     parse(&argv).account_selection().unwrap().name.as_deref(),
@@ -1110,8 +1229,22 @@ mod tests {
     #[test]
     fn the_thinking_flag_parses_on_either_side_of_connect() {
         for argv in [
-            ["aj", "--thinking", "high", "connect", "http://host:6161"],
-            ["aj", "connect", "http://host:6161", "--thinking", "high"],
+            [
+                "aj",
+                "--thinking",
+                "high",
+                "connect",
+                "http://host:6161",
+                "--new",
+            ],
+            [
+                "aj",
+                "connect",
+                "http://host:6161",
+                "--new",
+                "--thinking",
+                "high",
+            ],
         ] {
             let args = parse(&argv);
             assert_eq!(args.thinking, Some(ConfigThinkingLevel::High), "{argv:?}");

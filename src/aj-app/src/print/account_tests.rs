@@ -117,11 +117,8 @@ impl Store {
     }
 
     async fn run(&self, cli: &[&str]) -> anyhow::Result<(String, AssistantMessage)> {
-        let mut args = Args::try_parse_from(
-            ["aj", "--print", "--thinking", "off", "--speed", "standard"]
-                .into_iter()
-                .chain(cli.iter().copied()),
-        )?;
+        let mut args =
+            Args::try_parse_from(["aj", "--print"].into_iter().chain(cli.iter().copied()))?;
         // Exercise Config model selection without inheriting clap's MODEL_*
         // bindings or mutating the process environment shared by other tests.
         args.model_api = None;
@@ -130,6 +127,8 @@ impl Store {
         assert!(args.scripted.is_none());
         assert!(args.api_key.is_none());
         let config = Config {
+            thinking: Some(aj_conf::ConfigThinkingLevel::Off),
+            speed: Some(aj_conf::ConfigSpeed::Standard),
             model_api: Some(PROVIDER.into()),
             model_name: Some(MODEL.into()),
             spill_dir: Some(self.dir.path().join("spill").to_string_lossy().into_owned()),
@@ -198,59 +197,64 @@ impl Store {
 }
 
 #[tokio::test]
-async fn explicit_choices_override_resume_while_omission_restores_the_saved_pin() {
-    let store = Store::new().await;
-    store
-        .assert_run(
-            &["--account", "default", "create"],
+async fn creation_choices_are_preserved_when_resume_omits_account_flags() {
+    for (flags, pin, label, token) in [
+        (
+            vec!["--account", "default"],
             Some("default"),
             "default",
             "synthetic-literally-default-token",
-        )
-        .await;
-    let id = store.log().session_id().to_string();
-
-    for (flags, pin, label, token) in [
+        ),
         (
             vec!["--account", "work"],
             Some("work"),
             "work",
             "synthetic-work-token",
         ),
-        (vec![], Some("work"), "work", "synthetic-work-token"),
         (
             vec!["--account", ""],
             Some(""),
             "",
             "synthetic-unnamed-token",
         ),
-        (vec![], Some(""), "", "synthetic-unnamed-token"),
-        (
-            vec!["--default-account"],
-            None,
-            "personal",
-            "synthetic-personal-token",
-        ),
     ] {
-        let mut cli = vec!["continue", &id, "resume"];
-        cli.extend(flags);
+        let store = Store::new().await;
+        let mut cli = flags;
+        cli.push("create");
         store.assert_run(&cli, pin, label, token).await;
+        let id = store.log().session_id().to_string();
+        store
+            .auth()
+            .set_default_account(PROVIDER, "work")
+            .await
+            .unwrap();
+        store
+            .assert_run(&["continue", &id, "resume"], pin, label, token)
+            .await;
         assert_eq!(store.persistence.list_sessions().unwrap().len(), 1);
-    }
 
-    store
-        .auth()
-        .set_default_account(PROVIDER, "work")
-        .await
-        .unwrap();
-    store
-        .assert_run(
-            &["continue", &id, "follow the changed default"],
-            None,
-            "work",
-            "synthetic-work-token",
-        )
-        .await;
+        let before = store.log().entries_in_order().len();
+        let calls = store.provider.calls.load(Ordering::SeqCst);
+        for flags in [
+            vec!["--model-api", PROVIDER],
+            vec!["--model-name", MODEL],
+            vec!["--model-url", "https://example.test"],
+            vec!["--thinking", "off"],
+            vec!["--speed", "standard"],
+            vec!["--api-key", "synthetic-key"],
+            vec!["--account", "work"],
+            vec!["--account", ""],
+            vec!["--default-account"],
+        ] {
+            let mut cli = vec!["continue", &id, "refuse"];
+            cli.extend(flags);
+            let error = store.run(&cli).await.unwrap_err();
+            assert!(error.downcast_ref::<clap::Error>().is_some(), "{error:#}");
+            assert_eq!(store.provider.calls.load(Ordering::SeqCst), calls);
+            assert_eq!(store.log().entries_in_order().len(), before);
+            store.assert_pin(pin);
+        }
+    }
 }
 
 #[tokio::test]
@@ -285,8 +289,7 @@ async fn default_account_creation_stays_dynamic_and_missing_names_refuse_inferen
         .run(&["continue", &id, "refuse", "--account", "missing"])
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("missing"), "{error:#}");
-    assert!(error.to_string().contains(PROVIDER), "{error:#}");
+    assert!(error.downcast_ref::<clap::Error>().is_some(), "{error:#}");
     assert_eq!(store.provider.calls.load(Ordering::SeqCst), calls);
     assert_eq!(store.log().entries_in_order().len(), before);
     store.assert_pin(None);
