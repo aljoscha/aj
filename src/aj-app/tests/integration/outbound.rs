@@ -118,6 +118,7 @@ fn state(revision: u64) -> Frame {
         },
         oracle_settings: None,
         goal: None,
+        turn_outcome: None,
         credential_warning: None,
     }
 }

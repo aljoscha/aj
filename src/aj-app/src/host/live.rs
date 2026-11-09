@@ -123,6 +123,7 @@ pub(crate) struct SessionStatus {
     /// Whether the **main** agent has a turn in flight. Says nothing about
     /// sub-agents, whose liveness travels through lifecycle events.
     pub(crate) working: bool,
+    pub(crate) turn_outcome: Option<aj_wire::TurnOutcome>,
     /// Session-wide activity for directory rows, independent of Main's turn.
     pub(crate) session_working: bool,
     /// The settings the next main turn runs against, cached off the run
@@ -199,6 +200,7 @@ impl SessionStatus {
             settings: self.settings.clone(),
             oracle_settings: self.oracle_settings.clone(),
             goal: self.goal.clone(),
+            turn_outcome: self.turn_outcome,
             credential_warning: None,
         }
     }

@@ -704,6 +704,281 @@ struct BashGate {
     process: Option<tokio::net::TcpStream>,
 }
 
+fn assert_terminal_status(client: &Attached, directory_working: bool, expected: &str) {
+    let status = crate::program_status::Status::for_session(
+        &client.client,
+        &client.chat,
+        directory_working,
+        true,
+        false,
+    );
+    let mut bytes = Vec::new();
+    crate::program_status::Reporter::new()
+        .update(&mut bytes, status)
+        .expect("write terminal status");
+    assert_eq!(
+        bytes,
+        format!("\x1b]7501;state={expected}:app=aj\x1b\\").as_bytes()
+    );
+}
+
+async fn finish_status_turn(client: &mut Attached) -> Vec<Frame> {
+    client
+        .pump_until("the live terminal state", |frame| {
+            matches!(
+                frame,
+                Frame::State {
+                    opens_block: false,
+                    working: false,
+                    turn_outcome: Some(_),
+                    ..
+                }
+            )
+        })
+        .await
+}
+
+async fn assert_turn_terminal_status(
+    message: AssistantMessage,
+    outcome: aj_wire::TurnOutcome,
+    status: &str,
+) {
+    let fixture = Fixture::new(vec![message]).await;
+    let session = fixture.create().await;
+    let mut local = fixture.oracle(&session).await;
+    let mut remote = fixture.remote(&session).await;
+    local.finish_idle_attach().await;
+    remote.finish_idle_attach().await;
+    fixture.prompt(&session, "run").await;
+    for client in [&mut local, &mut remote] {
+        finish_status_turn(client).await;
+        assert_eq!(client.client.turn_outcome(), Some(outcome));
+        assert_terminal_status(client, false, status);
+        if matches!(
+            outcome,
+            aj_wire::TurnOutcome::Completed | aj_wire::TurnOutcome::Failed
+        ) {
+            client.client.acknowledge_turn_outcome();
+            assert_eq!(client.client.turn_outcome(), None);
+            assert_terminal_status(client, false, "idle");
+        }
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_status_reports_done_after_completion() {
+    assert_turn_terminal_status(
+        finalized_text_message("done"),
+        aj_wire::TurnOutcome::Completed,
+        "done",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_status_reports_error_after_terminal_provider_failure() {
+    use aj_models::types::{AssistantError, ErrorCategory};
+
+    let mut failure = finalized_text_message("");
+    failure.stop_reason = StopReason::Error;
+    failure.error = Some(AssistantError::new(
+        ErrorCategory::InvalidRequest,
+        "invalid request",
+    ));
+    assert_turn_terminal_status(failure, aj_wire::TurnOutcome::Failed, "error").await;
+}
+
+#[tokio::test]
+async fn terminal_status_reports_idle_after_explicit_yield() {
+    assert_turn_terminal_status(
+        calling("", "wait", "wait", serde_json::json!({})),
+        aj_wire::TurnOutcome::Waiting,
+        "idle",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_status_keeps_a_yielded_active_goal_idle_after_reattach() {
+    use aj_agent::goal::{GoalAction, GoalStatus};
+    let fixture = Fixture::new(vec![calling("", "wait", "wait", serde_json::json!({}))]).await;
+    let session = fixture.create().await;
+    let mut local = fixture.oracle(&session).await;
+    let mut remote = fixture.remote(&session).await;
+    local.finish_idle_attach().await;
+    remote.finish_idle_attach().await;
+    fixture
+        .host
+        .command(
+            &session,
+            Command::Goal(
+                GoalAction::Create {
+                    objective: "wait for input".into(),
+                    token_budget: None,
+                }
+                .into(),
+            ),
+        )
+        .await
+        .unwrap();
+    for client in [&mut local, &mut remote] {
+        finish_status_turn(client).await;
+        assert_eq!(
+            client.chat.goal.as_ref().unwrap().status,
+            GoalStatus::Active
+        );
+        assert!(client.chat.tasks().is_empty());
+        assert_terminal_status(client, false, "idle");
+        client.reattach().await;
+        assert_eq!(
+            client.client.turn_outcome(),
+            Some(aj_wire::TurnOutcome::Waiting)
+        );
+        client.client.acknowledge_turn_outcome();
+        assert_terminal_status(client, false, "idle");
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_status_does_not_announce_completion_during_attach() {
+    let mut bash = BashGate::new().await;
+    let fixture = Fixture::new(vec![
+        calling(
+            "",
+            "held",
+            "bash",
+            serde_json::json!({
+                "command": bash.command(), "description": "hold the turn open",
+            }),
+        ),
+        finalized_text_message("done"),
+    ])
+    .await;
+    let session = fixture.create().await;
+    let mut observer = fixture.oracle(&session).await;
+    observer.finish_idle_attach().await;
+    fixture.prompt(&session, "run").await;
+    bash.wait_until_blocked().await;
+    let mut stream = fixture
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .unwrap();
+    let opening = bounded("opening state", stream.recv()).await.unwrap();
+    assert!(matches!(
+        opening,
+        Frame::State {
+            opens_block: true,
+            working: true,
+            ..
+        }
+    ));
+    // The capacity-one block channel holds projection behind this snapshot.
+    // Complete Main before draining the block, forcing its post-CaughtUp repair.
+    bash.release().await;
+    finish_status_turn(&mut observer).await;
+    let mut client = SessionClient::new(session);
+    let mut chat = ChatState::new(settings());
+    let _ = client.apply(&mut chat, opening);
+    let mut caught_up = false;
+    bounded("post-block idle repair", async {
+        loop {
+            let frame = stream.recv().await.unwrap();
+            caught_up |= matches!(frame, Frame::CaughtUp { .. });
+            let repaired = matches!(
+                frame,
+                Frame::State {
+                    opens_block: false,
+                    working: false,
+                    turn_outcome: Some(aj_wire::TurnOutcome::Completed),
+                    ..
+                }
+            );
+            let _ = client.apply(&mut chat, frame);
+            assert_eq!(
+                client.turn_outcome(),
+                None,
+                "catch-up is not fresh completion"
+            );
+            if repaired {
+                assert!(caught_up);
+                break;
+            }
+        }
+    })
+    .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_status_is_idle_when_cancelled_before_provider_output() {
+    use aj_models::scripted::ProviderScript;
+    use aj_models::streaming::{AssistantMessageEvent, ErrorReason};
+
+    // The runtime opens an empty assistant slot before invoking the provider.
+    // Cancellation must finish without waiting for any provider output.
+    let provider = Arc::new(
+        ScriptedProvider::new(vec![ProviderScript::new().push(
+            DEADLINE * 3,
+            AssistantMessageEvent::Start {
+                partial: finalized_text_message(""),
+            },
+        )])
+        .on_exhausted(ExhaustedBehavior::Panic),
+    );
+    let fixture = Fixture::with_provider(provider).await;
+    let session = fixture.create().await;
+    let mut local = fixture.oracle(&session).await;
+    let mut remote = fixture.remote(&session).await;
+    local.finish_idle_attach().await;
+    remote.finish_idle_attach().await;
+    fixture.prompt(&session, "run").await;
+    for client in [&mut local, &mut remote] {
+        client
+            .pump_until("Main starts", |frame| {
+                matches!(frame,
+                    Frame::Event { event, .. } if matches!(event.known(),
+                        Some(AgentEvent::AgentStart { agent_id: AgentId::Main, .. }))
+                )
+            })
+            .await;
+    }
+    fixture
+        .client
+        .command(&session, &RemoteCommand::Cancel(CancelRequest::default()))
+        .await
+        .expect("cancel accepted");
+    for client in [&mut local, &mut remote] {
+        let frames = finish_status_turn(client).await;
+        for frame in frames {
+            if let Frame::Event { event, .. } = frame
+                && let Some(AgentEvent::MessageUpdate { event, .. }) = event.known()
+            {
+                // The runtime synthesizes an aborted terminal update even
+                // when the provider has not published anything.
+                assert!(matches!(
+                    event,
+                    AssistantMessageEvent::Error {
+                        reason: ErrorReason::Aborted,
+                        ..
+                    }
+                ));
+            }
+        }
+        assert_eq!(
+            client.client.turn_outcome(),
+            Some(aj_wire::TurnOutcome::Cancelled)
+        );
+        assert_terminal_status(client, false, "idle");
+    }
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn directory_stays_working_while_main_yields_to_background_work() {
     let mut bash = BashGate::new().await;
@@ -718,7 +993,7 @@ async fn directory_stays_working_while_main_yields_to_background_work() {
                 "run_in_background": true
             }),
         ),
-        calling("", "wait", "yield", serde_json::json!({})),
+        calling("", "wait", "wait", serde_json::json!({})),
         finalized_text_message("background work finished"),
     ])
     .await;
@@ -754,6 +1029,11 @@ async fn directory_stays_working_while_main_yields_to_background_work() {
                 .any(|task| task.status == aj_agent::tool::TaskStatus::Running)
         );
         assert!(client.transport.row(&session).await.working);
+        assert_eq!(
+            client.client.turn_outcome(),
+            Some(aj_wire::TurnOutcome::Waiting)
+        );
+        assert_terminal_status(client, true, "working");
         client
             .pump_until("session-wide working list", |frame| {
                 matches!(frame,
@@ -773,6 +1053,7 @@ async fn directory_stays_working_while_main_yields_to_background_work() {
                 )
             })
             .await;
+        finish_status_turn(client).await;
         client
             .pump_until("session-wide idle list", |frame| {
                 matches!(frame,
@@ -782,6 +1063,11 @@ async fn directory_stays_working_while_main_yields_to_background_work() {
             })
             .await;
         assert!(!client.transport.row(&session).await.working);
+        assert_eq!(
+            client.client.turn_outcome(),
+            Some(aj_wire::TurnOutcome::Completed)
+        );
+        assert_terminal_status(client, false, "done");
         assert!(
             client
                 .chat

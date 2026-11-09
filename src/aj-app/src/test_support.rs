@@ -965,6 +965,7 @@ mod tests {
                 settings: agent_settings(),
                 oracle_settings: None,
                 goal: None,
+                turn_outcome: None,
                 credential_warning: None,
             },
         );

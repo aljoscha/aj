@@ -816,6 +816,7 @@ fn state_frame_carries_display_settings_and_credential_warning() {
         settings,
         oracle_settings: None,
         goal: None,
+        turn_outcome: None,
         credential_warning: Some("host credentials are missing".into()),
     };
     let frame = serde_json::to_value(frame).unwrap();
@@ -852,6 +853,7 @@ fn state_round_trips_independent_oracle_settings() {
             settings: main.clone(),
             oracle_settings: oracle_settings.clone(),
             goal: None,
+            turn_outcome: None,
             credential_warning: None,
         };
         let encoded = serde_json::to_value(frame).unwrap();
@@ -1263,6 +1265,7 @@ fn frame_decode_is_forward_compatible() {
         Frame::State {
             oracle_settings: None,
             goal: None,
+            turn_outcome: None,
             credential_warning: None,
             ..
         }
@@ -3017,6 +3020,7 @@ fn local_frames() -> Vec<Frame> {
             },
             oracle_settings: None,
             goal: None,
+            turn_outcome: None,
             credential_warning: None,
         },
         Frame::CaughtUp {

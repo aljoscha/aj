@@ -31,7 +31,7 @@ the host process itself.
   the host to loopback and tunnels the port through Tailscale SSH with
   `action: check`.
 - Tool approvals or any client-to-agent mid-turn decision channel.
-  Status is working or idle, nothing more.
+  Runtime status reports activity and turn outcomes, not approval requests.
 - A web UI. HTTP plus SSE leaves that door open, nothing here builds
   toward it.
 - Provisioning hosts or VMs. A gateway enrolls hosts that exist.
@@ -214,11 +214,20 @@ internally tagged with `kind`:
   the host's runtime fallback or validation. It contains no environment values,
   credentials, or live-only thinking display. Live delivery and backfill supply
   the same context, including across compaction. Older hosts may omit the field.
-- `state`: `{kind, session, epoch, opens_block?, working, settings, oracle_settings?, goal?}`.
+- `state`: `{kind, session, epoch, opens_block?, working, turn_outcome?, settings, oracle_settings?, goal?}`.
   `opens_block: true` marks the `state` that opens an attach block
   (section 5.5), absent reads false. It is the only thing that tells a
   block's opening from an on-change `state`, so a client reads it off the
   frame and never infers it from having asked.
+  `turn_outcome` optionally reports how Main's last driven turn ended:
+  `completed`, `cancelled`, `failed`, or `waiting` (an explicit yield).
+  It is null while Main is working, absent or null when unknown, and not
+  restored from the log. Attach openings carry the current outcome so a
+  yielded goal remains distinguishable from one continuing between turns.
+  A client may announce outcomes of turns it observed starting live, but must
+  not announce catch-up or its post-`caught_up` repair as new completion.
+  Tool failures alone are not failed turns, and waiting does not imply a need
+  for user action.
   `working` says whether the session's **main agent** has a turn in
   flight, `settings` is the active `AgentSettings` (`provider`,
   `model_id`, `thinking`, `thinking_display`, `speed`, `verbosity`, `context_window`),

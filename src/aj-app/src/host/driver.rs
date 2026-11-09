@@ -429,6 +429,9 @@ impl Driver {
         let result = match outcome {
             Ok(result) => result,
             Err(err) => {
+                if agent == AgentId::Main {
+                    self.session.status().turn_outcome = Some(aj_wire::TurnOutcome::Failed);
+                }
                 // A panicked turn task is fatal for the turn but not for
                 // the host: other sessions keep running, and the reap
                 // above already marked its agent idle, so the session
@@ -446,6 +449,14 @@ impl Driver {
                 return;
             }
         };
+        if agent == AgentId::Main {
+            self.session.status().turn_outcome = Some(match &result {
+                Ok(()) if self.waiting_for_input => aj_wire::TurnOutcome::Waiting,
+                Ok(()) => aj_wire::TurnOutcome::Completed,
+                Err(TurnError::Aborted) => aj_wire::TurnOutcome::Cancelled,
+                Err(_) => aj_wire::TurnOutcome::Failed,
+            });
+        }
         if !self.session.is_draining()
             && self.automatic_wake_allowed(agent)
             && (self.session.core.task_registry.has_notices(agent)
@@ -590,6 +601,9 @@ impl Driver {
             status.session_working = session_working;
             let main_changed = status.working != working;
             status.working = working;
+            if working {
+                status.turn_outcome = None;
+            }
             main_changed
         });
         if changed {
@@ -1457,6 +1471,7 @@ impl Driver {
     /// stay unique across the switch, and its accumulated usage, which
     /// records tokens this process really spent.
     fn reset_branch_state(&self) {
+        self.session.status().turn_outcome = None;
         // The abandoned branch's sub-agents must stop being promptable: a
         // prompt to one would grow that branch under the new epoch, and
         // every attached client would fold it into the new branch's

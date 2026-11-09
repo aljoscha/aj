@@ -78,6 +78,7 @@ mod markdown_view;
 mod overlay;
 mod palette;
 mod pending;
+mod program_status;
 mod prompt_history;
 mod quit_hint;
 mod remote;

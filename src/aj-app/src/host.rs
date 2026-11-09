@@ -2186,6 +2186,7 @@ impl SessionHost {
             last_seq: log.last_seq(),
             working: false,
             session_working: false,
+            turn_outcome: None,
             settings,
             oracle_settings,
             goal,
@@ -2347,6 +2348,7 @@ impl SessionHost {
             snapshot,
             epoch,
             working_seen,
+            turn_outcome_seen,
             settings_seen,
             oracle_settings_seen,
             goal_seen,
@@ -2364,6 +2366,7 @@ impl SessionHost {
                 log.snapshot(),
                 status.epoch.clone(),
                 status.working,
+                status.turn_outcome,
                 status.settings.clone(),
                 status.oracle_settings.clone(),
                 status.goal.clone(),
@@ -2431,6 +2434,7 @@ impl SessionHost {
                 oracle_settings: oracle_settings_seen.clone(),
                 goal: goal_seen,
                 credential_warning,
+                turn_outcome: turn_outcome_seen,
             },
         )
         .await
@@ -2607,6 +2611,7 @@ impl SessionHost {
         // like a state change to every other client on the host.
         session.publish_state(&self.inner.shared.fanout, |status| {
             status.working != working_seen
+                || status.turn_outcome != turn_outcome_seen
                 || status.settings != settings_seen
                 || status.oracle_settings != oracle_settings_seen
         });

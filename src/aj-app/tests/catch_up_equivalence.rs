@@ -145,6 +145,7 @@ fn state_frame(epoch: &str, working: bool) -> Frame {
         settings: scripted_settings(),
         oracle_settings: None,
         goal: None,
+        turn_outcome: None,
         credential_warning: None,
     }
 }

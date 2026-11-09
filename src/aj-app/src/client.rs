@@ -95,6 +95,12 @@ pub struct SessionClient {
     settings: Option<AgentSettings>,
     oracle_settings: Option<AgentSettings>,
     working: bool,
+    /// Live Main outcome. Completion and failure remain until acknowledged.
+    /// Waiting survives acknowledgment so a yielded goal still reads as idle.
+    turn_outcome: Option<aj_wire::TurnOutcome>,
+    /// A live start awaits its terminal state. Reliable AgentStart covers a
+    /// working=true snapshot that the outbound queue coalesced away.
+    awaiting_turn_outcome: bool,
     first_attach_settings: Option<AgentSettings>,
     /// The host-side credential warning carried by the first attach's opening
     /// state, for a frontend to fold once after Caught. A reconnect may carry a
@@ -132,6 +138,8 @@ impl SessionClient {
             settings: None,
             oracle_settings: None,
             working: false,
+            turn_outcome: None,
+            awaiting_turn_outcome: false,
             first_attach_settings: None,
             first_attach_credential_warning: None,
             saw_first_attach: false,
@@ -209,6 +217,18 @@ impl SessionClient {
                     return Redraw(false);
                 };
                 let event = known.into_value();
+                if self.attach == Attach::Live
+                    && matches!(
+                        event,
+                        AgentEvent::AgentStart {
+                            agent_id: AgentId::Main,
+                            ..
+                        }
+                    )
+                {
+                    self.awaiting_turn_outcome = true;
+                    self.turn_outcome = None;
+                }
                 if let AgentEvent::QueueUpdate {
                     agent_id,
                     steering,
@@ -232,6 +252,7 @@ impl SessionClient {
                 epoch,
                 opens_block,
                 working,
+                turn_outcome,
                 settings,
                 oracle_settings,
                 goal,
@@ -263,6 +284,24 @@ impl SessionClient {
                 self.settings = Some(settings);
                 self.oracle_settings = oracle_settings;
                 chat.note_goal(goal);
+                if opens_block {
+                    self.awaiting_turn_outcome = false;
+                    self.turn_outcome = None;
+                } else if self.attach == Attach::Live {
+                    if working {
+                        self.awaiting_turn_outcome = true;
+                        self.turn_outcome = None;
+                    } else if self.awaiting_turn_outcome {
+                        self.turn_outcome = turn_outcome;
+                        self.awaiting_turn_outcome = false;
+                    }
+                }
+                // Waiting is current runtime state, not an attention signal.
+                // Preserve it through attach and its post-CaughtUp repair so
+                // an active but yielded goal does not look like ongoing work.
+                if !working && turn_outcome == Some(aj_wire::TurnOutcome::Waiting) {
+                    self.turn_outcome = turn_outcome;
+                }
                 self.working = working;
                 Redraw(true)
             }
@@ -464,6 +503,23 @@ impl SessionClient {
         self.working
     }
 
+    /// Main's live outcome, excluding acknowledged completion or failure.
+    /// Attach history never creates an outcome, and a new turn replaces it.
+    pub fn turn_outcome(&self) -> Option<aj_wire::TurnOutcome> {
+        self.turn_outcome
+    }
+
+    /// Acknowledge completion or failure. Waiting and cancellation carry no
+    /// attention indicator and remain until replaced by a new turn.
+    pub fn acknowledge_turn_outcome(&mut self) {
+        if matches!(
+            self.turn_outcome,
+            Some(aj_wire::TurnOutcome::Completed | aj_wire::TurnOutcome::Failed)
+        ) {
+            self.turn_outcome = None;
+        }
+    }
+
     /// Whether continuity was broken and the caller owes a re-attach.
     pub fn needs_reattach(&self) -> bool {
         self.needs_reattach
@@ -652,6 +708,74 @@ mod tests {
         state_with(epoch, working, settings())
     }
 
+    #[test]
+    fn turn_outcomes_require_live_completion_and_acknowledgment_survives_state_refresh() {
+        let mut client = SessionClient::new(SESSION.into());
+        let mut chat = chat();
+        let completed = |mut frame| {
+            if let Frame::State { turn_outcome, .. } = &mut frame {
+                *turn_outcome = Some(aj_wire::TurnOutcome::Completed);
+            }
+            frame
+        };
+        let _ = client.apply(&mut chat, completed(opening(EPOCH, false)));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        assert_eq!(client.turn_outcome(), None, "history is not a new result");
+        let _ = client.apply(&mut chat, state(EPOCH, true));
+        let _ = client.apply(&mut chat, completed(state("stale", false)));
+        assert_eq!(client.turn_outcome(), None);
+        let _ = client.apply(&mut chat, completed(state(EPOCH, false)));
+        assert_eq!(client.turn_outcome(), Some(aj_wire::TurnOutcome::Completed));
+        client.acknowledge_turn_outcome();
+        let _ = client.apply(&mut chat, completed(state(EPOCH, false)));
+        assert_eq!(
+            client.turn_outcome(),
+            None,
+            "settings refresh cannot re-arm a result"
+        );
+        let _ = client.apply(&mut chat, state(EPOCH, true));
+        let _ = client.apply(&mut chat, completed(state(EPOCH, false)));
+        assert!(client.turn_outcome().is_some());
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
+        let _ = client.apply(&mut chat, completed(state(EPOCH, false)));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        assert_eq!(
+            client.turn_outcome(),
+            None,
+            "catch-up does not announce completion"
+        );
+        // The host repairs changes during a block after CaughtUp, not before.
+        let _ = client.apply(&mut chat, opening(EPOCH, true));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        let _ = client.apply(&mut chat, completed(state(EPOCH, false)));
+        assert_eq!(
+            client.turn_outcome(),
+            None,
+            "post-block repair is not live completion"
+        );
+        // Working snapshots coalesce, but the reliable live start survives.
+        let _ = client.apply(
+            &mut chat,
+            live(
+                EPOCH,
+                AgentEvent::AgentStart {
+                    agent_id: AgentId::Main,
+                    assignment_pending: false,
+                },
+            ),
+        );
+        let _ = client.apply(&mut chat, completed(state(EPOCH, false)));
+        assert_eq!(client.turn_outcome(), Some(aj_wire::TurnOutcome::Completed));
+        let mut waiting = opening(EPOCH, false);
+        if let Frame::State { turn_outcome, .. } = &mut waiting {
+            *turn_outcome = Some(aj_wire::TurnOutcome::Waiting);
+        }
+        let _ = client.apply(&mut chat, waiting);
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        client.acknowledge_turn_outcome();
+        assert_eq!(client.turn_outcome(), Some(aj_wire::TurnOutcome::Waiting));
+    }
+
     fn state_with(epoch: &str, working: bool, settings: AgentSettings) -> Frame {
         state_frame(epoch, false, working, settings, None)
     }
@@ -689,6 +813,7 @@ mod tests {
             settings,
             oracle_settings: None,
             goal: None,
+            turn_outcome: None,
             credential_warning: credential_warning.map(str::to_string),
         }
     }
@@ -880,6 +1005,7 @@ mod tests {
             settings: settings(),
             oracle_settings,
             goal: None,
+            turn_outcome: None,
             credential_warning: None,
         };
         let opening = |session, epoch, oracle| frame(session, epoch, true, oracle);

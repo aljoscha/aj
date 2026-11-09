@@ -2303,6 +2303,7 @@ struct LoginSession {
     cancel: Arc<AtomicBool>,
     token: CancellationToken,
     handle: tokio::task::JoinHandle<LoginOutcome>,
+    state: Arc<StdMutex<LoginDialogState>>,
 }
 
 /// How a login task ended. Authorization runs on this machine and stores
@@ -2380,7 +2381,7 @@ fn start_login(
     let task_pending = Arc::clone(&pending_input);
     let completion_target = target.clone();
     let handle = tokio::spawn(async move {
-        let callbacks = DialogCallbacks::new(task_state, task_pending, redraw);
+        let callbacks = DialogCallbacks::new(Arc::clone(&task_state), task_pending, redraw.clone());
         let authorize = async {
             let provider = auth.oauth_provider(&provider_id).await.map_err(|_| {
                 OAuthError::Other(format!("this aj has no login flow for {provider_id}"))
@@ -2398,10 +2399,17 @@ fn start_login(
         };
         // The one step that writes. It runs to its answer whatever the token
         // says, so cancellation never leaves a write in doubt.
+        {
+            let mut state = task_state.lock().expect("login dialog state poisoned");
+            state.url = None;
+            state.input_prompt = None;
+        }
+        let _ = redraw.send(());
         LoginOutcome::Store(control.mutate_credentials(&session, mutation).await)
     });
 
     *login_session = Some(LoginSession {
+        state,
         provider_name,
         target: completion_target,
         cancel,
@@ -7750,6 +7758,41 @@ fn reattached_notice(control: &Control) -> &'static str {
     }
 }
 
+fn acknowledges_program_status(event: &Event) -> bool {
+    matches!(event, Event::KeyPress(_))
+        || matches!(event, Event::Paste(text) if !text.is_empty())
+        || matches!(event, Event::Mouse(mouse) if mouse.button != vaxis::mouse::Button::None)
+}
+
+fn sync_program_status(
+    app: &mut AsyncApp,
+    world: &World,
+    reporter: &mut crate::program_status::Reporter,
+    login: Option<&LoginSession>,
+) {
+    let auth_pending = login.is_some_and(|login| {
+        if login.cancel.load(Ordering::Relaxed) || login.handle.is_finished() {
+            return false;
+        }
+        let state = login.state.lock().expect("login dialog state poisoned");
+        state.input_prompt.is_some() || state.url.is_some()
+    });
+    let working = world
+        .directory
+        .rows()
+        .iter()
+        .any(|row| row.id == world.session() && row.working);
+    let status = crate::program_status::Status::for_session(
+        world.client(),
+        &world.chat.borrow(),
+        working,
+        world.connection == Connection::Connected && world.client().attach_phase() == Attach::Live,
+        auth_pending,
+    );
+    // Status is optional terminal metadata. Its failure must not stop a turn.
+    let _ = app.with_writer(|writer| reporter.update(writer, status));
+}
+
 async fn drive(
     app: &mut AsyncApp,
     root: &WidgetRef,
@@ -7758,6 +7801,9 @@ async fn drive(
     theme_watch: &mut ThemeWatch,
     prompt_history_rx: &mut Option<UnboundedReceiver<Vec<String>>>,
 ) -> Result<SessionExit> {
+    let mut program_status = crate::program_status::Reporter::new();
+    // Selecting a session is deliberate attention, not a new completion.
+    world.client_mut().acknowledge_turn_outcome();
     // The receiver stays with its editor across switches and early exits.
     let view = shell.borrow().view();
     // Rising-edge tracker for the loader's animation: the tick chain
@@ -7900,6 +7946,7 @@ async fn drive(
             app.request_redraw();
         }
         sync_sidebar(world, shell);
+        sync_program_status(app, world, &mut program_status, login_session.as_ref());
         // Entry ids restart when the model is replaced. Clear image lookups
         // and terminal allocations before painting, while the terminal handle
         // is available. Widget reconciliation has its own generation because
@@ -8056,6 +8103,9 @@ async fn drive(
             event = app.next_input() => {
                 match event {
                     Some(event) => {
+                        if acknowledges_program_status(&event) {
+                            world.client_mut().acknowledge_turn_outcome();
+                        }
                         // Every global chord (the ctrl+c ladder, the
                         // toggles, the overlay openers) is matched by
                         // the keymap controller inside this dispatch.
@@ -8665,6 +8715,8 @@ async fn drive(
     // Every loop exit, including errors, passes this barrier: leaving the UI
     // must not detach a credential writer, so a store in flight is awaited.
     // Authorization stops at once and stores nothing.
+    let _ = app
+        .with_writer(|writer| program_status.update(writer, crate::program_status::Status::Clear));
     if let Some(session) = login_session.as_mut() {
         session.token.cancel();
         let outcome = (&mut session.handle).await;
@@ -18289,49 +18341,218 @@ mod tests {
         world.chat.borrow();
     }
 
+    struct CapturedTty {
+        inner: TestTty,
+        output: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl Write for CapturedTty {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl vaxis::tty::Tty for CapturedTty {
+        fn writer(&mut self) -> &mut dyn Write {
+            self
+        }
+
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+
+        fn get_winsize(&self) -> std::io::Result<vaxis::Winsize> {
+            self.inner.get_winsize()
+        }
+
+        fn notify_winsize(
+            &self,
+            handler: vaxis::tty::ResizeHandler,
+        ) -> std::io::Result<vaxis::tty::HandlerId> {
+            self.inner.notify_winsize(handler)
+        }
+
+        fn remove_winsize(&self, id: vaxis::tty::HandlerId) {
+            self.inner.remove_winsize(id);
+        }
+    }
+
+    fn program_reports(output: &Rc<RefCell<Vec<u8>>>) -> Vec<String> {
+        String::from_utf8_lossy(&output.borrow())
+            .split("\x1b]7501;")
+            .skip(1)
+            .map(|part| part.split("\x1b\\").next().unwrap().to_string())
+            .collect()
+    }
+
+    async fn wait_program_report(output: &Rc<RefCell<Vec<u8>>>, report: &str, count: usize) {
+        tokio::time::timeout(SETTLE_DEADLINE, async {
+            while program_reports(output)
+                .iter()
+                .filter(|r| r.as_str() == report)
+                .count()
+                < count
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("missing {report}: {:?}", program_reports(output)));
+    }
+
+    #[tokio::test]
+    async fn program_status_drive_reports_completion_acknowledgment_and_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let (mut app, mut input, mut world, shell, root) = init_app_with_world_and_tty(
+            &dir,
+            "streaming-text",
+            Box::new(CapturedTty {
+                inner: TestTty::new(),
+                output: Rc::clone(&output),
+            }),
+        )
+        .await;
+        let (mut theme, mut history) = drive_parts();
+        let user = async {
+            wait_program_report(&output, "state=idle:app=aj", 1).await;
+            input.write_all(b"hello\r").unwrap();
+            wait_program_report(&output, "state=working:app=aj", 1).await;
+            wait_program_report(&output, "state=done:app=aj", 1).await;
+            input.write_all(b"x").unwrap();
+            wait_program_report(&output, "state=idle:app=aj", 2).await;
+            drop(input);
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme,
+                &mut history
+            ),
+            user
+        );
+        assert!(matches!(result.unwrap(), SessionExit::Quit));
+        assert_eq!(
+            program_reports(&output),
+            [
+                "state=idle:app=aj",
+                "state=working:app=aj",
+                "state=done:app=aj",
+                "state=idle:app=aj",
+                "state=clear",
+            ]
+        );
+        app.shutdown().await;
+        world.host().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn program_status_ignores_other_sessions_and_clears_unavailable_state() {
+        let dir = TempDir::new().unwrap();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let (mut app, _input, mut world, _shell, _root) = init_app_with_world_and_tty(
+            &dir,
+            "streaming-text",
+            Box::new(CapturedTty {
+                inner: TestTty::new(),
+                output: Rc::clone(&output),
+            }),
+        )
+        .await;
+        let mut rows = world.control.sessions().await.unwrap().sessions;
+        let mut other = rows
+            .iter()
+            .find(|row| row.id == world.session())
+            .unwrap()
+            .clone();
+        other.id = "another-session".into();
+        other.working = true;
+        rows.push(other);
+        let _ = world.directory.apply(aj_wire::Frame::List {
+            sessions: rows,
+            hosts: vec![],
+        });
+        let mut reporter = crate::program_status::Reporter::new();
+        sync_program_status(&mut app, &world, &mut reporter, None);
+        world.connection = Connection::Reconnecting;
+        sync_program_status(&mut app, &world, &mut reporter, None);
+        assert_eq!(
+            program_reports(&output),
+            ["state=idle:app=aj", "state=clear"]
+        );
+        app.shutdown().await;
+        world.host().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn program_status_reports_auth_only_while_login_needs_input() {
+        let dir = TempDir::new().unwrap();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let (mut app, _input, mut world, shell, _root) = init_app_with_world_and_tty(
+            &dir,
+            "streaming-text",
+            Box::new(CapturedTty {
+                inner: TestTty::new(),
+                output: Rc::clone(&output),
+            }),
+        )
+        .await;
+        register_controlled_oauth(&world, "status-auth", "access", LoginGate::Waiting).await;
+        let (redraw, _rx) = unbounded_channel();
+        let mut login = None;
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login,
+            &redraw,
+            "status-auth".into(),
+            "Controlled OAuth".into(),
+            LoginTarget::NewAccount {
+                existing: vec![String::new()],
+            },
+            world.session().to_string(),
+            credential_host(&world),
+        );
+        tokio::time::timeout(SETTLE_DEADLINE, async {
+            while login
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .input_prompt
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut reporter = crate::program_status::Reporter::new();
+        sync_program_status(&mut app, &world, &mut reporter, login.as_ref());
+        login.as_ref().unwrap().token.cancel();
+        let result = (&mut login.as_mut().unwrap().handle).await;
+        finish_login(&mut world, &shell, &mut app, &mut login, result);
+        sync_program_status(&mut app, &world, &mut reporter, None);
+        assert_eq!(
+            program_reports(&output),
+            ["state=blocked:kind=auth:app=aj", "state=idle:app=aj"]
+        );
+        app.shutdown().await;
+        world.host().shutdown().await;
+    }
+
     #[tokio::test]
     async fn epoch_replacement_releases_images_and_retries_failed_entries() {
-        struct CapturedTty {
-            inner: TestTty,
-            output: Rc<RefCell<Vec<u8>>>,
-        }
-
-        impl Write for CapturedTty {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.output.borrow_mut().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl vaxis::tty::Tty for CapturedTty {
-            fn writer(&mut self) -> &mut dyn Write {
-                self
-            }
-
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.inner.read(buf)
-            }
-
-            fn get_winsize(&self) -> std::io::Result<vaxis::Winsize> {
-                self.inner.get_winsize()
-            }
-
-            fn notify_winsize(
-                &self,
-                handler: vaxis::tty::ResizeHandler,
-            ) -> std::io::Result<vaxis::tty::HandlerId> {
-                self.inner.notify_winsize(handler)
-            }
-
-            fn remove_winsize(&self, id: vaxis::tty::HandlerId) {
-                self.inner.remove_winsize(id);
-            }
-        }
-
         for corrupt in [false, true] {
             let dir = TempDir::new().expect("tempdir");
             let output = Rc::new(RefCell::new(Vec::new()));
@@ -18637,6 +18858,7 @@ mod tests {
                 tokens_used: 0,
                 time_used_seconds: 90,
             }),
+            turn_outcome: None,
             credential_warning: None,
         };
         let _ = world.directory.apply(frame.clone());
@@ -18719,6 +18941,7 @@ mod tests {
             settings: world.client().settings().unwrap().clone(),
             oracle_settings: None,
             goal: None,
+            turn_outcome: None,
             credential_warning: None,
         };
         let _ = world.directory.apply(frame);
@@ -29310,6 +29533,7 @@ mod tests {
             },
             oracle_settings: None,
             goal: None,
+            turn_outcome: None,
             credential_warning: credential_warning.map(str::to_string),
         })
         .expect("a state frame")

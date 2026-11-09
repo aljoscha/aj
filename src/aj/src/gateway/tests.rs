@@ -7124,6 +7124,7 @@ fn state_frame(session: &str, epoch: &str) -> String {
         settings: fake_settings(),
         oracle_settings: None,
         goal: None,
+        turn_outcome: None,
         credential_warning: None,
     })
     .expect("a state frame")

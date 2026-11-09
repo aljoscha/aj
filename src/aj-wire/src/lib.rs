@@ -1513,6 +1513,16 @@ struct EventTag {
     event_type: String,
 }
 
+/// How Main's latest driven turn ended. This is runtime state, not log history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+    Waiting,
+}
+
 /// One item on the unified event stream.
 #[derive(Clone, Debug)]
 pub enum Frame {
@@ -1531,6 +1541,9 @@ pub enum Frame {
         /// its block, so it is reliable rather than lossy.
         opens_block: bool,
         working: bool,
+        /// Main's latest driven turn result. Null while working or unknown.
+        /// Attach outcomes describe current state, not fresh completion.
+        turn_outcome: Option<TurnOutcome>,
         settings: AgentSettings,
         /// Oracle settings staged for the next main turn. Absent when unresolved
         /// or when the host has no Oracle support.
@@ -1717,6 +1730,8 @@ enum FrameRef<'a> {
         #[serde(skip_serializing_if = "unset")]
         opens_block: bool,
         working: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_outcome: Option<TurnOutcome>,
         settings: &'a AgentSettings,
         #[serde(skip_serializing_if = "Option::is_none")]
         oracle_settings: Option<&'a AgentSettings>,
@@ -1770,6 +1785,7 @@ impl Serialize for Frame {
                 epoch,
                 opens_block,
                 working,
+                turn_outcome,
                 settings,
                 oracle_settings,
                 goal,
@@ -1779,6 +1795,7 @@ impl Serialize for Frame {
                 epoch,
                 opens_block: *opens_block,
                 working: *working,
+                turn_outcome: *turn_outcome,
                 settings,
                 oracle_settings: oracle_settings.as_ref(),
                 goal: goal.as_ref(),
@@ -1879,6 +1896,7 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     opens_block,
                     working,
+                    turn_outcome,
                     settings,
                     oracle_settings,
                     goal,
@@ -1889,6 +1907,7 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     opens_block,
                     working,
+                    turn_outcome,
                     settings,
                     oracle_settings,
                     goal,
@@ -1959,6 +1978,8 @@ struct StateFrameFields {
     #[serde(default)]
     opens_block: bool,
     working: bool,
+    #[serde(default)]
+    turn_outcome: Option<TurnOutcome>,
     settings: AgentSettings,
     #[serde(default)]
     oracle_settings: Option<AgentSettings>,
