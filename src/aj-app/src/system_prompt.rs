@@ -6,7 +6,7 @@
 //! context files, discovered skills, environment summary) and turns
 //! it into that string here, once, before seeding the agent.
 
-use aj_conf::AgentEnv;
+use aj_conf::{AgentEnv, ContextFileKind};
 
 // The default system prompt is embedded at compile time so the binaries
 // ship as self-contained executables. The file lives next to this
@@ -26,13 +26,32 @@ pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
 pub fn assemble_system_prompt(env: &AgentEnv, include_skills: bool) -> String {
     let mut text = env.system_prompt.content.clone();
 
-    // Each context file is wrapped in an `<agents-md>` block so the
-    // model can tell where instructions start and end, with the
-    // kind-specific prefix text introducing it.
+    if !env.context_files.is_empty() {
+        text.push_str(
+            "\n\n## User and project guidance\n\n\
+             Follow the applicable guidance below. Global guidance applies across projects. \
+             Project guidance applies to its directory and descendants. \
+             For conflicts, explicit user requests take precedence over this guidance, \
+             project guidance over global guidance, and more specific directory guidance \
+             over parent-directory guidance. This guidance overrides default behavior \
+             within its scope.",
+        );
+    }
+
     for file in &env.context_files {
+        let scope = match file.kind {
+            ContextFileKind::UserInstructions => "all projects".to_string(),
+            ContextFileKind::ProjectInstructions => format!(
+                "{} and descendants",
+                file.path
+                    .parent()
+                    .expect("context file has a directory")
+                    .display()
+            ),
+        };
         text.push_str(&format!(
-            "\n\n{}\n<agents-md>\n{}\n</agents-md>",
-            file.kind.prompt_prefix(),
+            "\n\nContents of {} (scope: {scope}):\n<agents-md>\n{}\n</agents-md>",
+            file.path.display(),
             file.content
         ));
     }
@@ -55,7 +74,7 @@ pub fn assemble_system_prompt(env: &AgentEnv, include_skills: bool) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use aj_conf::{AgentEnv, SystemPrompt, SystemPromptSource};
+    use aj_conf::{AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource};
 
     use super::assemble_system_prompt;
 
@@ -73,6 +92,56 @@ mod tests {
             skills,
             skill_diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn guidance_includes_sources_scopes_and_precedence() {
+        let mut env = env_with_skills(Vec::new());
+        env.context_files = vec![
+            ContextFile {
+                path: "/home/user/.agents/AGENTS.md".into(),
+                kind: ContextFileKind::UserInstructions,
+                content: "Global rule".into(),
+            },
+            ContextFile {
+                path: "/repo/AGENTS.md".into(),
+                kind: ContextFileKind::ProjectInstructions,
+                content: "Project rule".into(),
+            },
+            ContextFile {
+                path: "/repo/src/CLAUDE.md".into(),
+                kind: ContextFileKind::ProjectInstructions,
+                content: "Nested rule".into(),
+            },
+        ];
+
+        let prompt = assemble_system_prompt(&env, false);
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("explicit user requests take precedence"));
+        assert!(prompt.contains("project guidance over global guidance"));
+        assert!(prompt.contains("more specific directory guidance over parent-directory guidance"));
+        for (path, scope, rule) in [
+            (
+                "/home/user/.agents/AGENTS.md",
+                "all projects",
+                "Global rule",
+            ),
+            ("/repo/AGENTS.md", "/repo and descendants", "Project rule"),
+            (
+                "/repo/src/CLAUDE.md",
+                "/repo/src and descendants",
+                "Nested rule",
+            ),
+        ] {
+            assert!(prompt.contains(&format!(
+                "Contents of {path} (scope: {scope}):\n<agents-md>\n{rule}\n</agents-md>"
+            )));
+        }
+        assert!(prompt.find("Global rule") < prompt.find("Project rule"));
+        assert!(prompt.find("Project rule") < prompt.find("Nested rule"));
+
+        env.context_files.clear();
+        assert!(!assemble_system_prompt(&env, false).contains("## User and project guidance"));
     }
 
     #[test]

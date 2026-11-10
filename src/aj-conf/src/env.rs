@@ -10,23 +10,6 @@ use std::path::{Path, PathBuf};
 use crate::paths::{find_git_root, home_dir, project_dirs_upward};
 use crate::skills::{self, Skill, SkillDiagnostic};
 
-/// Prefix for project-level AGENTS.md instructions injected into the system
-/// prompt.
-pub const AGENTS_MD_PREFIX: &str = r#"
-Here are instructions about the code base from the user. It's the contents
-of an AGENTS.md file. These instructions override default behavior and you
-must follow them exactly as written:
-"#;
-
-/// Prefix for user-level (global) instructions injected into the system
-/// prompt.
-pub const USER_AGENTS_MD_PREFIX: &str = r#"
-Here are global instructions from the user that apply across all projects.
-They are loaded from the user's home directory (e.g. ~/.agents/AGENTS.md
-or ~/.claude/CLAUDE.md). These instructions override default behavior and
-you must follow them exactly as written:
-"#;
-
 /// A file that contributes to the agent's context (system prompt). Covers
 /// user-level and project-level `AGENTS.md` / `CLAUDE.md`; the whole file
 /// content is stitched into the prompt (unlike skills, which are listed by
@@ -42,9 +25,8 @@ pub struct ContextFile {
     pub content: String,
 }
 
-/// Kind of a [ContextFile]. Determines the prefix text used when injecting the
-/// content into the system prompt and the human-readable label shown in the
-/// UI.
+/// Kind of a [ContextFile]. Determines its scope in the system prompt and
+/// the human-readable label shown in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextFileKind {
     /// Global, user-level instructions from `~/.agents/AGENTS.md` or
@@ -56,15 +38,6 @@ pub enum ContextFileKind {
 }
 
 impl ContextFileKind {
-    /// Returns the prefix text injected into the system prompt before the
-    /// file's content.
-    pub fn prompt_prefix(&self) -> &'static str {
-        match self {
-            ContextFileKind::UserInstructions => USER_AGENTS_MD_PREFIX,
-            ContextFileKind::ProjectInstructions => AGENTS_MD_PREFIX,
-        }
-    }
-
     /// Short human-readable label, used when displaying the context to the
     /// user.
     pub fn label(&self) -> &'static str {
@@ -361,23 +334,6 @@ mod tests {
         assert!(display_output.contains("Git root directory: None"));
         assert!(display_output.contains("Operating system:"));
         assert!(display_output.contains("Today's date: 2026-01-02"));
-    }
-
-    #[test]
-    fn test_context_file_kind_prompt_prefix() {
-        // Each kind has a non-empty prefix; smoke-test that the user-level
-        // prefix is distinct from the project-level one so the model sees
-        // them framed differently.
-        assert!(!ContextFileKind::UserInstructions.prompt_prefix().is_empty());
-        assert!(
-            !ContextFileKind::ProjectInstructions
-                .prompt_prefix()
-                .is_empty()
-        );
-        assert_ne!(
-            ContextFileKind::UserInstructions.prompt_prefix(),
-            ContextFileKind::ProjectInstructions.prompt_prefix()
-        );
     }
 
     #[test]

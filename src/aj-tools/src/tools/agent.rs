@@ -45,24 +45,12 @@ agent and oracle, but not your conversation history. It shares your working
 directory and can edit files and run commands. The user can steer it from its
 view, but this tool does not provide a way for you to message it mid-task.
 
-Use this tool for:
-- A multi-step investigation whose intermediate output would crowd your context.
-- Independently specifiable work that can run alongside your own work, with
-  clear ownership and success criteria.
-- A large, bounded work unit whose result you can assess from a diff or concrete
-  evidence, or a task the user explicitly asks you to delegate.
-
 Do not use it for a known file read, an exact text search, a localized edit, or
-routine reassurance about your own work. Use direct tools for those. Do not
-hand off an entire coherent implementation merely because it is complex, or
-delegate before you understand what outcome to request.
+routine reassurance about your own work. Use direct tools for those.
 
-Give the worker a self-contained brief: goal, scope, relevant files and evidence,
-constraints, and verification. Say whether it is researching, coding, or
-verifying. Ask for compact but complete results: the outcome, required evidence,
-files changed or inspected, checks run, and blockers. If you need exact quotes,
-numbers, paths, or URLs, request them explicitly. Inspect the report and any
-changes before relying on them.
+Say whether the task is researching, coding, or verifying. Request files changed
+or inspected, checks run, and blockers, plus any exact quotes, numbers, paths,
+or URLs you need.
 
 Set run_in_background: true to keep working while the sub-agent runs: the call
 returns immediately with a task id, and the sub-agent's report is delivered to
@@ -74,9 +62,7 @@ sleeping only delays the report by the length of the sleep.
 Parallel agents share your filesystem. When you launch several agents at once
 (several agent calls in one message, or multiple background agents), they run
 concurrently against the same working directory, with no isolation or locking
-between them. Only run agents in parallel when their tasks are independent.
-Keep edits to any given file within a single agent, or run those tasks one at
-a time.
+between them.
 "#;
 
 #[derive(Debug, Clone)]

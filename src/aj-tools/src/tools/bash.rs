@@ -99,8 +99,8 @@ const DESCRIPTION: &str = r#"
 Execute a command in the system shell (bash). The command will be run in the
 working directory of the agent session.
 
-- There are no permissions checks or sandboxing. You are free to run any command
-  you consider reasonable and safe.
+- This tool enforces no permission checks or sandboxing. Obtain any approval
+  required for the command's effects before running it.
 - Commands have a configurable timeout to prevent hanging (default: 30s). It
   bounds the command itself: a process the command leaves behind still holding
   its stdout or stderr gets a couple of seconds to let go, after which its
