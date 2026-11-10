@@ -28982,6 +28982,23 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "background-agent-slow").await;
         let session = remote.host.create().await.expect("create session");
+        // This observer gates the fixture only. The measured UI attaches later,
+        // so it cannot learn the subagent's activity from its live start event.
+        let mut observer = remote
+            .host
+            .attach(&[aj_app::host::AttachRequest {
+                session: session.clone(),
+                cursor: None,
+            }])
+            .await
+            .expect("observer");
+        crate::remote::tests::bounded("observer attachment", async {
+            while !matches!(
+                observer.recv().await.expect("observer stays open"),
+                aj_wire::Frame::List { .. }
+            ) {}
+        })
+        .await;
         remote
             .host
             .command(
@@ -28994,40 +29011,35 @@ mod tests {
             .await
             .expect("prompt accepted");
 
-        // Gate: the shape under test is an IDLE session with a RUNNING
-        // background sub. Idle proves the parent turn, and with it the
-        // sub's live AgentStart, predates the attach below, so a green
-        // footer cannot have learned the sub from a live frame. The running
-        // agent task proves the sub has not finished yet.
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        loop {
-            let list = remote.host.sessions().await.expect("session list");
-            let idle = list
-                .sessions
-                .iter()
-                .any(|row| row.id == session && !row.working);
-            let tasks = remote
-                .host
-                .local_handles(&session)
-                .await
-                .expect("live session")
-                .task_registry
-                .snapshot();
-            let sub_running = tasks.iter().any(|task| {
+        // Directory activity includes the background sub. Observe Main's
+        // terminal state instead, then independently require the sub to be live.
+        crate::remote::tests::bounded("parent turn to finish", async {
+            while !matches!(
+                observer.recv().await.expect("observer stays open"),
+                aj_wire::Frame::State {
+                    opens_block: false,
+                    working: false,
+                    turn_outcome: Some(_),
+                    ..
+                }
+            ) {}
+        })
+        .await;
+        let tasks = remote
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session")
+            .task_registry
+            .snapshot();
+        assert!(
+            tasks.iter().any(|task| {
                 matches!(task.kind, aj_agent::tool::TaskKind::Agent { .. })
                     && task.status == aj_agent::tool::TaskStatus::Running
-            });
-            if idle && sub_running {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the host never reached idle-with-a-running-sub \
-                 (idle {idle}, sub running {sub_running}), \
-                 this test would otherwise measure nothing",
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+            }),
+            "the sub must still be running when the measured client attaches"
+        );
+        drop(observer);
 
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         assert_eq!(

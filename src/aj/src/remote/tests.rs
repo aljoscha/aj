@@ -1568,7 +1568,7 @@ impl Attached {
     ///
     /// The exit condition is the contract rather than a beat. One `sessions()`
     /// read gives a coherent pair (see [`Transport::row`]), and the client has
-    /// caught up when that row says the main agent is idle and everything the
+    /// caught up when that row says the session is idle and everything the
     /// host published on the way there has been delivered here (see
     /// [`Self::delivered`]). Both halves are needed: the flag says the host
     /// stopped working, the position says this client heard about it.
@@ -1590,6 +1590,20 @@ impl Attached {
     /// evicted or dropped client would otherwise read as a converged one and
     /// poison every assertion after it.
     async fn settle(&mut self) {
+        self.settle_when(|row| !row.working).await;
+    }
+
+    /// Catch up while a quiet background task keeps the directory busy.
+    /// The caller must first observe the main turn's live terminal state after
+    /// a completed attachment, or attach after that turn ended. No new main
+    /// turn may start during this wait. Unlike `settle`, this cannot tolerate a
+    /// main state dropped during attachment.
+    async fn settle_main_idle(&mut self) {
+        assert!(!self.client.working(), "the main turn has ended");
+        self.settle_when(|_| true).await;
+    }
+
+    async fn settle_when(&mut self, idle: impl Fn(&SessionSummary) -> bool) {
         let session = self.client.session().to_string();
         // What the deadline should say if it fires, rewritten on every read so
         // the panic names the half that never arrived rather than the wait.
@@ -1601,10 +1615,10 @@ impl Attached {
                 // the host published is outstanding by definition.
                 let target = row.last_seq.unwrap_or(0);
                 let here = self.delivered.unwrap_or(0);
-                if !row.working && here >= target {
+                if idle(&row) && here >= target {
                     return;
                 }
-                waiting_for = match row.working {
+                waiting_for = match !idle(&row) {
                     true => format!("the turn to end, delivered {here} of {target}"),
                     false => format!("the rest of the turn, delivered {here} of {target}"),
                 };
@@ -2349,8 +2363,10 @@ async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
     let fixture = Fixture::new(background_task_turn()).await;
     let session = fixture.create().await;
     let mut remote = fixture.remote(&session).await;
+    remote.finish_idle_attach().await;
     fixture.prompt(&session, "background something").await;
-    remote.settle().await;
+    finish_status_turn(&mut remote).await;
+    remote.settle_main_idle().await;
 
     let task = remote
         .chat
@@ -5095,8 +5111,10 @@ async fn a_joiner_takes_the_task_table_from_caught_up() {
     let fixture = Fixture::new(background_task_turn()).await;
     let session = fixture.create().await;
     let mut oracle = fixture.oracle(&session).await;
+    oracle.finish_idle_attach().await;
     fixture.prompt(&session, "background something").await;
-    oracle.settle().await;
+    finish_status_turn(&mut oracle).await;
+    oracle.settle_main_idle().await;
     assert_eq!(
         oracle.canonical().tasks.len(),
         1,
@@ -5104,7 +5122,7 @@ async fn a_joiner_takes_the_task_table_from_caught_up() {
     );
 
     let mut joiner = fixture.remote(&session).await;
-    joiner.settle().await;
+    joiner.settle_main_idle().await;
 
     assert_eq!(
         joiner.chat.tasks().len(),
@@ -5688,8 +5706,10 @@ async fn a_task_that_ended_while_away_reads_as_ended_from_caught_up() {
     let fixture = Fixture::new(script).await;
     let session = fixture.create().await;
     let mut remote = fixture.remote(&session).await;
+    remote.finish_idle_attach().await;
     fixture.prompt(&session, "background something").await;
-    remote.settle().await;
+    finish_status_turn(&mut remote).await;
+    remote.settle_main_idle().await;
     let task = remote
         .chat
         .tasks()
