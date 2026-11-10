@@ -18479,15 +18479,29 @@ mod tests {
         ThemeWatch::install("dark")
     }
 
+    /// Pick a reasoning model from the bundled catalog, give its provider a
+    /// runtime credential so the host offers it, and select it through the
+    /// settings owner. The host filters model choices by configured
+    /// credentials, so the fixture must not depend on ambient provider keys.
     async fn select_host_thinking_model(world: &mut World, shell: &Rc<RefCell<Shell>>) {
-        let models = world.control.config(world.session()).await.unwrap().models;
-        let info = models
-            .into_iter()
+        let wanted = world
+            .catalog
+            .iter()
             .find(|info| {
                 aj_models::registry::supported_thinking_levels(info)
                     .contains(&aj_models::types::ThinkingLevel::High)
             })
-            .expect("host catalog offers a reasoning model");
+            .expect("bundled catalog offers a reasoning model")
+            .clone();
+        world
+            .auth
+            .set_runtime_api_key(&wanted.provider, "test-key".into())
+            .await;
+        let models = world.control.config(world.session()).await.unwrap().models;
+        let info = models
+            .into_iter()
+            .find(|info| info.provider == wanted.provider && info.id == wanted.id)
+            .expect("host offers the reasoning model once its provider has a credential");
         let owner = SettingsOwner::capture(world, shell, Arc::clone(&world.catalog));
         assert!(
             confirm_setting(
