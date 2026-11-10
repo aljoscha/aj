@@ -1,6 +1,6 @@
 {
   "schema_version": 6,
-  "updated_at": 1791194837027,
+  "updated_at": 1794306866772,
   "source": "models.dev",
   "models": [
     {
@@ -72,6 +72,54 @@
       "max_tokens": 128000
     },
     {
+      "id": "claude-fable-5-2",
+      "name": "Claude Fable 5.2",
+      "family": "claude-fable",
+      "api": "anthropic-messages",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "fast",
+          "cost": {
+            "input": 16.0,
+            "output": 80.0,
+            "cache_read": 0.4,
+            "cache_write": 20.0
+          }
+        }
+      ],
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 8.0,
+        "output": 40.0,
+        "cache_read": 0.2,
+        "cache_write": 10.0
+      },
+      "context_window": 1000000,
+      "max_tokens": 128000
+    },
+    {
       "id": "claude-haiku-4-5",
       "name": "Claude Haiku 4.5 (latest)",
       "family": "claude-haiku",
@@ -126,6 +174,52 @@
       },
       "context_window": 200000,
       "max_tokens": 64000
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "name": "Claude Haiku 5.5",
+      "family": "claude-haiku",
+      "api": "anthropic-messages",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 0.1,
+        "output": 0.5,
+        "cache_read": 0.01,
+        "cache_write": 0.125,
+        "tiers": [
+          {
+            "input_tokens_above": 100000,
+            "input": 0.5,
+            "output": 2.5,
+            "cache_read": 0.05,
+            "cache_write": 0.625
+          }
+        ]
+      },
+      "context_window": 1000000,
+      "max_tokens": 128000
     },
     {
       "id": "claude-opus-4-5",
@@ -439,7 +533,7 @@
         "cache_read": 0.3,
         "cache_write": 3.75
       },
-      "context_window": 1000000,
+      "context_window": 200000,
       "max_tokens": 64000
     },
     {
@@ -467,7 +561,7 @@
         "cache_read": 0.3,
         "cache_write": 3.75
       },
-      "context_window": 1000000,
+      "context_window": 200000,
       "max_tokens": 64000
     },
     {
@@ -572,7 +666,7 @@
       "cost": {
         "input": 2.0,
         "output": 10.0,
-        "cache_read": 0.2,
+        "cache_read": 0.1,
         "cache_write": 2.5
       },
       "context_window": 1000000,
@@ -630,6 +724,20 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 3.5,
+            "output": 14.0,
+            "cache_read": 0.875,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -652,6 +760,20 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 0.7,
+            "output": 2.8,
+            "cache_read": 0.175,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -674,6 +796,20 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 0.2,
+            "output": 0.8,
+            "cache_read": 0.05,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -696,6 +832,20 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 4.25,
+            "output": 17.0,
+            "cache_read": 2.125,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -718,6 +868,20 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 8.75,
+            "output": 26.25,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -784,6 +948,20 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 0.25,
+            "output": 1.0,
+            "cache_read": 0.125,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -817,6 +995,32 @@
         }
       ],
       "supports_verbosity": true,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 2.5,
+            "output": 20.0,
+            "cache_read": 0.25,
+            "cache_write": 0.0
+          }
+        },
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.625,
+            "output": 5.0,
+            "cache_read": 0.0625,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -850,6 +1054,32 @@
         }
       ],
       "supports_verbosity": true,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 0.45,
+            "output": 3.6,
+            "cache_read": 0.045,
+            "cache_write": 0.0
+          }
+        },
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.125,
+            "output": 1.0,
+            "cache_read": 0.0125,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -883,6 +1113,20 @@
         }
       ],
       "supports_verbosity": true,
+      "speed_modes": [
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.025,
+            "output": 0.2,
+            "cache_read": 0.0025,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -946,6 +1190,32 @@
         }
       ],
       "supports_verbosity": true,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 2.5,
+            "output": 20.0,
+            "cache_read": 0.25,
+            "cache_write": 0.0
+          }
+        },
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.625,
+            "output": 5.0,
+            "cache_read": 0.0625,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -980,6 +1250,32 @@
         }
       ],
       "supports_verbosity": true,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 3.5,
+            "output": 28.0,
+            "cache_read": 0.35,
+            "cache_write": 0.0
+          }
+        },
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.875,
+            "output": 7.0,
+            "cache_read": 0.0875,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -992,36 +1288,6 @@
       },
       "context_window": 400000,
       "max_tokens": 128000
-    },
-    {
-      "id": "gpt-5.2-chat-latest",
-      "name": "GPT-5.2 Chat",
-      "family": "gpt-codex",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "medium"
-          ]
-        }
-      ],
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 1.75,
-        "output": 14.0,
-        "cache_read": 0.175,
-        "cache_write": 0.0
-      },
-      "context_window": 128000,
-      "max_tokens": 16384
     },
     {
       "id": "gpt-5.2-pro",
@@ -1056,28 +1322,6 @@
       "max_tokens": 128000
     },
     {
-      "id": "gpt-5.3-chat-latest",
-      "name": "GPT-5.3 Chat (latest)",
-      "family": "gpt",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": false,
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 1.75,
-        "output": 14.0,
-        "cache_read": 0.175,
-        "cache_write": 0.0
-      },
-      "context_window": 128000,
-      "max_tokens": 16384
-    },
-    {
       "id": "gpt-5.3-codex",
       "name": "GPT-5.3 Codex",
       "family": "gpt-codex",
@@ -1098,6 +1342,20 @@
         }
       ],
       "supports_verbosity": true,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 3.5,
+            "output": 28.0,
+            "cache_read": 0.35,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -1235,6 +1493,18 @@
             "cache_read": 0.15,
             "cache_write": 0.0
           }
+        },
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.375,
+            "output": 2.25,
+            "cache_read": 0.0375,
+            "cache_write": 0.0
+          }
         }
       ],
       "input": [
@@ -1271,6 +1541,20 @@
         }
       ],
       "supports_verbosity": true,
+      "speed_modes": [
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.1,
+            "output": 0.625,
+            "cache_read": 0.01,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -1935,7 +2219,7 @@
           ]
         }
       ],
-      "supports_verbosity": false,
+      "supports_verbosity": true,
       "speed_modes": [
         {
           "speed": "fast",
@@ -1985,17 +2269,17 @@
           "description": "Premium low-latency processing. Account eligibility applies.",
           "wire_value": "ultrafast",
           "cost": {
-            "input": 12,
-            "output": 60,
+            "input": 12.0,
+            "output": 60.0,
             "cache_read": 0.6,
-            "cache_write": 15,
+            "cache_write": 15.0,
             "tiers": [
               {
                 "input_tokens_above": 272000,
-                "input": 24,
-                "output": 90,
+                "input": 24.0,
+                "output": 90.0,
                 "cache_read": 1.2,
-                "cache_write": 30
+                "cache_write": 30.0
               }
             ]
           }
@@ -2017,6 +2301,64 @@
             "output": 15.0,
             "cache_read": 0.2,
             "cache_write": 5.0
+          }
+        ]
+      },
+      "context_window": 1050000,
+      "max_tokens": 128000
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "name": "GPT-6.1 Terra",
+      "family": "gpt-terra",
+      "api": "openai-responses",
+      "provider": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 2.0,
+            "output": 10.0,
+            "cache_read": 0.1,
+            "cache_write": 2.5
+          }
+        }
+      ],
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.05,
+        "cache_write": 1.25,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 2.0,
+            "output": 7.5,
+            "cache_read": 0.1,
+            "cache_write": 2.5
           }
         ]
       },
@@ -2219,6 +2561,32 @@
         }
       ],
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 3.5,
+            "output": 14.0,
+            "cache_read": 0.875,
+            "cache_write": 0.0
+          }
+        },
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 1.0,
+            "output": 4.0,
+            "cache_read": 0.25,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -2314,6 +2682,32 @@
         }
       ],
       "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "priority",
+          "cost": {
+            "input": 2.0,
+            "output": 8.0,
+            "cache_read": 0.5,
+            "cache_write": 0.0
+          }
+        },
+        {
+          "speed": "flex",
+          "name": "flex",
+          "description": "",
+          "wire_value": "flex",
+          "cost": {
+            "input": 0.55,
+            "output": 2.2,
+            "cache_read": 0.1375,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
