@@ -76,7 +76,12 @@ override the effective config. Skills are discovered from user and project
 
 Normally run only fast tests (`./scripts/check-test-scratch.sh`), reserving slow tests for relevant changes or CI.
 
-The current CI gate for review-ready work is:
+While iterating and before each commit, run the formatter, clippy, and the
+fast tests for the crates you touched (`./scripts/check-test-scratch.sh -p ...`).
+Add slow tests only where the change is relevant to them.
+
+Run the full CI gate once, when a body of work is ready to hand over or push,
+not per commit:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
@@ -90,9 +95,10 @@ Scale targeted checks while iterating, but verify the final range against the
 guarantees it claims. Important behavior is exercised through the real composed
 seam, not only through a helper that constructs one component. Assertions
 observe the boundary where harm lands, and fixtures assert the preconditions
-that make their measurement meaningful. When practical, break a claimed
-guarantee and confirm that the relevant check notices. A surviving break is a
-finding about the test or design, not a formality.
+that make their measurement meaningful. For a guarantee whose failure would be
+costly, such as durability, ordering, or recovery, break it once and confirm
+that the relevant check notices. A surviving break is a finding about the test
+or design. Do not repeat this for every commit or every fix.
 
 Scratch ownership must match task lifetime. Lexical test state uses an owning
 guard. Work that may outlive a test uses a process-lifetime root with per-test
