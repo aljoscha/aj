@@ -26,7 +26,7 @@ fn main() {
         aj_models::refresh::build_seed_from_models_dev(&body).expect("build seed catalog");
     if let Some(codex_path) = args.next() {
         let body = std::fs::read_to_string(codex_path).expect("read pinned Codex payload");
-        let mut seed = aj_models::registry::CodexSeedFile {
+        let mut seed = aj_models::registry::CuratedSeedFile {
             models: aj_models::registry::bundled_codex_seed(),
         };
         aj_models::refresh::update_codex_speed_metadata(&mut seed.models, &body, &catalog.models)

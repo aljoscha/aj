@@ -941,6 +941,18 @@ tier. `gpt-5.2` is flat-rate with no tier. This assumes the Codex backend
 enforces the declared `context_window`; `calculate_cost` does not itself
 clamp usage to the window.
 
+**Anthropic models missing from models.dev are seeded by hand.** The
+restricted Claude Mythos line (`claude-mythos-5-1`, `claude-mythos-5-2`)
+is served by the Anthropic API to entitled accounts but is not indexed by
+models.dev under `anthropic`. `src/aj-models/data/anthropic.json` carries
+these entries, with limits from `GET /v1/models/{id}` and pricing from
+Anthropic's public pricing page. Refresh and load splice the file the
+same way as the Codex seed, except that upstream wins: an entry that
+models.dev starts to index is dropped from the file, and a test fails
+while both copies exist. Mythos models are also version-gated on the
+Claude Code client version sent in OAuth mode (§6), so the stealth
+version must meet the minimum the API reports for them.
+
 ---
 
 ### 3.5 Speed Modes

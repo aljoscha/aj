@@ -40,7 +40,7 @@ pub(crate) const CLAUDE_CODE_IDENTITY_PROMPT: &str =
 /// OAuth mode, since API-key requests don't send this header. Bump it if
 /// OAuth turns start failing authorization or the server reports that
 /// this version does not support a model.
-pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.280";
+pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.300";
 
 /// Canonical tool names from Claude Code 2.x.
 ///

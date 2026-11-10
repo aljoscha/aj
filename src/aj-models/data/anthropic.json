@@ -1,0 +1,86 @@
+{
+  "models": [
+    {
+      "id": "claude-mythos-5-1",
+      "name": "Claude Mythos 5.1",
+      "family": "claude-mythos",
+      "api": "anthropic-messages",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 0.25,
+        "cache_write": 12.5
+      },
+      "context_window": 1000000,
+      "max_tokens": 128000
+    },
+    {
+      "id": "claude-mythos-5-2",
+      "name": "Claude Mythos 5.2",
+      "family": "claude-mythos",
+      "api": "anthropic-messages",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "fast",
+          "description": "",
+          "wire_value": "fast",
+          "cost": {
+            "input": 16.0,
+            "output": 80.0,
+            "cache_read": 0.4,
+            "cache_write": 20.0
+          }
+        }
+      ],
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 8.0,
+        "output": 40.0,
+        "cache_read": 0.2,
+        "cache_write": 10.0
+      },
+      "context_window": 1000000,
+      "max_tokens": 128000
+    }
+  ]
+}

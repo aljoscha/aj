@@ -17,8 +17,8 @@ use serde::Deserialize;
 
 use crate::registry::{
     CATALOG_SCHEMA_VERSION, CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelCostTier,
-    ModelInfo, ReasoningOption, SpeedMode, apply_override, bundled_codex_seed, bundled_overrides,
-    splice_codex_seed, user_cache_path,
+    ModelInfo, ReasoningOption, SpeedMode, apply_override, bundled_anthropic_seed,
+    bundled_codex_seed, bundled_overrides, splice_seed, user_cache_path,
 };
 use crate::types::{Speed, ThinkingLevel};
 
@@ -577,15 +577,16 @@ fn parse_openrouter(
     Ok(models)
 }
 
-/// Splice the hand-curated Codex seed, then finalize. Shared tail of
+/// Splice the hand-curated seeds, then finalize. Shared tail of
 /// catalog construction across the live sources.
 fn assemble_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
-    // re-emit Codex models from the hand-curated seed after
-    // upstream filtering. Refresh writes the codex entries into the
-    // user cache so subsequent refreshes diff cleanly (without the
-    // codex set showing up as "removed" every run because models.dev
-    // doesn't include them).
-    splice_codex_seed(&mut models, bundled_codex_seed());
+    // re-emit curated models after upstream filtering. Refresh writes
+    // them into the user cache so subsequent refreshes diff cleanly
+    // (without the curated set showing up as "removed" every run
+    // because models.dev doesn't include them). Upstream entries are
+    // already in `models`, so they win over the Anthropic supplement.
+    splice_seed(&mut models, bundled_codex_seed());
+    splice_seed(&mut models, bundled_anthropic_seed());
     finalize_catalog(models, source)
 }
 
@@ -1234,7 +1235,7 @@ mod tests {
         let anthropic = catalog
             .models
             .iter()
-            .find(|m| m.provider == "anthropic")
+            .find(|m| m.provider == "anthropic" && m.speed_mode(&Speed::Ultrafast).is_some())
             .unwrap();
         assert_eq!(
             anthropic.speed_mode(&Speed::Ultrafast).unwrap().wire_value,
@@ -1332,22 +1333,27 @@ mod tests {
     fn build_catalog_filters_and_maps() {
         let cat = build_catalog_from_json(FIXTURE, None).expect("parses");
         // Two upstream models survive filtering plus the bundled
-        // Codex seed appended at the end. google must be ignored (not
-        // a target provider) and the non-tool anthropic model must be
-        // filtered out.
-        let codex_count = bundled_codex_seed().len();
-        assert!(codex_count > 0, "codex seed must be non-empty");
-        assert_eq!(cat.models.len(), 2 + codex_count);
+        // curated seeds. google must be ignored (not a target
+        // provider) and the non-tool anthropic model must be filtered
+        // out.
+        let curated_count = bundled_codex_seed().len() + bundled_anthropic_seed().len();
+        assert!(curated_count > 0, "curated seeds must be non-empty");
+        assert_eq!(cat.models.len(), 2 + curated_count);
         assert_eq!(cat.source, "models.dev");
         assert!(cat.updated_at > 0);
 
         // The whole catalog is sorted by (provider, id). The codex
         // seed lands last here because `openai-codex` orders after
         // `anthropic`/`openai` in this fixture.
+        let curated: Vec<_> = bundled_codex_seed()
+            .into_iter()
+            .chain(bundled_anthropic_seed())
+            .map(|m| (m.provider, m.id))
+            .collect();
         let upstream_identities: Vec<_> = cat
             .models
             .iter()
-            .filter(|m| m.provider != "openai-codex")
+            .filter(|m| !curated.contains(&(m.provider.clone(), m.id.clone())))
             .map(|m| (m.provider.as_str(), m.id.as_str()))
             .collect();
         assert_eq!(
@@ -1452,8 +1458,11 @@ mod tests {
             }
         }"#;
         let cat = build_catalog_from_json(body, None).expect("parses");
-        // One upstream model + the bundled codex seed.
-        assert_eq!(cat.models.len(), 1 + bundled_codex_seed().len());
+        // One upstream model + the bundled curated seeds.
+        assert_eq!(
+            cat.models.len(),
+            1 + bundled_codex_seed().len() + bundled_anthropic_seed().len()
+        );
         let m = cat
             .models
             .iter()
@@ -1476,8 +1485,8 @@ mod tests {
 
         // First write: everything is "added".
         let cat1 = build_catalog_from_json(FIXTURE, None).expect("parses");
-        let codex_count = bundled_codex_seed().len();
-        let expected_total = 2 + codex_count;
+        let curated_count = bundled_codex_seed().len() + bundled_anthropic_seed().len();
+        let expected_total = 2 + curated_count;
         assert_eq!(cat1.models.len(), expected_total);
         write_catalog_atomically(&dest, &cat1).expect("writes");
         let summary = build_summary(&dest, &cat1);
@@ -1519,7 +1528,7 @@ mod tests {
         assert_eq!(summary3.added, vec!["anthropic/claude-new"]);
 
         let mut mode_price_change = cat1.clone();
-        let model = &mut mode_price_change.models[0];
+        let model = &mut mode_price_change.models[claude_idx];
         model.speed_modes.push(SpeedMode {
             speed: Speed::Fast,
             name: "Fast".into(),

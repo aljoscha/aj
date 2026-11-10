@@ -44,6 +44,15 @@ const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 /// follow matching models.dev API entries, not the CLI's compaction caps.
 const CODEX_SEED_JSON: &str = include_str!("../data/codex.json");
 
+/// Bundled Anthropic supplement. Some models the Anthropic API serves
+/// to our accounts (currently the restricted Mythos line) are not
+/// indexed by models.dev under `anthropic`, so they are curated here
+/// with pricing from Anthropic's public pricing page and limits from
+/// `GET /v1/models/{id}`. Unlike the Codex seed, the upstream catalog
+/// wins on conflict: once models.dev carries an entry, delete it here
+/// (`anthropic_seed_only_covers_models_dev_gaps` enforces this).
+const ANTHROPIC_SEED_JSON: &str = include_str!("../data/anthropic.json");
+
 /// Provider id used to key Codex catalog entries. Exposed so the
 /// refresh and load paths agree on the value used for filtering and
 /// splicing.
@@ -372,7 +381,8 @@ impl ModelRegistry {
         // in the catalog (e.g. a freshly-refreshed user cache that
         // included them) are not duplicated; the splice is purely
         // additive for `(provider, id)` keys that aren't there yet.
-        splice_codex_seed(&mut models, bundled_codex_seed());
+        splice_seed(&mut models, bundled_codex_seed());
+        splice_seed(&mut models, bundled_anthropic_seed());
         // Apply overrides in declared order. Each entry shallow-merges
         // its patch onto the first matching `(provider, id)`.
         for entry in &overrides.overrides {
@@ -729,26 +739,37 @@ pub fn bundled_overrides() -> OverridesFile {
     })
 }
 
-/// On-disk shape of the bundled Codex seed file. Lives in its own
-/// struct so the catalog and seed files don't share the
-/// `updated_at`/`source` framing — the Codex list has no upstream and
-/// no refresh timestamp.
+/// On-disk shape of a bundled curated seed file (`data/codex.json`,
+/// `data/anthropic.json`). Lives in its own struct so the catalog and
+/// seed files don't share the `updated_at`/`source` framing — curated
+/// lists have no upstream and no refresh timestamp.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct CodexSeedFile {
+pub struct CuratedSeedFile {
     pub models: Vec<ModelInfo>,
 }
 
-/// Parse the bundled OpenAI Codex seed (`data/codex.json`). Failure
-/// here is non-fatal: we log a warning and proceed with an empty list,
-/// so a malformed file at most hides Codex models without bricking the
-/// registry. Each entry must already carry
-/// `provider == CODEX_PROVIDER_ID`; non-Codex entries are dropped with
-/// a warning so the file can't accidentally inject other providers.
+/// Parse the bundled OpenAI Codex seed (`data/codex.json`). Every entry
+/// must carry `provider == CODEX_PROVIDER_ID`.
 pub fn bundled_codex_seed() -> Vec<ModelInfo> {
-    let parsed: CodexSeedFile = match serde_json::from_str(CODEX_SEED_JSON) {
+    parse_curated_seed(CODEX_SEED_JSON, "codex.json", CODEX_PROVIDER_ID)
+}
+
+/// Parse the bundled Anthropic supplement (`data/anthropic.json`).
+/// Every entry must carry `provider == "anthropic"`.
+pub fn bundled_anthropic_seed() -> Vec<ModelInfo> {
+    parse_curated_seed(ANTHROPIC_SEED_JSON, "anthropic.json", "anthropic")
+}
+
+/// Parse one curated seed file. Failure here is non-fatal: we log a
+/// warning and proceed with an empty list, so a malformed file at most
+/// hides its models without bricking the registry. Entries on any
+/// provider other than `provider` are dropped with a warning so a file
+/// can't accidentally inject other providers.
+fn parse_curated_seed(json: &str, label: &str, provider: &str) -> Vec<ModelInfo> {
+    let parsed: CuratedSeedFile = match serde_json::from_str(json) {
         Ok(file) => file,
         Err(err) => {
-            tracing::warn!("failed to parse bundled codex.json: {err}; ignoring");
+            tracing::warn!("failed to parse bundled {label}: {err}; ignoring");
             return Vec::new();
         }
     };
@@ -756,11 +777,11 @@ pub fn bundled_codex_seed() -> Vec<ModelInfo> {
         .models
         .into_iter()
         .filter(|m| {
-            if m.provider == CODEX_PROVIDER_ID {
+            if m.provider == provider {
                 true
             } else {
                 tracing::warn!(
-                    "codex.json entry {}/{} has unexpected provider; dropping",
+                    "{label} entry {}/{} has unexpected provider; dropping",
                     m.provider,
                     m.id
                 );
@@ -770,15 +791,15 @@ pub fn bundled_codex_seed() -> Vec<ModelInfo> {
         .collect()
 }
 
-/// Splice the Codex seed onto an existing model list, adding entries
+/// Splice a curated seed onto an existing model list, adding entries
 /// for `(provider, id)` keys not already present and leaving existing
 /// entries untouched. The catalog's prior contents win on conflict so
-/// a user cache that already carries refreshed Codex models doesn't
+/// a user cache that already carries refreshed seed models doesn't
 /// have its values silently rewritten by the in-process seed.
 ///
 /// Returns the number of entries appended; useful in diagnostics and
 /// tests.
-pub fn splice_codex_seed(models: &mut Vec<ModelInfo>, seed: Vec<ModelInfo>) -> usize {
+pub fn splice_seed(models: &mut Vec<ModelInfo>, seed: Vec<ModelInfo>) -> usize {
     if seed.is_empty() {
         return 0;
     }
@@ -1030,7 +1051,13 @@ mod tests {
             .iter()
             .map(|m| m.id.as_str())
             .collect();
-        assert_eq!(anthropic_ids, vec!["claude-x", "claude-y"]);
+        let curated_anthropic: Vec<_> =
+            bundled_anthropic_seed().into_iter().map(|m| m.id).collect();
+        let expected: Vec<_> = ["claude-x", "claude-y"]
+            .into_iter()
+            .chain(curated_anthropic.iter().map(String::as_str))
+            .collect();
+        assert_eq!(anthropic_ids, expected);
         assert!(reg.models("nope").is_empty());
 
         // The codex splice fed entries; the registry surfaces them
@@ -1562,11 +1589,13 @@ mod tests {
         // Every override target must reference a real seed entry
         // before we try to apply it. This catches typos at test time.
         let codex = bundled_codex_seed();
+        let anthropic = bundled_anthropic_seed();
         for entry in &overrides.overrides {
             assert!(
                 seed.models
                     .iter()
                     .chain(&codex)
+                    .chain(&anthropic)
                     .any(|m| m.provider == entry.target.provider && m.id == entry.target.id),
                 "override target {}/{} does not match any seed entry",
                 entry.target.provider,
@@ -1583,6 +1612,33 @@ mod tests {
             .get("openai", "gpt-6.1-sol")
             .expect("gpt-6.1-sol present in seed");
         assert!(sol.supports_verbosity);
+        let mythos = registry
+            .get("anthropic", "claude-mythos-5-2")
+            .expect("claude-mythos-5-2 spliced from anthropic.json");
+        assert_eq!(mythos.api, "anthropic-messages");
+        assert!(mythos.reasoning);
+    }
+
+    /// The Anthropic supplement exists only for models models.dev does
+    /// not index. Once upstream carries an entry, the models.dev seed
+    /// wins on splice and the curated copy is dead data that will drift
+    /// from upstream pricing. Fail so the entry gets deleted.
+    #[test]
+    fn anthropic_seed_only_covers_models_dev_gaps() {
+        let seed: Catalog = serde_json::from_str(SEED_MODELS_JSON).expect("seed parses");
+        let curated = bundled_anthropic_seed();
+        assert!(!curated.is_empty(), "anthropic seed populated");
+        for m in &curated {
+            assert!(
+                !seed
+                    .models
+                    .iter()
+                    .any(|s| s.provider == m.provider && s.id == m.id),
+                "{}/{} is now in the models.dev seed; remove it from anthropic.json",
+                m.provider,
+                m.id
+            );
+        }
     }
 
     /// The bundled seed's reasoning controls drive the adaptive
@@ -1697,11 +1753,11 @@ mod tests {
         }
     }
 
-    /// `splice_codex_seed` must be additive only: entries already in
+    /// `splice_seed` must be additive only: entries already in
     /// the model list win over the seed so refreshed user caches
     /// aren't silently rewritten by the in-process seed.
     #[test]
-    fn splice_codex_seed_is_additive_only() {
+    fn splice_seed_is_additive_only() {
         let mut models = vec![ModelInfo {
             id: "gpt-5.5".into(),
             name: "gpt-5.5 (from cache)".into(),
@@ -1729,7 +1785,7 @@ mod tests {
 
         let seed = bundled_codex_seed();
         let total_seed = seed.len();
-        let appended = splice_codex_seed(&mut models, seed);
+        let appended = splice_seed(&mut models, seed);
 
         // The seed entry for gpt-5.5 should not have been re-applied.
         assert_eq!(appended, total_seed - 1);
@@ -1744,7 +1800,7 @@ mod tests {
         assert!((gpt55.cost.input - 9.99).abs() < 1e-9);
 
         // A second splice with the same seed appends nothing.
-        let appended_again = splice_codex_seed(&mut models, bundled_codex_seed());
+        let appended_again = splice_seed(&mut models, bundled_codex_seed());
         assert_eq!(appended_again, 0);
     }
 
@@ -1772,7 +1828,7 @@ mod tests {
             max_tokens: 1,
         };
         let mut models = Vec::new();
-        let appended = splice_codex_seed(&mut models, vec![stray]);
+        let appended = splice_seed(&mut models, vec![stray]);
         // The splice accepts whatever the caller passes — filtering of
         // non-codex entries happens inside `bundled_codex_seed` before
         // the splice runs, not in the splice itself. Pin the splice's
