@@ -17,7 +17,17 @@ mod tests;
 
 pub(super) struct GoalRun {
     pub(super) current: Option<Goal>,
+    /// The goal's definition or status changed, or a boundary asked for usage
+    /// to be saved. Only this appends a goal record.
     dirty: bool,
+    /// Tokens or time accrued since the last record. Usage alone never appends:
+    /// it rides on the next record, and [`Self::save_usage`] forces one at a
+    /// Main turn's end and at teardown. A crash therefore loses at most the
+    /// interrupted turn's accounting.
+    unsaved_usage: bool,
+    /// Tokens were charged since clients last saw the goal. Published from
+    /// memory, since clients run their own clock for elapsed time.
+    unpublished: bool,
     /// Descendants retain the goal that admitted their work. Main can adopt a
     /// new goal mid-turn, but only inference started afterward belongs to it.
     owners: HashMap<AgentId, String>,
@@ -39,6 +49,8 @@ impl GoalRun {
         Self {
             current,
             dirty: false,
+            unsaved_usage: false,
+            unpublished: false,
             owners: HashMap::new(),
             inferences: HashMap::new(),
             clock: None,
@@ -70,9 +82,14 @@ impl GoalRun {
             if seconds > 0 {
                 goal.time_used_seconds = goal.time_used_seconds.saturating_add(seconds);
                 *clock += std::time::Duration::from_secs(seconds);
-                self.dirty = true;
+                self.unsaved_usage = true;
             }
         }
+    }
+
+    fn save_usage(&mut self) {
+        self.elapsed();
+        self.dirty |= self.unsaved_usage;
     }
 
     fn set_status(&mut self, status: GoalStatus) {
@@ -150,7 +167,8 @@ impl GoalRun {
             return;
         }
         goal.tokens_used = goal.tokens_used.saturating_add(tokens);
-        self.dirty |= tokens > 0;
+        self.unsaved_usage |= tokens > 0;
+        self.unpublished |= tokens > 0;
         if goal.status == GoalStatus::Active
             && goal
                 .token_budget
@@ -165,7 +183,7 @@ impl GoalRun {
         &mut self,
         outcome: &Result<Result<(), TurnError>, tokio::task::JoinError>,
     ) {
-        self.elapsed();
+        self.save_usage();
         if self.active() {
             match outcome {
                 Ok(Ok(())) => {
@@ -391,9 +409,22 @@ impl Driver {
         self.checkpoint_goal().await
     }
 
+    /// Save usage that would otherwise wait for the next record. For teardown.
+    pub(super) async fn checkpoint_goal_usage(&mut self) -> Result<(), GoalError> {
+        self.goal.save_usage();
+        self.checkpoint_goal().await
+    }
+
     pub(super) async fn checkpoint_goal(&mut self) -> Result<(), GoalError> {
         self.goal.elapsed();
         if !self.goal.dirty {
+            if std::mem::take(&mut self.goal.unpublished) {
+                let current = self.goal.current.clone();
+                self.session.publish_state(&self.shared.fanout, |status| {
+                    status.goal = current;
+                    true
+                });
+            }
             return Ok(());
         }
         // The log guard fences the event forwarder. Publish preceding appends
@@ -408,6 +439,8 @@ impl Driver {
         log.flush_pending()
             .map_err(|err| GoalError::Storage(err.to_string()))?;
         self.goal.dirty = false;
+        self.goal.unsaved_usage = false;
+        self.goal.unpublished = false;
         // Preserve zero as the fast path for sessions that have never had a
         // goal. Model creation enables context without advancing later revisions.
         self.goal_revision = self.goal_revision.max(1);

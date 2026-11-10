@@ -1559,7 +1559,7 @@ impl Driver {
         // Detached task drivers emit their terminal events while quiescing.
         // Publish those before the host closes the attachment streams.
         self.drain_events();
-        match tokio::time::timeout(LOG_FLUSH_GRACE, self.checkpoint_goal()).await {
+        match tokio::time::timeout(LOG_FLUSH_GRACE, self.checkpoint_goal_usage()).await {
             Ok(Ok(())) => {}
             outcome => tracing::warn!(?outcome, "could not checkpoint goal usage at teardown"),
         }

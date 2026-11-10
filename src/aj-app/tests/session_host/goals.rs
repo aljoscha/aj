@@ -1135,6 +1135,77 @@ async fn goal_tools_continue_across_turns_and_account_only_the_goal_work() {
 }
 
 #[tokio::test]
+async fn goal_usage_is_recorded_at_turn_boundaries_and_published_between_them() {
+    let gate = tempfile::TempDir::new().unwrap();
+    let gate = gate.path().join("open");
+    let (h, _) = recorded(vec![
+        used(
+            calling(
+                "working",
+                "blocked",
+                "bash",
+                json!({
+                    "command": format!("until [ -e '{}' ]; do sleep 0.01; done", gate.display()),
+                    "description": "hold the turn open"
+                }),
+            ),
+            10,
+        ),
+        used(finalized_text_message("first part done"), 5),
+        used(
+            calling(
+                "verified everything",
+                "done",
+                "update_goal",
+                json!({"status":"complete"}),
+            ),
+            7,
+        ),
+        used(finalized_text_message("all done"), 3),
+    ]);
+    let session = h.create().await;
+    let mut stream = h.host.attach(&[attach_request(&session)]).await.unwrap();
+    frames_until(&mut stream, "attach", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    action(&h.host, &session, create()).await;
+
+    // The tool holds the turn open after its inference was charged. Clients
+    // see that subtotal, but it has no log record behind it yet.
+    frames_until(
+        &mut stream,
+        "the mid-turn subtotal",
+        |frame| matches!(frame, Frame::State { goal: Some(goal), .. } if goal.tokens_used == 10),
+    )
+    .await;
+    let handles = h.host.local_handles(&session).await.unwrap();
+    let recorded = || async {
+        let log = handles.log.lock().await;
+        log.entries_in_order()
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                aj_session::ConversationEntryKind::GoalChange { goal: Some(goal) } => {
+                    Some(goal.tokens_used)
+                }
+                _ => None,
+            })
+            .collect::<Vec<u64>>()
+    };
+    assert_eq!(recorded().await, [0]);
+
+    std::fs::write(&gate, "").unwrap();
+    let result = wait_goal(&h, &session, GoalStatus::Complete).await;
+    assert_eq!(result.tokens_used, 22);
+    assert_eq!(
+        recorded().await,
+        [0, 15, 22],
+        "one record each for creation, the first turn's end and completion"
+    );
+    h.host.shutdown().await;
+}
+
+#[tokio::test]
 async fn goal_budget_includes_descendants_excludes_cache_reads_and_steers_wrapup() {
     let mut spawn = used(
         calling(

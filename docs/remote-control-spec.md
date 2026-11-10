@@ -580,7 +580,10 @@ cleared. An absent field decodes as no goal for compatibility. A snapshot has
 `time_used_seconds`. Status is `active`, `paused`, `blocked`,
 `budget_limited`, `usage_limited`, or `complete`.
 
-Goal state and usage persist on the user branch. Reopening a session or
+Goal state and usage persist on the user branch. The host records usage when
+the goal's definition or status changes, when a Main turn ends, and at
+shutdown, so a crash loses at most the interrupted turn's accounting. `state`
+frames carry current usage between those records. Reopening a session or
 switching heads does not automatically pursue a restored goal. Explicit
 resume is required. Cancelling Main pauses pursuit. Reconnecting to a still
 live session does not pause it. Goal commands do not cancel a turn or its tools.
