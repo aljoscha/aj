@@ -253,10 +253,8 @@ enum StartupSession {
 /// A named session is resumed as named, including one that has been
 /// archived: archiving puts a session away without closing it, so naming it
 /// is still the way back in. Unnamed resume takes the default pick, which
-/// passes archived sessions over, and interactive mode has a readline to fall
-/// back on, so an empty store degrades to a fresh session rather than
-/// failing. Reading the store can still fail, and that is raised rather than
-/// treated as an empty store.
+/// passes archived sessions over. Nothing to resume is an error, not an
+/// implicit request to create a session. Store read failures are propagated.
 fn startup_session(
     command: Option<&CliCommand>,
     persistence: &ConversationPersistence,
@@ -272,8 +270,9 @@ fn startup_session(
         }) => match persistence.get_latest_session_id()? {
             Some(latest) => StartupSession::Resume(latest),
             None => {
-                eprintln!("No latest conversation to resume; starting a fresh session.");
-                StartupSession::Create
+                return Err(anyhow!(
+                    "no conversation sessions to resume; invoke `aj` to start a new session"
+                ));
             }
         },
         _ => StartupSession::Create,
@@ -303,8 +302,6 @@ async fn build_world(
     let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
     let process_notices = ProcessNotices::at_launch(diagnostics, &keybinding_problems);
 
-    // `aj continue` with neither an explicit id nor a latest session
-    // on disk degrades to a fresh session, matching `aj`.
     let startup = startup_session(args.command.as_ref(), persistence)?;
 
     let ComposedHost {
@@ -10702,31 +10699,44 @@ mod tests {
         );
     }
 
-    /// With every session archived, bare `aj continue` opens a fresh one:
-    /// interactive mode has a readline to fall back on, so an empty pick is a
-    /// new session rather than a failure.
     #[tokio::test]
-    async fn bare_continue_creates_through_the_composed_build_when_all_are_archived() {
-        let dir = TempDir::new().expect("tempdir");
-        let persistence = store_in(&dir);
-        let only = seed_session(&persistence);
-        assert_eq!(
-            listed_session_ids(&persistence),
-            vec![only.clone()],
-            "the seeded session is listable before archiving",
-        );
-        persistence.write_archived(&only, true).expect("archive it");
-        assert!(
-            persistence.read_archived(&only).expect("read the sidecar"),
-            "the only session is archived before the composed call",
-        );
-
-        let world = world_from_argv(&dir, &["aj", "--scripted", "streaming-text", "continue"])
-            .await
-            .expect("build world");
-        let opened = world.session().to_string();
-        shut_down(&world).await;
-        assert_ne!(opened, only, "the archived session was not resumed");
+    async fn continue_without_a_resumable_session_fails_without_creating_one() {
+        for archived in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let persistence = store_in(&dir);
+            if archived {
+                let only = seed_session(&persistence);
+                persistence.write_archived(&only, true).expect("archive it");
+                assert!(persistence.read_archived(&only).unwrap());
+            }
+            let before = listed_session_ids(&persistence);
+            assert_eq!(before.len(), usize::from(archived));
+            for id in [None, Some("missing-session")] {
+                let mut argv = vec!["aj", "--scripted", "streaming-text", "continue"];
+                argv.extend(id);
+                match world_from_argv(&dir, &argv).await {
+                    Err(error) => {
+                        if id.is_none() {
+                            let message = format!("{error:#}");
+                            assert!(
+                                message.contains("no conversation sessions to resume"),
+                                "{message}"
+                            );
+                            assert!(message.contains("invoke `aj`"), "{message}");
+                        }
+                    }
+                    Ok(world) => {
+                        shut_down(&world).await;
+                        panic!("continue opened a session with nothing to resume");
+                    }
+                }
+                assert_eq!(
+                    listed_session_ids(&persistence),
+                    before,
+                    "failed resume created a session"
+                );
+            }
+        }
     }
 
     /// A store that cannot be read fails the run rather than opening a fresh
@@ -10930,72 +10940,6 @@ mod tests {
             None,
             "a refused run leaves no session behind",
         );
-    }
-
-    /// A resume has no created session for `--tag` to name, so the flag is
-    /// reported rather than dropped.
-    #[tokio::test]
-    async fn a_launch_tag_on_a_resume_says_it_has_nothing_to_name() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "streaming-text").await;
-        install_unpaced_demo(&world, "streaming-text");
-        persist_session(&mut world).await;
-        let session = world.session().to_string();
-        shut_down(&world).await;
-
-        let resumed = world_from_argv(
-            &dir,
-            &[
-                "aj",
-                "--scripted",
-                "streaming-text",
-                "--tag",
-                "fix-auth",
-                "continue",
-                &session,
-            ],
-        )
-        .await
-        .expect("build the resumed world");
-        assert!(
-            main_notices(&resumed)
-                .iter()
-                .any(|n| n.contains("--tag has nothing to name")),
-            "{:?}",
-            main_notices(&resumed),
-        );
-        assert_eq!(
-            store_in(&dir).read_tag(&session).expect("read the sidecar"),
-            None,
-            "and the resumed session is not relabelled",
-        );
-        shut_down(&resumed).await;
-
-        // A flag that normalizes to no label names nothing, so there is
-        // nothing to report about it. Print mode reads the same flag through
-        // the same rule (see `Args::has_launch_tag`).
-        let blank = world_from_argv(
-            &dir,
-            &[
-                "aj",
-                "--scripted",
-                "streaming-text",
-                "--tag",
-                "   ",
-                "continue",
-                &session,
-            ],
-        )
-        .await
-        .expect("build the resumed world");
-        assert!(
-            !main_notices(&blank)
-                .iter()
-                .any(|n| n.contains("--tag has nothing to name")),
-            "{:?}",
-            main_notices(&blank),
-        );
-        shut_down(&blank).await;
     }
 
     /// The complete fresh-session block keeps config diagnostics, skill
@@ -11619,7 +11563,7 @@ mod tests {
     async fn a_refused_create_toasts_its_failure() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let (mut app, _writer, _root) = app_over(&shell).await;
         let before = main_notices(&world).len();
 
@@ -15801,7 +15745,7 @@ mod tests {
         let host_dir = TempDir::new().unwrap();
         let client_dir = TempDir::new().unwrap();
         let (remote, auth) = credential_fixture(&host_dir).await;
-        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &["--new"]).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
         register_controlled_oauth(&world, "credential-fake", "new-access", LoginGate::Ready).await;
         world
@@ -17548,7 +17492,7 @@ mod tests {
         };
         let dir = TempDir::new().unwrap();
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let supported = world.control.clone();
         let (tx, mut rx) = unbounded_channel();
         let (redraw, _) = unbounded_channel();
@@ -24488,7 +24432,7 @@ mod tests {
     async fn a_peer_without_the_endpoint_says_so() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let elsewhere = format!("{}/nowhere", remote.url());
         world.control =
             Control::remote(crate::remote::RemoteClient::new(&elsewhere).expect("a client"));
@@ -24647,7 +24591,8 @@ mod tests {
 
         let remote_dir = process_lifetime_test_dir();
         let peer = RemoteHost::start(remote_dir, "streaming-text").await;
-        let (mut remote, remote_shell) = connect_world_and_shell(remote_dir, &peer, &[]).await;
+        let (mut remote, remote_shell) =
+            connect_world_and_shell(remote_dir, &peer, &["--new"]).await;
         let (mut remote_app, _writer, _root) = app_over(&remote_shell).await;
         let remote_session = remote.directory.rename_focused(SESSION.to_string());
         let remote_feedback = refusal_feedback(&mut remote, &remote_shell, &mut remote_app).await;
@@ -26005,7 +25950,7 @@ mod tests {
     async fn passive_reattachment_keeps_live_reading_state_but_rebuilt_models_open_at_tail() {
         let dir = TempDir::new().expect("tempdir");
         let mut remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let prompt = (0..80)
             .map(|i| format!("reading row {i:03}\n"))
             .collect::<String>();
@@ -28113,7 +28058,7 @@ mod tests {
     async fn session_info_distinguishes_unsupported_hosts_from_missing_sessions() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let missing = world
             .control
             .session_info("missing")
@@ -29071,9 +29016,9 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let host_directory = remote.working_directory();
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
 
-        // A fresh host holds nothing, so bare connect created the session.
+        // Explicit creation opens a session on the fresh host.
         assert!(!world.session().is_empty());
         // The host's scripted identity, which this client's config knows
         // nothing about, so it can only have come from a `state` frame.
@@ -29147,15 +29092,14 @@ mod tests {
     }
 
     /// Session selection: an explicit id attaches it, `--new`
-    /// creates, bare connect takes the host's latest, and a host with no
-    /// sessions gets one created.
+    /// creates even on an empty host, and bare connect takes the host's latest.
     #[tokio::test]
     async fn connect_mode_resolves_the_session_to_attach() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
 
-        // Create-when-empty: the host holds nothing yet.
-        let created = connect_world(&dir, &remote, &[]).await;
+        // Explicit creation: the host holds nothing yet.
+        let created = connect_world(&dir, &remote, &["--new"]).await;
         let first = created.session().to_string();
         assert!(
             remote
@@ -29205,7 +29149,7 @@ mod tests {
     async fn connect_mode_reconnects_after_a_dropped_stream() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = world.session().to_string();
 
         assert!(handle_submit(&mut world, "hello".to_string()).await);
@@ -29594,7 +29538,7 @@ mod tests {
     async fn a_selected_target_is_not_usable_or_successful_before_its_caught() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let target = "selected-slow-target".to_string();
         let epoch = "slow-target-epoch";
         let peer = WarmPeer::start(
@@ -29800,7 +29744,7 @@ mod tests {
     async fn a_connected_client_reports_the_hosts_credential_warning() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let target = "host-without-credentials".to_string();
         let warning = "Heads up: the host has no credentials for this provider";
         let peer = WarmPeer::start(
@@ -29850,7 +29794,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         // History on the host, written through a first client that then lets go.
-        let (mut seed, _seed_shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut seed, _seed_shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         remote
             .install_unpaced_demo(seed.session(), "streaming-text")
             .await;
@@ -29969,7 +29913,7 @@ mod tests {
     async fn a_selected_target_paints_its_history_whole_once_caught() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let target = "selected-painted-target".to_string();
         let epoch = "painted-target-epoch";
         let peer = WarmPeer::start(
@@ -30057,7 +30001,7 @@ mod tests {
     async fn a_rejoin_into_the_same_epoch_keeps_the_transcript_on_screen() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         run_prompt(&mut world, "history before the cut").await;
         let session = world.session().to_string();
         let cursor = world.client().cursor().expect("a committed cursor");
@@ -30132,7 +30076,7 @@ mod tests {
     async fn a_late_refusal_keeps_the_target_selected_and_draws_the_exact_reason() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let previous = world.session().to_string();
         let target = "selected-refused-target".to_string();
         let reason = "the target is held by the peer named here";
@@ -30217,7 +30161,7 @@ mod tests {
     async fn a_refused_target_passively_rejoins_and_completes_its_startup() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let target = "selected-rejoining-target".to_string();
         let reason = "the target is unavailable for the first attach";
         let peer = WarmPeer::answering(
@@ -30306,7 +30250,7 @@ mod tests {
     async fn a_partial_create_followed_by_refusal_preserves_the_minted_session() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = "minted-partial-session".to_string();
         let partial = "the session exists, but its requested label was not applied";
         let reason = "the minted session is temporarily withheld";
@@ -30398,7 +30342,7 @@ mod tests {
     async fn a_stalled_switch_keeps_the_target_selected_and_retrying() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let target = "selected-stalled-target".to_string();
         let peer = WarmPeer::start_cutting(Vec::new(), Duration::from_millis(15)).await;
         redirect_to(&mut world, &peer, Duration::from_secs(30));
@@ -30466,7 +30410,7 @@ mod tests {
     async fn a_stream_open_failure_keeps_the_target_selected_and_reconnecting() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let target = "selected-open-failure".to_string();
         let reason = "the peer refused this replacement stream exactly";
         let peer = WarmPeer::refusing_events(reason).await;
@@ -30534,7 +30478,7 @@ mod tests {
     async fn an_outage_is_one_warning_row_rewritten_by_each_retry() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let reason = "host down";
         let down = WarmPeer::refusing_events(reason).await;
         fn outage_rows(chat: &RefCell<ChatState>) -> Vec<String> {
@@ -30923,7 +30867,7 @@ mod tests {
     async fn a_reset_inside_the_block_ends_the_catch_up() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = world.session().to_string();
 
         // A transport budget long enough that waiting it out would be the
@@ -30993,7 +30937,7 @@ mod tests {
     async fn the_loop_reads_input_while_a_block_arrives() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = world.session().to_string();
 
         let silence = Duration::from_millis(500);
@@ -31116,7 +31060,7 @@ mod tests {
     async fn the_loop_paces_a_stream_that_dies_inside_the_block() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
 
         // The cut is what ends every attempt, so the transport budget is long
         // enough that silence cannot be what does.
@@ -31170,7 +31114,7 @@ mod tests {
     async fn the_loop_keeps_its_input_when_a_re_attach_is_refused() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
 
         let refusal = "no host serves this session any more";
         let script = vec![
@@ -31241,7 +31185,7 @@ mod tests {
     async fn a_settled_block_does_not_re_decide_itself() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, _shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = world.session().to_string();
 
         let mut block = Block {
@@ -31273,7 +31217,7 @@ mod tests {
     async fn a_session_change_mid_catch_up_leaves_no_recovery_behind() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = world.session().to_string();
         let epoch = "epoch-interrupted";
 
@@ -31365,7 +31309,7 @@ mod tests {
     async fn a_swap_does_not_wait_for_a_background_block() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let (mut app, _writer, _root) = app_over(&shell).await;
         let first = world.session().to_string();
 
@@ -31485,7 +31429,7 @@ mod tests {
     async fn a_locked_refusal_stays_settled_through_directory_updates() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = world.session().to_string();
 
         let refusal = "another writer holds this session";
@@ -31587,7 +31531,7 @@ mod tests {
     async fn a_session_refused_twice_still_rejoins() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let session = world.session().to_string();
         let epoch = "epoch-second-time";
 
@@ -31942,7 +31886,7 @@ mod tests {
     async fn provider_usage_unsupported_is_not_pregated_and_is_rendered() {
         let dir = TempDir::new().unwrap();
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         world.control = Control::remote(
             crate::remote::RemoteClient::new(&format!("{}/nowhere", remote.url())).unwrap(),
         );
@@ -31967,7 +31911,7 @@ mod tests {
                 None
             };
             let (mut world, shell) = if let Some(remote) = &remote {
-                connect_world_and_shell(&client_dir, remote, &[]).await
+                connect_world_and_shell(&client_dir, remote, &["--new"]).await
             } else {
                 world_and_shell(&host_dir, "streaming-text").await
             };
@@ -32087,7 +32031,7 @@ mod tests {
     async fn a_connection_seeds_the_recall_ring_from_nothing() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let world = connect_world(&dir, &remote, &[]).await;
+        let world = connect_world(&dir, &remote, &["--new"]).await;
         store_holding_a_prompt(&world.persistence, "prompt-typed-on-the-client");
 
         assert!(
@@ -32176,7 +32120,7 @@ mod tests {
     async fn up_over_a_connection_recalls_this_runs_own_prompt() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         store_holding_a_prompt(&world.persistence, "prompt-typed-on-the-client");
         let session = world.session().to_string();
         let before = durable_seq(&remote, &session).await;
@@ -32253,7 +32197,7 @@ mod tests {
     async fn connect_mode_creates_and_switches_sessions() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         let first = world.session().to_string();
         let (mut app, _writer, _root) = app_over(&shell).await;
 
@@ -32703,8 +32647,8 @@ mod tests {
     }
 
     /// A connect that attaches an existing session has no created session for
-    /// `--tag` to name, so the flag is reported rather than dropped, exactly
-    /// as a local resume reports it. A flag that normalizes to no label names
+    /// `--tag` to name, so the flag is reported rather than dropped.
+    /// A flag that normalizes to no label names
     /// nothing and reports nothing.
     #[tokio::test]
     async fn a_launch_tag_on_a_connect_resume_says_it_has_nothing_to_name() {
@@ -32925,7 +32869,7 @@ mod tests {
     async fn connect_mode_folds_a_refused_commands_reason() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
 
         // A model this host has no catalog row for: the peer's wording is
         // what the user sees, because only the host can know it.
@@ -32981,7 +32925,7 @@ mod tests {
     async fn connect_mode_ctrl_c_renders_a_cancel_refusal() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "parallel-agents").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
         assert!(handle_submit(&mut world, "delegate it".to_string()).await);
         settle(&mut world).await;
 
@@ -33346,7 +33290,7 @@ mod tests {
     async fn connect_mode_browses_the_tree_and_branches() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
 
         remote
             .install_unpaced_demo(world.session(), "streaming-text")

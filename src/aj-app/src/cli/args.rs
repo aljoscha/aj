@@ -227,7 +227,7 @@ fn command_options(command: &str) -> &'static [&'static str] {
     match command {
         "connect" => SESSION_OPTIONS,
         "serve" => HOST_OPTIONS,
-        "continue" => &["listen", "auth", "allow", "name", "tag", "env"],
+        "continue" => &["listen", "auth", "allow", "name", "env"],
         "gateway" => SERVER_OPTIONS,
         _ => &[],
     }
@@ -605,7 +605,7 @@ pub enum ConnectSession<'a> {
     /// `--new`: a session this run creates, whatever the host already holds.
     Fresh,
     /// Nothing named: the host's most recently modified session that is not
-    /// archived, and a fresh one when it holds none.
+    /// archived. Fails when no such session exists.
     Latest,
 }
 
@@ -652,7 +652,7 @@ pub enum Command {
     /// List existing conversation sessions for this project.
     ListSessions,
     /// Continue a conversation session (latest unarchived one if no id
-    /// given).
+    /// given). Fails if there is no session to resume.
     ///
     /// Accepts optional positional launch input after the session id:
     /// `aj continue ID <args...>` resumes the session and auto-submits
@@ -685,8 +685,8 @@ pub enum Command {
     Serve,
     /// Attach the interactive TUI to a session on a remote aj host.
     ///
-    /// With no session id the host's most recently modified session is
-    /// attached, and one is created when the host has none.
+    /// With no session id the host's most recently modified unarchived session
+    /// is attached. Fails if none exists. Use `--new` to create a session.
     ///
     /// Launch input follows the session id, exactly as for `continue`:
     /// `aj connect URL ID <args...>` attaches and auto-submits the args as
@@ -757,10 +757,7 @@ mod tests {
         for (command, expected) in [
             ("list-sessions", vec![]),
             ("update-models", vec![]),
-            (
-                "continue",
-                vec!["listen", "auth", "allow", "name", "tag", "env"],
-            ),
+            ("continue", vec!["listen", "auth", "allow", "name", "env"]),
             ("serve", vec!["listen", "auth", "allow", "name"]),
             ("gateway", vec!["listen", "auth", "allow"]),
             (

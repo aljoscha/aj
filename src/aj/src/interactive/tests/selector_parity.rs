@@ -302,7 +302,7 @@ async fn selector_parity_unsupported_and_disconnected_have_no_fallback() {
     let host_dir = TempDir::new().unwrap();
     let client_dir = TempDir::new().unwrap();
     let remote = host(&host_dir, "selector-errors").await;
-    let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[]).await;
+    let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &["--new"]).await;
     let (mut app, mut writer, root) = app_over(&shell).await;
     for (url, expected) in [
         (format!("{}/unsupported", remote.url()), "does not serve"),
@@ -414,7 +414,7 @@ async fn model_choices_follow_host_credentials_when_reopened() {
         let handles = crate::remote::tests::HostHandles::new(&host_dir);
         let auth = handles.auth.clone();
         let remote = host_with_handles(&host_dir, "authenticated", handles).await;
-        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[]).await;
+        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &["--new"]).await;
         if local {
             world.control = Control::local(remote.host.clone());
         }
@@ -461,7 +461,7 @@ async fn model_selector_does_not_require_the_config_editor_endpoint() {
     let host_dir = TempDir::new().unwrap();
     let client_dir = TempDir::new().unwrap();
     let remote = host(&host_dir, "catalog-only").await;
-    let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[]).await;
+    let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &["--new"]).await;
     let catalog = remote.host.models(world.session()).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

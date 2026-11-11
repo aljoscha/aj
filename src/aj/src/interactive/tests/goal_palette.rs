@@ -350,7 +350,7 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
 async fn goal_palette_shows_unsupported_host_and_remains_cancellable() {
     let dir = TempDir::new().unwrap();
     let remote = RemoteHost::start(&dir, "streaming-text").await;
-    let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+    let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
     world.control = Control::remote(
         crate::remote::RemoteClient::new(&format!("{}/nowhere", remote.url())).unwrap(),
     );
@@ -700,7 +700,7 @@ async fn goal_palette_reports_delayed_refusal_after_all_goal_windows_close() {
     let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let dir = TempDir::new().unwrap();
     let remote = RemoteHost::start(&dir, "streaming-text").await;
-    let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+    let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
     world.control = Control::remote(crate::remote::RemoteClient::new(&url).unwrap());
     let observed = Rc::clone(&shell);
     let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {

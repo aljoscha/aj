@@ -1296,9 +1296,10 @@ These options are available on local interactive launches, `continue`, and
 `--name`. `connect` accepts session-creation options (`--model-api`,
 `--model-url`, `--model-name`, `--account`, `--default-account`, `--speed`,
 `--thinking`, `--tag`, and `--env`), not server options. `--api-key` is
-local-only. `continue` also accepts `--tag` and `--env` for sessions it
-creates. Utility commands accept none of these options. Shared options
-may precede or follow the relevant subcommand.
+local-only. `continue` also accepts `--env` for later in-TUI creates,
+but not `--tag`: startup only resumes an existing session. Utility commands
+accept none of these options. Shared options may precede or follow the
+relevant subcommand.
 
 ## 7. Session settings follow the creator
 
@@ -1455,7 +1456,9 @@ and the restore notice from `state` frames.
 Session selection asks for one of three things:
 
 - Bare `aj connect <url>` attaches the host's most recently active
-  unarchived session, and creates one when the host offers none.
+  unarchived session. If none exists, it fails and suggests `--new`.
+  Local `aj continue` follows the same resume-only rule and suggests `aj`
+  when no unarchived session exists. Naming a nonexistent session fails too.
 - `aj connect <url> <session-id> [input...]` attaches that session
   whatever its archived bit says. Launch input follows the id.
 - `aj connect <url> --new [input...]` creates a session. Under `--new`
@@ -1466,10 +1469,9 @@ Explicit `--model-api`, `--model-name`, `--model-url`, `--thinking`,
 `--speed`, `--account`, and `--default-account` select settings for a new
 session only. They require `connect --new` in remote mode and are accepted
 on either side of the subcommand. Bare connect rejects these flags before
-contacting the host, even when it would create a session because none exists.
-It retains its attach-or-create behavior using defaults. Environment and
-config values remain creation defaults, not explicit flags, and do not
-change an attached session. Use interactive settings to change existing sessions.
+contacting the host. Environment and config values remain creation defaults,
+not explicit flags, and do not change an attached session. Use interactive
+settings to change existing sessions.
 `--api-key` is local-only and is rejected on connect. Configure credentials
 on the host instead.
 

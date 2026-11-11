@@ -140,8 +140,8 @@ async fn resolve_named_host(
 /// Resolve the session to attach, creating one when that is what the
 /// selection rule says.
 ///
-/// The default attach passes over archived rows, so a host whose sessions are
-/// all archived creates one exactly as an empty host does. An explicit id in
+/// The default attach passes over archived rows and fails when no candidate
+/// exists. Only an explicit new-session request creates. An explicit id in
 /// the host's directory is answered whatever its bit says: archiving puts a
 /// session away, it does not close it.
 async fn resolve_session(
@@ -184,16 +184,9 @@ async fn resolve_session(
                 .filter(|summary| !summary.archived)
                 .max_by_key(|summary| (summary.last_activity, summary.id.clone()))
                 .map(|summary| summary.id.clone());
-            match latest {
-                Some(session) => Ok((session, false)),
-                // A fresh `aj serve` holds nothing, and a host holding only
-                // archived sessions offers nothing either, so connect mode
-                // would otherwise have nothing to attach at all.
-                None => Ok((
-                    create(control, host, settings, tag, session_env).await?,
-                    true,
-                )),
-            }
+            latest
+                .map(|session| (session, false))
+                .ok_or_else(|| anyhow!("no conversation sessions to resume; use `aj connect <url> --new` to start a new session"))
         }
     }
 }
@@ -930,34 +923,38 @@ mod tests {
         peer.shutdown().await;
     }
 
-    /// A host whose every session is archived offers nothing to attach, so
-    /// bare connect creates, exactly as against a host holding none.
     #[tokio::test]
-    async fn bare_connect_creates_when_every_session_is_archived() {
-        let peer = Peer::start().await;
-        let put_away = peer.create().await;
-        peer.archive(&put_away).await;
-        let rows = peer.rows().await;
-        assert!(
-            !rows.is_empty() && rows.iter().all(|summary| summary.archived),
-            "the fixture holds {} sessions and not all are archived, so a create here proves nothing",
-            rows.len()
-        );
+    async fn bare_connect_without_a_resumable_session_fails_without_creating_one() {
+        for archived in [false, true] {
+            let peer = Peer::start().await;
+            if archived {
+                let only = peer.create().await;
+                peer.archive(&only).await;
+            }
+            let before = peer.rows().await;
+            assert_eq!(before.len(), usize::from(archived));
+            assert!(before.iter().all(|row| row.archived));
 
-        let connected = peer.dial(&[]).await;
-        assert_ne!(
-            connected.session, put_away,
-            "bare connect attached the archived session"
-        );
-        assert!(
-            connected.created,
-            "bare connect reported an attach for the session it minted"
-        );
-        assert!(
-            !peer.row(&connected.session).await.archived,
-            "the session bare connect created is archived"
-        );
-        peer.shutdown().await;
+            let error = peer.try_dial(&[]).await.err().expect("nothing to resume");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("no conversation sessions to resume"),
+                "{message}"
+            );
+            assert!(message.contains("aj connect <url> --new"), "{message}");
+            let after = peer.rows().await;
+            assert_eq!(
+                after.iter().map(|row| &row.id).collect::<Vec<_>>(),
+                before.iter().map(|row| &row.id).collect::<Vec<_>>(),
+                "failed resume created a session",
+            );
+            assert!(after.iter().all(|row| row.archived));
+
+            let created = peer.dial(&["--new"]).await;
+            assert!(created.created);
+            assert_eq!(peer.rows().await.len(), before.len() + 1);
+            peer.shutdown().await;
+        }
     }
 
     /// Naming a session is asking for that one: the archived bit puts a
