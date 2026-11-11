@@ -74,8 +74,10 @@ this fixed native pair. Do not share its directory between host architectures.
 
 Both downloads must match the pinned Bazel SHA-256 hashes before the pair is
 published under the ignored `third-party/codex-code-mode/native/` directory.
-Failed downloads leave no installed partial pair. Existing pairs are verified,
-never overwritten. An offline source can be supplied with `--from-dir DIR`,
+Failed downloads leave the installation unchanged. Existing files are verified,
+never overwritten. Rerun bootstrap to download missing files in an incomplete
+installation. Checksum mismatches still fail without changing files. An offline
+source can be supplied with `--from-dir DIR`,
 containing the upstream artifact filenames. Revalidate an installation with:
 
 ```sh

@@ -27,17 +27,22 @@ def bootstrap(root, target, source=None, check=False):
     dest = root / 'third-party/codex-code-mode/native'
     if dest.is_symlink():
         raise RuntimeError(f'Refusing symlink native directory: {dest}')
-    if dest.exists() or check:
-        for item in pair:
-            verify(dest / NAMES[item['kind']], item)
+    missing = []
+    for item in pair:
+        path = dest / NAMES[item['kind']]
+        if path.exists() or path.is_symlink() or check:
+            verify(path, item)
+        else:
+            missing.append(item)
+    if not missing:
         return
 
-    # Publish the pair together. Failed downloads never leave a usable partial pair.
-    # An existing directory is only verified, never repaired or overwritten.
+    # Verify every download before publishing. Keep existing verified files intact
+    # when completing a partial installation. Bootstrap requires a single writer.
     with tempfile.TemporaryDirectory(prefix='.v8-', dir=dest.parent) as tmp:
         staged = Path(tmp) / 'native'
         staged.mkdir()
-        for item in pair:
+        for item in missing:
             path = staged / NAMES[item['kind']]
             if source is not None:
                 shutil.copyfile(source / item['filename'], path)
@@ -46,7 +51,12 @@ def bootstrap(root, target, source=None, check=False):
                                 '--proto', '=https', '--proto-redir', '=https',
                                 item['url'], '--output', str(path)], check=True)
             verify(path, item)
-        staged.rename(dest)
+        if dest.exists():
+            for item in missing:
+                name = NAMES[item['kind']]
+                (staged / name).rename(dest / name)
+        else:
+            staged.rename(dest)
 
 
 def main():

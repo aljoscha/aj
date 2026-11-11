@@ -286,6 +286,30 @@ class BootstrapContract(unittest.TestCase):
             bootstrap.bootstrap(self.root, target, self.source)
         self.assertEqual(tree(self.native), before)
 
+    def test_missing_installed_files_are_restored(self):
+        target = self.items[0]['target']
+        bootstrap.bootstrap(self.root, target, self.source)
+        expected = tree(self.native)
+        for name in bootstrap.NAMES.values():
+            with self.subTest(missing=name):
+                (self.native / name).unlink()
+                before = tree(self.native)
+                with self.assertRaises(FileNotFoundError):
+                    bootstrap.bootstrap(self.root, target, check=True)
+                self.assertEqual(tree(self.native), before)
+                bootstrap.bootstrap(self.root, target, self.source)
+                self.assertEqual(tree(self.native), expected)
+
+    def test_failed_repair_preserves_existing_files(self):
+        target = self.items[0]['target']
+        bootstrap.bootstrap(self.root, target, self.source)
+        (self.native / 'src_binding.rs').unlink()
+        (self.source / self.items[1]['filename']).write_bytes(b'corrupt download')
+        before = tree(self.native)
+        with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+            bootstrap.bootstrap(self.root, target, self.source)
+        self.assertEqual(tree(self.native), before)
+
     def test_unsupported_platform_has_no_fallback(self):
         with self.assertRaisesRegex(RuntimeError, 'No pinned sandbox-enabled V8 pair'):
             bootstrap.bootstrap(self.root, 'x86_64-unknown-linux-musl', self.source)
