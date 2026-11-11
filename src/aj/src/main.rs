@@ -7,7 +7,7 @@
 
 use aj_app::cli::args::{Args, Command};
 use aj_conf::Config;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use tracing_subscriber::EnvFilter;
 
 /// Where this run's log output goes.
@@ -134,20 +134,6 @@ async fn async_main() -> Result<()> {
     // `EnvFilter` enables no callsites.
     let args = Args::parse();
     args.launch_env().map_err(|err| anyhow!("--env: {err}"))?;
-    // CLI-wide mode refusals live here because this is the only boundary that
-    // can reject before logging and dispatch. Command runners receive
-    // preflighted arguments and do not repeat this policy.
-    if args.has_launch_env() {
-        match &args.command {
-            Some(Command::Serve) => {
-                bail!("--env is stated per session create and cannot configure aj serve")
-            }
-            Some(Command::Gateway { .. }) => {
-                bail!("--env is stated per session create and cannot configure aj gateway")
-            }
-            _ => {}
-        }
-    }
     let interactive = is_interactive(&args);
     let log_path = match std::env::var_os("AJ_LOG_FILE") {
         Some(path) => Some(std::path::PathBuf::from(path)),

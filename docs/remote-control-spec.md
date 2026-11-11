@@ -1291,6 +1291,15 @@ Reference systemd units for `aj serve` and `aj gateway` ship in
 convention, and a host is configured entirely by `--listen`, `--auth`,
 `--allow`, `--name` and their environment equivalents.
 
+These options are available on local interactive launches, `continue`, and
+`serve`. `gateway` accepts `--listen`, `--auth`, and `--allow`, but not
+`--name`. `connect` accepts session-creation options (`--model-api`,
+`--model-url`, `--model-name`, `--account`, `--default-account`, `--speed`,
+`--thinking`, `--tag`, and `--env`), not server options. `--api-key` is
+local-only. `continue` also accepts `--tag` and `--env` for sessions it
+creates. Utility commands accept none of these options. Shared options
+may precede or follow the relevant subcommand.
+
 ## 7. Session settings follow the creator
 
 The host supplies the environment (workspace, skills, keys, catalog,

@@ -86,7 +86,7 @@ fn deadline_helper_drains_output_while_the_child_runs() {
 }
 
 #[test]
-fn malformed_global_env_is_refused_before_utility_dispatch_side_effects() {
+fn session_env_is_refused_before_utility_dispatch_side_effects() {
     let home = TempDir::new().expect("isolated home");
     let cwd = TempDir::new().expect("non-repository working directory");
     let output = run_aj(
@@ -98,7 +98,7 @@ fn malformed_global_env_is_refused_before_utility_dispatch_side_effects() {
     assert!(!output.status.success(), "malformed --env was accepted");
     let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
     assert!(
-        stderr.contains("--env: environment argument \"MISSING\" must contain '='"),
+        stderr.contains("unexpected argument '--env'"),
         "unexpected refusal: {stderr:?}"
     );
     assert!(
@@ -115,7 +115,7 @@ fn malformed_global_env_is_refused_before_utility_dispatch_side_effects() {
 }
 
 #[test]
-fn main_preflight_refuses_serve_and_gateway_env_before_any_state() {
+fn parser_refuses_serve_and_gateway_env_before_any_state() {
     for mode in ["serve", "gateway"] {
         let home = TempDir::new().expect("isolated home");
         let cwd = TempDir::new().expect("non-repository working directory");
@@ -133,7 +133,7 @@ fn main_preflight_refuses_serve_and_gateway_env_before_any_state() {
         assert!(!output.status.success(), "{mode} accepted create-only env");
         let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
         assert!(
-            stderr.contains("--env is stated per session create"),
+            stderr.contains("unexpected argument '--env'"),
             "unexpected {mode} refusal: {stderr:?}"
         );
         assert!(

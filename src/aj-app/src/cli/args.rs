@@ -28,36 +28,23 @@ pub enum LaunchEnvError {
 
 /// Top-level CLI for the `aj` binary.
 ///
-/// Construct this type through [`Args::parse`], [`Args::parse_from`], or
-/// [`Args::try_parse_from`]. The `clap::Args` trait is
-/// an implementation detail used to flatten these fields into the private root
-/// parser. It is not a supported construction boundary because clap's
-/// `ArgMatches` representation has already discarded outer occurrences of
-/// repeatable globals such as `--env` and `--allow` when the same option follows
-/// a subcommand.
-///
-/// `Args` deliberately does not implement `clap::Parser`:
-///
-/// ```compile_fail
-/// use aj_app::cli::args::Args;
-///
-/// let _ = <Args as clap::Parser>::try_parse_from([
-///     "aj", "--env", "BEFORE=one", "list-sessions", "--env", "AFTER=two",
-/// ]);
-/// ```
+/// Construct through this type's parse methods. They scope shared options to
+/// the commands that use them and combine options stated before and after a
+/// subcommand. The derived `clap::Args` implementation is only used by the
+/// private root parser.
 #[derive(clap::Args, Debug)]
 pub struct Args {
     /// New-session model API (e.g. `anthropic`, `openai`, `openai-codex`,
     /// `openrouter`).
-    #[arg(long, global = true, env = "MODEL_API")]
+    #[arg(long, env = "MODEL_API")]
     pub model_api: Option<String>,
 
     /// Override the new session's model endpoint URL.
-    #[arg(long, global = true, env = "MODEL_URL")]
+    #[arg(long, env = "MODEL_URL")]
     pub model_url: Option<String>,
 
     /// New-session model name (provider-specific identifier).
-    #[arg(long, global = true, env = "MODEL_NAME")]
+    #[arg(long, env = "MODEL_NAME")]
     pub model_name: Option<String>,
 
     /// API key for a new local session, applied as a runtime
@@ -66,35 +53,30 @@ pub struct Args {
     /// written to disk. Intentionally has no `env =` binding so the
     /// only way to supply it is the explicit flag (provider-specific
     /// env vars like `ANTHROPIC_API_KEY` remain the env path).
-    #[arg(long, global = true, conflicts_with_all = ["account", "default_account"])]
+    #[arg(long, conflicts_with_all = ["account", "default_account"])]
     pub api_key: Option<String>,
 
     /// Pin the new session's provider to this stored account.
     /// An empty value selects the unnamed account.
-    #[arg(
-        long,
-        global = true,
-        value_name = "NAME",
-        conflicts_with = "default_account"
-    )]
+    #[arg(long, value_name = "NAME", conflicts_with = "default_account")]
     pub account: Option<String>,
 
     /// Use the provider's shared default account in the new session.
-    #[arg(long, global = true, conflicts_with = "account")]
+    #[arg(long, conflicts_with = "account")]
     pub default_account: bool,
 
     /// New-session shared Main/Oracle inference speed: standard, fast, ultrafast, flex,
     /// or a model-advertised mode. Unsupported models use standard speed.
-    #[arg(long, global = true, env = "AJ_SPEED")]
+    #[arg(long, env = "AJ_SPEED")]
     pub speed: Option<String>,
 
     /// New-session Main thinking effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
     /// or `max`.
     ///
-    /// Global so local, print, and `connect --new` runs share one spelling and
+    /// Local, print, and `connect --new` runs share one spelling and
     /// the same CLI > env > config precedence. Explicit session-setting flags
     /// require a new session. Remote creation requires `connect --new`.
-    #[arg(long, global = true, env = "AJ_THINKING", value_name = "LEVEL")]
+    #[arg(long, env = "AJ_THINKING", value_name = "LEVEL")]
     pub thinking: Option<ConfigThinkingLevel>,
 
     /// Run in non-interactive print mode: stream events to stdout
@@ -144,7 +126,6 @@ pub struct Args {
     /// runs the same host headless.
     #[arg(
         long,
-        global = true,
         env = "AJ_LISTEN",
         num_args = 0..=1,
         require_equals = true,
@@ -160,24 +141,23 @@ pub struct Args {
     /// The control port runs arbitrary commands through the agent, so
     /// serving a non-loopback address in `local` mode refuses to start
     /// rather than serving unauthenticated.
-    #[arg(long, global = true, env = "AJ_AUTH", default_value = "local")]
+    #[arg(long, env = "AJ_AUTH", default_value = "local")]
     pub auth: String,
 
     /// Tailnet login allowed to connect in `--auth tailscale` mode,
     /// repeatable. Spelled exactly as the tailscale daemon reports it
     /// (e.g. `alice@github`). A tagged node has no login and is admitted
     /// only by the aj control capability granted in the tailnet policy.
-    #[arg(long, global = true, env = "AJ_ALLOW", value_delimiter = ',')]
+    #[arg(long, env = "AJ_ALLOW", value_delimiter = ',')]
     pub allow: Vec<String>,
 
     /// Name the session this run creates, shown in place of its id
     /// wherever a session is listed.
     ///
-    /// Global, so it reads the same on either side of a subcommand and
-    /// reaches the create a `connect --new` performs on the host. A run that
+    /// Available locally and on `connect` for sessions created on the host. A run that
     /// resumes an existing session creates nothing for the flag to name, and
     /// says so rather than dropping it.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub tag: Option<String>,
 
     /// Add one initial environment entry to sessions this invocation creates.
@@ -188,7 +168,6 @@ pub struct Args {
     /// create rather than inherited from the launching process.
     #[arg(
         long,
-        global = true,
         value_name = "KEY=VALUE",
         action = clap::ArgAction::Append
     )]
@@ -197,15 +176,13 @@ pub struct Args {
     /// Name the host this run serves, shown in place of its id wherever a
     /// client lists hosts.
     ///
-    /// Global so it reads the same on either side of a subcommand and reaches
-    /// the host an interactive `--listen` run serves, not only `aj serve`. A
-    /// run that serves no host of its own carries it to no effect, `aj
-    /// gateway` included: a gateway names the hosts behind it, not itself.
+    /// Available for local interactive hosts and `aj serve`. A gateway
+    /// names the hosts behind it, not itself.
     ///
     /// Absent, the host names itself after its working directory, `~`-
     /// abbreviated under home. That is a fallback: a fleet of clones is
     /// easier to read with names its operator chose.
-    #[arg(long, global = true, env = "AJ_NAME")]
+    #[arg(long, env = "AJ_NAME")]
     pub name: Option<String>,
 
     /// Subcommand selector for the non-conversational utilities
@@ -215,18 +192,58 @@ pub struct Args {
     pub command: Option<Command>,
 }
 
+// Options shared with the root launch mode, scoped to their consumers.
+const SESSION_OPTIONS: &[&str] = &[
+    "model_api",
+    "model_url",
+    "model_name",
+    "account",
+    "default_account",
+    "speed",
+    "thinking",
+    "tag",
+    "env",
+];
+const SERVER_OPTIONS: &[&str] = &["listen", "auth", "allow"];
+const HOST_OPTIONS: &[&str] = &["listen", "auth", "allow", "name"];
+const SCOPED_OPTIONS: &[&str] = &[
+    "model_api",
+    "model_url",
+    "model_name",
+    "api_key",
+    "account",
+    "default_account",
+    "speed",
+    "thinking",
+    "tag",
+    "env",
+    "listen",
+    "auth",
+    "allow",
+    "name",
+];
+
+fn command_options(command: &str) -> &'static [&'static str] {
+    match command {
+        "connect" => SESSION_OPTIONS,
+        "serve" => HOST_OPTIONS,
+        "continue" => &["listen", "auth", "allow", "name", "tag", "env"],
+        "gateway" => SERVER_OPTIONS,
+        _ => &[],
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "aj")]
 #[command(about = "AI-driven agent for software engineering")]
 #[command(long_about = None)]
-#[command(flatten_help = true)]
 struct CliParser {
     #[command(flatten)]
     args: Args,
 }
 
 impl Args {
-    /// Parse the process command line while preserving every global `--env` and
+    /// Parse the process command line while preserving every `--env` and
     /// `--allow` occurrence across subcommand boundaries.
     pub fn parse() -> Self {
         Self::parse_from(std::env::args_os())
@@ -241,23 +258,62 @@ impl Args {
         Self::try_parse_from(argv).unwrap_or_else(|err| err.exit())
     }
 
-    /// Parse `argv` while preserving every global `--env` and `--allow`
+    /// Parse `argv` while preserving every `--env` and `--allow`
     /// occurrence across subcommand boundaries.
     ///
-    /// Clap propagates one matched value set for a global argument through the
-    /// command hierarchy. For an append argument used on both sides of a
-    /// subcommand, the deeper set replaces the outer set. Re-reading those
-    /// repeatable arguments from the already accepted argv retains each
-    /// complete user statement in command-line order without reinterpreting any
-    /// other part of the grammar.
+    /// Shared options are matched independently at the root and subcommand.
+    /// Explicit child values override root defaults. Repeatable options retain
+    /// all explicit occurrences in command-line order.
     pub fn try_parse_from<I, T>(argv: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
         let argv = argv.into_iter().map(Into::into).collect::<Vec<_>>();
-        let matches = CliParser::command().try_get_matches_from(argv.clone())?;
+        let matches = Self::command().try_get_matches_from(argv)?;
         let mut parsed = CliParser::from_arg_matches(&matches)?.args;
+        // Root options remain accepted before a subcommand, but only when that
+        // command uses them. Child CLI values override root defaults, not vice versa.
+        if let Some((command, child)) = matches.subcommand() {
+            for &id in SCOPED_OPTIONS {
+                if !command_options(command).contains(&id)
+                    && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+                {
+                    return Err(clap::Error::raw(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        format!("--{} does not apply to {command}", id.replace('_', "-")),
+                    ));
+                }
+            }
+            macro_rules! take_child {
+                ($($field:ident: $ty:ty),* $(,)?) => {
+                    $(
+                        if child.try_contains_id(stringify!($field)).unwrap_or(false)
+                            && child.value_source(stringify!($field))
+                                == Some(clap::parser::ValueSource::CommandLine)
+                        {
+                            parsed.$field = child.get_one::<$ty>(stringify!($field)).cloned();
+                        }
+                    )*
+                };
+            }
+            take_child!(
+                model_api: String, model_url: String, model_name: String,
+                account: String, speed: String, thinking: ConfigThinkingLevel,
+                listen: String, tag: String, name: String,
+            );
+            if child.try_contains_id("default_account").unwrap_or(false)
+                && child.value_source("default_account")
+                    == Some(clap::parser::ValueSource::CommandLine)
+            {
+                parsed.default_account = child.get_flag("default_account");
+            }
+            if child.try_contains_id("auth").unwrap_or(false)
+                && child.value_source("auth") == Some(clap::parser::ValueSource::CommandLine)
+            {
+                parsed.auth = child.get_one::<String>("auth").unwrap().clone();
+            }
+        }
         // Environment bindings remain defaults even on commands that cannot
         // accept an explicit session choice. ArgMatches retains the provenance
         // that the typed fields no longer distinguish.
@@ -271,7 +327,12 @@ impl Args {
             "default_account",
             "api_key",
         ] {
-            if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+            if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine)
+                && !matches.subcommand().is_some_and(|(_, child)| {
+                    child.try_contains_id(id).unwrap_or(false)
+                        && child.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+                })
+            {
                 continue;
             }
             let flag = id.replace('_', "-");
@@ -293,8 +354,8 @@ impl Args {
                 message,
             ));
         }
-        parsed.env = explicit_global_arguments(&argv, "--env", None).unwrap_or_default();
-        if let Some(allow) = explicit_global_arguments(&argv, "--allow", Some(',')) {
+        parsed.env = explicit_arguments(&matches, "env").unwrap_or_default();
+        if let Some(allow) = explicit_arguments(&matches, "allow") {
             parsed.allow = allow;
         }
         // Clap checks conflicts within each command. These flags can arrive
@@ -325,10 +386,24 @@ impl Args {
     /// Build the clap command for help, completion, and grammar introspection.
     ///
     /// An [`Args`] value is constructed only by this type's parse methods.
-    /// Materializing one from this command's `ArgMatches` would bypass the argv
+    /// Materializing one from this command's `ArgMatches` would bypass the
     /// normalization described by [`Self::try_parse_from`].
     pub fn command() -> clap::Command {
-        <CliParser as clap::CommandFactory>::command()
+        let mut command = CliParser::command();
+        let options = command.get_arguments().cloned().collect::<Vec<_>>();
+        for name in ["continue", "serve", "connect", "gateway"] {
+            command = command.mut_subcommand(name, |child| {
+                let offset = child.get_arguments().count();
+                child.args(
+                    options
+                        .iter()
+                        .filter(|arg| command_options(name).contains(&arg.get_id().as_str()))
+                        .enumerate()
+                        .map(|(index, arg)| arg.clone().display_order(offset + index)),
+                )
+            });
+        }
+        command
     }
 
     /// The validated `--tag` value for the session this run creates.
@@ -389,7 +464,7 @@ impl Args {
 
     /// The host `--host` named, for the session a `connect` run creates.
     ///
-    /// Subcommand-scoped rather than global like `--tag`: a create through a
+    /// Subcommand-scoped: a create through a
     /// gateway is the only thing it can point at, and `connect` is the only
     /// mode that reaches one.
     pub fn connect_host(&self) -> Option<&str> {
@@ -470,57 +545,21 @@ impl Args {
     }
 }
 
-/// Collect values for one repeatable global option clap has already accepted.
-///
-/// `None` distinguishes no explicit occurrence from an explicitly supplied
-/// value set. Callers with an environment binding preserve clap's environment
-/// result only in the former case. `value_delimiter` is the field's clap
-/// delimiter and is applied to each recovered occurrence in place.
-fn explicit_global_arguments(
-    argv: &[OsString],
-    option: &str,
-    value_delimiter: Option<char>,
-) -> Option<Vec<String>> {
+/// Preserve explicit repeatable values across the root and subcommand.
+/// Environment defaults apply only when neither scope supplied CLI values.
+fn explicit_arguments(matches: &clap::ArgMatches, id: &str) -> Option<Vec<String>> {
+    let scopes = std::iter::once(matches).chain(matches.subcommand().map(|(_, child)| child));
     let mut values = None;
-    let equals_prefix = format!("{option}=");
-    let mut index = 1;
-    let mut options = true;
-    while index < argv.len() {
-        let argument = &argv[index];
-        if options && argument == "--" {
-            options = false;
-            index += 1;
-            continue;
+    for scope in scopes {
+        if scope.try_contains_id(id).unwrap_or(false)
+            && scope.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+        {
+            values
+                .get_or_insert_with(Vec::new)
+                .extend(scope.get_many::<String>(id).into_iter().flatten().cloned());
         }
-        if options && argument == option {
-            let value = argv
-                .get(index + 1)
-                .unwrap_or_else(|| panic!("clap accepted {option} with a value"))
-                .clone()
-                .into_string()
-                .unwrap_or_else(|_| panic!("clap accepted {option} as a String"));
-            push_global_argument(&mut values, &value, value_delimiter);
-            index += 2;
-            continue;
-        }
-        if options {
-            if let Some(argument) = argument.to_str() {
-                if let Some(value) = argument.strip_prefix(&equals_prefix) {
-                    push_global_argument(&mut values, value, value_delimiter);
-                }
-            }
-        }
-        index += 1;
     }
     values
-}
-
-fn push_global_argument(values: &mut Option<Vec<String>>, value: &str, delimiter: Option<char>) {
-    let values = values.get_or_insert_with(Vec::new);
-    match delimiter {
-        Some(delimiter) => values.extend(value.split(delimiter).map(String::from)),
-        None => values.push(value.to_string()),
-    }
 }
 
 /// What a `connect` run's command line asks for.
@@ -609,7 +648,6 @@ pub enum PrintFormat {
 
 /// Non-conversational subcommands.
 #[derive(Subcommand, Debug)]
-#[command(flatten_help = true)]
 pub enum Command {
     /// List existing conversation sessions for this project.
     ListSessions,
@@ -641,8 +679,7 @@ pub enum Command {
     /// Serve this working directory's sessions headlessly on the control
     /// port, with no terminal UI of its own.
     ///
-    /// The address comes from `--listen` / `AJ_LISTEN`, which are global and
-    /// so may be given on either side of the subcommand. It defaults to the
+    /// The address comes from `--listen` / `AJ_LISTEN`, which may be given on either side of the subcommand. It defaults to the
     /// loopback control port when neither is given, so a bare `aj serve` is
     /// reachable by `aj connect` on the same machine.
     Serve,
@@ -698,8 +735,7 @@ pub enum Command {
     /// request to the host that owns the session, and adds the host-management
     /// endpoints. It holds no sessions of its own.
     ///
-    /// The address comes from `--listen` / `AJ_LISTEN`, which are global and so
-    /// may be given on either side of the subcommand, and defaults to the
+    /// The address comes from `--listen` / `AJ_LISTEN`, which may be given on either side of the subcommand, and defaults to the
     /// loopback control port.
     Gateway {
         /// Read static host addresses from this file instead of
@@ -715,6 +751,89 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subcommand_help_and_parsing_scope_shared_options() {
+        for (command, expected) in [
+            ("list-sessions", vec![]),
+            ("update-models", vec![]),
+            (
+                "continue",
+                vec!["listen", "auth", "allow", "name", "tag", "env"],
+            ),
+            ("serve", vec!["listen", "auth", "allow", "name"]),
+            ("gateway", vec!["listen", "auth", "allow"]),
+            (
+                "connect",
+                vec![
+                    "model_api",
+                    "model_url",
+                    "model_name",
+                    "account",
+                    "default_account",
+                    "speed",
+                    "thinking",
+                    "tag",
+                    "env",
+                ],
+            ),
+        ] {
+            let help = Args::try_parse_from(["aj", command, "--help"]).unwrap_err();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = help.to_string();
+            for id in SCOPED_OPTIONS {
+                let flag = format!("--{}", id.replace('_', "-"));
+                assert_eq!(
+                    help.contains(&flag),
+                    expected.contains(id),
+                    "{command}: {flag}\n{help}"
+                );
+                if !expected.contains(id) {
+                    for before in [true, false] {
+                        let option = if *id == "default_account" {
+                            flag.clone()
+                        } else if *id == "thinking" {
+                            format!("{flag}=high")
+                        } else {
+                            format!("{flag}=unused")
+                        };
+                        let mut argv = vec!["aj"];
+                        if before {
+                            argv.push(&option);
+                        }
+                        argv.push(command);
+                        if command == "connect" {
+                            argv.push("http://host");
+                        }
+                        if !before {
+                            argv.push(&option);
+                        }
+                        assert!(Args::try_parse_from(&argv).is_err(), "{argv:?}");
+                    }
+                }
+            }
+        }
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn scoped_values_keep_explicit_root_choices_and_prefer_explicit_child_choices() {
+        let args = parse(&["aj", "--thinking=high", "connect", "http://host", "--new"]);
+        assert_eq!(args.thinking, Some(ConfigThinkingLevel::High));
+        let args = parse(&[
+            "aj",
+            "--thinking=high",
+            "connect",
+            "http://host",
+            "--new",
+            "--thinking=low",
+        ]);
+        assert_eq!(args.thinking, Some(ConfigThinkingLevel::Low));
+        let args = parse(&["aj", "--auth=open", "serve"]);
+        assert_eq!(args.auth, "open");
+        let args = parse(&["aj", "--auth=open", "serve", "--auth=tailscale"]);
+        assert_eq!(args.auth, "tailscale");
+    }
 
     #[test]
     fn explicit_format_requires_print_mode() {
@@ -779,7 +898,14 @@ mod tests {
                     let result = Args::try_parse_from(&argv);
                     assert_eq!(result.is_ok(), allowed, "{argv:?}: {result:?}");
                     if let Err(error) = result {
-                        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                clap::error::ErrorKind::ArgumentConflict
+                                    | clap::error::ErrorKind::UnknownArgument
+                            ),
+                            "{argv:?}: {error}"
+                        );
                         assert!(error.to_string().contains(flag.split('=').next().unwrap()));
                     }
                 }
@@ -810,6 +936,8 @@ mod tests {
                 assert_eq!(args.thinking, Some(ConfigThinkingLevel::High));
                 assert_eq!(args.speed.as_deref(), Some("fast"));
             }
+            let root = parse(&["aj", "--thinking=off", "connect", "http://host", "--new"]);
+            assert_eq!(root.thinking, Some(ConfigThinkingLevel::Off));
             let args = parse(&["aj", "connect", "http://host", "--new", "--thinking=off"]);
             assert_eq!(args.thinking, Some(ConfigThinkingLevel::Off));
             assert!(Args::try_parse_from(["aj", "continue", "--thinking=off"]).is_err());
@@ -866,6 +994,22 @@ mod tests {
     fn account_flags_refuse_conflicts_and_commands_without_a_session() {
         for argv in [
             vec!["aj", "--account=work", "--default-account"],
+            vec![
+                "aj",
+                "--account=work",
+                "connect",
+                "http://host",
+                "--new",
+                "--default-account",
+            ],
+            vec![
+                "aj",
+                "--default-account",
+                "connect",
+                "http://host",
+                "--new",
+                "--account=work",
+            ],
             vec!["aj", "--api-key=key", "--account=work"],
             vec!["aj", "--api-key=key", "--default-account"],
             vec!["aj", "--api-key=key", "continue", "--account=work"],
@@ -884,7 +1028,7 @@ mod tests {
         }
     }
 
-    /// The control-port flags are global, so a subcommand does not hide them:
+    /// The control-port flags are shared with server commands:
     /// they configure the host a `serve` run is, and both placements read the
     /// same to a user.
     #[test]
@@ -1009,16 +1153,7 @@ mod tests {
         }
     }
 
-    /// A connect run reaches them too, which is what lets the shell say the
-    /// flag has nothing to serve rather than silently dropping it.
-    #[test]
-    fn the_control_port_flags_reach_a_connect_run() {
-        let args = parse(&["aj", "connect", "http://127.0.0.1:6161", "--listen"]);
-        assert_eq!(args.listen.as_deref(), Some(DEFAULT_LISTEN_ADDRESS));
-        assert!(matches!(args.command, Some(Command::Connect { .. })));
-    }
-
-    /// A gateway takes its address from the same global flag a host does, and
+    /// A gateway takes its address from the same listen flag a host does, and
     /// its configuration file from a flag of its own.
     #[test]
     fn the_gateway_subcommand_takes_a_listen_address_and_a_config_file() {
@@ -1048,7 +1183,7 @@ mod tests {
         assert_eq!(bare.auth, "local", "and the gate defaults closed here too");
     }
 
-    /// `--tag` is global, so a `connect --new` can name the session it asks
+    /// `--tag` is shared with `connect`, so it can name the session it asks
     /// the host to create without a second spelling of the flag.
     #[test]
     fn the_tag_flag_parses_on_either_side_of_a_subcommand() {
@@ -1068,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_env_is_global_repeatable_and_splits_only_the_first_equals() {
+    fn launch_env_is_repeatable_and_splits_only_the_first_equals() {
         let invocations: [&[&str]; 2] = [
             &[
                 "aj",
@@ -1076,11 +1211,15 @@ mod tests {
                 "AJ_CASE=upper,comma",
                 "--env",
                 "aj_case=lower=tail",
-                "serve",
+                "connect",
+                "http://host",
+                "--new",
             ],
             &[
                 "aj",
-                "serve",
+                "connect",
+                "http://host",
+                "--new",
                 "--env",
                 "AJ_CASE=upper,comma",
                 "--env",
@@ -1107,7 +1246,9 @@ mod tests {
             "aj",
             "--env",
             "BEFORE=one",
-            "list-sessions",
+            "connect",
+            "http://host",
+            "--new",
             "--env=AFTER=two=tail",
         ]);
         assert_eq!(
@@ -1120,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn long_help_keeps_product_description_and_lists_recovered_globals_once() {
+    fn long_help_keeps_product_description_and_lists_shared_options_once() {
         let help = Args::command().render_long_help().to_string();
         assert_eq!(help.matches("--env <KEY=VALUE>").count(), 1, "{help}");
         assert_eq!(help.matches("--allow <ALLOW>").count(), 1, "{help}");
@@ -1181,7 +1322,9 @@ mod tests {
             "aj",
             "--env",
             "MISSING",
-            "list-sessions",
+            "connect",
+            "http://host",
+            "--new",
             "--env",
             "OK=value",
         ]);
@@ -1197,7 +1340,9 @@ mod tests {
             "aj",
             "--env",
             "KEY=first",
-            "list-sessions",
+            "connect",
+            "http://host",
+            "--new",
             "--env",
             "KEY=second",
         ]);
@@ -1224,7 +1369,7 @@ mod tests {
         }
     }
 
-    /// Thinking is global, so its spelling reads the same on either side of a
+    /// Thinking is shared with connect and reads the same on either side of a
     /// subcommand.
     #[test]
     fn the_thinking_flag_parses_on_either_side_of_connect() {
@@ -1316,7 +1461,7 @@ mod tests {
         assert!(!parse(&["aj", "--tag", "two\nlines"]).has_launch_tag());
     }
 
-    /// `--name` is global so it reads the same on either side of a
+    /// `--name` is shared with host commands and reads the same on either side of a
     /// subcommand, the way the control-port flags do.
     ///
     /// Nothing here asserts what an absent flag yields: `AJ_NAME` in the
@@ -1448,7 +1593,7 @@ mod tests {
                 "http://host:6161",
                 "--new",
             ],
-            vec!["aj", "hello", "--tag", "t", "continue", "ID"],
+            vec!["aj", "hello", "--name", "host", "continue", "ID"],
         ] {
             let args = parse(&argv);
             assert!(

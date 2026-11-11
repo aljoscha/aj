@@ -103,7 +103,8 @@ must be upgraded before using edited sessions.
 
 ## Creation defaults
 
-`--env KEY=VALUE` remains a repeatable global launch flag. It splits at the
+`--env KEY=VALUE` is a repeatable launch flag on local runs, `continue`,
+and `connect`. It splits at the
 first equals sign and refuses duplicate keys, missing equals signs, or invalid
 entries. It has no process-environment binding and no `config.toml` equivalent.
 
@@ -117,7 +118,7 @@ On continue or attach, the existing session keeps its recorded branch map. The
 launch map stays available for later creates, and a notice explains that the
 flag did not edit the resumed session. Use the environment window for a
 conscious edit. `serve` and `gateway` refuse `--env` because those invocations do
-not create a session themselves.
+not create a session themselves. Utility commands refuse it too.
 
 Remote creates carry an optional top-level `env` map in `CreateSessionRequest`.
 The host validates the map before minting and records it as the initial branch
