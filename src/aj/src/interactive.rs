@@ -27143,56 +27143,6 @@ mod tests {
                     .selected,
                 None
             );
-            auth.remove_account(other, "work").await.unwrap();
-            let overview = world.control.credential_overview(&session).await.unwrap();
-            assert!(!overview.stored.contains_key(other));
-            assert!(
-                !overview
-                    .statuses
-                    .iter()
-                    .any(|status| status.provider_id == other)
-            );
-            let orphan = world.control.accounts(&session, Some(other)).await.unwrap();
-            assert_eq!(orphan.selected.as_deref(), Some("work"));
-            assert!(
-                orphan.accounts.is_empty(),
-                "the pin outlives its last stored account"
-            );
-            let request = pick_credential(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut writer,
-                &root,
-                CommandAction::OpenAccountSelector,
-                other,
-            )
-            .await;
-            assert_eq!(
-                request.action,
-                AuthPickerAction::SelectAccount {
-                    provider: other.into(),
-                    account: None
-                }
-            );
-            apply_auth_request(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut login_session,
-                &tx,
-                request,
-            )
-            .await;
-            assert_eq!(
-                world
-                    .control
-                    .accounts(&session, Some(other))
-                    .await
-                    .unwrap()
-                    .selected,
-                None
-            );
 
             let mut current = None;
             for (index, expected) in [

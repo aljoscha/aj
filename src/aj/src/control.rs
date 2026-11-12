@@ -222,9 +222,6 @@ impl Control {
         additional_providers: &[String],
     ) -> Result<(aj_wire::CredentialOverview, Vec<AccountList>), ControlError> {
         let overview = self.credential_overview(session).await?;
-        // Pins outlive stored credentials. Keep their providers reachable so
-        // the user can clear a pin after its last account has been removed.
-        let settings = self.session_info(session).await?.settings;
         let providers: std::collections::BTreeSet<_> = overview
             .statuses
             .iter()
@@ -236,8 +233,6 @@ impl Control {
                     .iter()
                     .map(|provider| provider.id.as_str()),
             )
-            .chain(settings.accounts.keys().map(String::as_str))
-            .chain(settings.model.as_ref().map(|model| model.api.as_str()))
             .chain(additional_providers.iter().map(String::as_str))
             .collect();
         // One read per provider, all in flight at once. Results keep the
