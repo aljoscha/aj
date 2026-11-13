@@ -1202,7 +1202,7 @@ mod tests {
             );
             assert_eq!(
                 run.oracle.model_key,
-                ("anthropic".into(), "claude-fable-5-1".into())
+                ("anthropic".into(), "claude-fable-5-2".into())
             );
         }
     }
@@ -1237,7 +1237,7 @@ mod tests {
         let oracle = startup.oracle.clone();
         assert_eq!(
             oracle.model_key,
-            ("anthropic".into(), "claude-fable-5-1".into())
+            ("anthropic".into(), "claude-fable-5-2".into())
         );
         assert_eq!(oracle.thinking, Some(ThinkingConfig::XHigh));
         let auth = empty_auth(&dir);

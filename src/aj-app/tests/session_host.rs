@@ -508,7 +508,7 @@ fn user_model_saves_pin_both_keys_and_publish_only_after_success() {
                     "oracle_model",
                     "oracle_model_api",
                     "oracle_model_name",
-                    "claude-fable-5-1",
+                    "claude-fable-5-2",
                 ),
             ] {
                 let mut selected = scripted_model_info();

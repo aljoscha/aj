@@ -629,7 +629,7 @@ pub struct Config {
     pub oracle_model_api: Option<String>,
     /// Custom Oracle model endpoint URL.
     pub oracle_model_url: Option<String>,
-    /// Oracle model name. Defaults to `claude-fable-5-1`.
+    /// Oracle model name. Defaults to `claude-fable-5-2`.
     pub oracle_model_name: Option<String>,
     /// Oracle thinking level, independent of the main agent.
     pub oracle_thinking: Option<ConfigThinkingLevel>,
@@ -755,7 +755,7 @@ impl Default for Config {
             verbosity: None,
             oracle_model_api: Some("anthropic".into()),
             oracle_model_url: None,
-            oracle_model_name: Some("claude-fable-5-1".into()),
+            oracle_model_name: Some("claude-fable-5-2".into()),
             oracle_thinking: Some(ConfigThinkingLevel::XHigh),
             oracle_verbosity: None,
             theme: None,
@@ -1893,7 +1893,7 @@ mod tests {
         assert!(config.oracle_model_url.is_none());
         assert_eq!(
             config.oracle_model_name.as_deref(),
-            Some("claude-fable-5-1")
+            Some("claude-fable-5-2")
         );
         assert_eq!(config.thinking, Some(ConfigThinkingLevel::XHigh));
         assert_eq!(

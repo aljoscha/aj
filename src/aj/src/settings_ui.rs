@@ -2850,7 +2850,7 @@ mod tests {
         use crate::test_support::{draw_ctx, rows};
         let defaults = SettingsValues::from_config(&Config::default());
         assert_eq!(defaults.values["model_name"], "claude-opus-5");
-        assert_eq!(defaults.values["oracle_model_name"], "claude-fable-5-1");
+        assert_eq!(defaults.values["oracle_model_name"], "claude-fable-5-2");
         let model_rows = build_setting_rows(&defaults, &defaults, false, &BTreeSet::new())
             .into_iter()
             .filter(|row| row.id == MODEL_SETTING_ID || row.id == "oracle_model")
@@ -2858,7 +2858,7 @@ mod tests {
         let mut list = SettingList::new(model_rows, styles(), false);
         let page = rows(&list.draw(&draw_ctx(100, Some(18)))).join("\n");
         assert!(page.contains("anthropic/claude-opus-5"), "{page}");
-        assert!(page.contains("anthropic/claude-fable-5-1"), "{page}");
+        assert!(page.contains("anthropic/claude-fable-5-2"), "{page}");
         let configured = SettingsValues::from_config(&Config {
             model_api: Some("openai".into()),
             model_name: Some("different-main".into()),
@@ -2885,7 +2885,7 @@ mod tests {
                 .find(|row| row.id == "oracle_model")
                 .unwrap()
                 .clear_to,
-            "anthropic/claude-fable-5-1"
+            "anthropic/claude-fable-5-2"
         );
         let oracle: Vec<_> = settings
             .into_iter()
@@ -2904,7 +2904,7 @@ mod tests {
         let mut list = SettingList::new(oracle, styles(), false);
         let page = rows(&list.draw(&draw_ctx(100, Some(18)))).join("\n");
         assert!(page.contains("oracle_model"));
-        assert!(page.contains("anthropic/claude-fable-5-1"), "{page}");
+        assert!(page.contains("anthropic/claude-fable-5-2"), "{page}");
         assert!(!page.contains("Follow main"));
         assert!(!page.contains("inherits the main"));
     }
