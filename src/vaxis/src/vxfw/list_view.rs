@@ -271,6 +271,19 @@ impl ListGeometry {
         }
     }
 
+    /// Makes room for `count` unmeasured items in front, keeping every
+    /// existing measurement with its item.
+    fn prepend(&mut self, count: usize) {
+        let old = std::mem::take(&mut self.heights);
+        *self = ListGeometry::new();
+        self.set_len(count + old.len());
+        for (i, height) in old.into_iter().enumerate() {
+            if let Some(height) = height {
+                self.set_measured(count + i, height);
+            }
+        }
+    }
+
     /// Records item `i`'s measured `height`, replacing any prior measurement.
     ///
     /// A no-op when `i` is out of range. Re-measuring an already-measured index
@@ -377,6 +390,10 @@ pub struct ListView {
     /// Set when the exact item count is known, which lets cursor moves and
     /// jumps avoid walking the builder.
     pub item_count: Option<u32>,
+    /// Lines of content that exist above the first item but are not in the
+    /// source yet, as the owner estimates them. Only the scroll bar reads
+    /// this: it sizes and places the thumb as if they were there.
+    pub lines_above: u32,
     scroll: Scroll,
     /// Viewport height (rows) the last [`draw`](Widget::draw) laid out
     /// against. `None` before the first draw. Page-scroll callers scale this
@@ -402,6 +419,7 @@ impl ListView {
             anchor_short_to_bottom: false,
             wheel_scroll: 1,
             item_count: None,
+            lines_above: 0,
             scroll: Scroll::default(),
             last_viewport_height: None,
             geometry: ListGeometry::new(),
@@ -581,6 +599,19 @@ impl ListView {
             top: cursor,
             ..Scroll::default()
         };
+    }
+
+    /// Tells the list its source gained `count` items in front of the ones
+    /// it had. The viewport, the cursor and the measured extents stay with
+    /// the items they were on.
+    pub fn items_prepended(&mut self, count: u32) {
+        self.cursor += count;
+        self.scroll.top += count;
+        if let Some(known) = &mut self.item_count {
+            *known += count;
+        }
+        self.geometry
+            .prepend(usize::try_from(count).expect("count fits usize"));
     }
 
     /// Scrolls to the bottom when the item count is known, preserving the
@@ -1116,8 +1147,13 @@ impl ScrollableView for ListView {
         if self.geometry.len() == 0 {
             None
         } else {
-            Some(u32::try_from(self.geometry.total()).unwrap_or(u32::MAX))
+            let total = self.geometry.total() + u64::from(self.lines_above);
+            Some(u32::try_from(total).unwrap_or(u32::MAX))
         }
+    }
+
+    fn lines_above(&self) -> u32 {
+        self.lines_above
     }
 
     fn viewport_top_line(&self) -> Option<u32> {
@@ -1127,7 +1163,7 @@ impl ScrollableView for ListView {
         let top = usize::try_from(self.scroll.top).expect("top fits usize");
         // `offset` is reconciled to `>= 0` after a draw. Clamp defensively.
         let offset = u64::try_from(self.scroll.offset.max(0)).expect("offset fits u64");
-        let line = self.geometry.offset_for_index(top) + offset;
+        let line = self.geometry.offset_for_index(top) + offset + u64::from(self.lines_above);
         Some(u32::try_from(line).unwrap_or(u32::MAX))
     }
 
@@ -1135,7 +1171,9 @@ impl ScrollableView for ListView {
         if self.geometry.len() == 0 {
             None
         } else {
-            let idx = self.geometry.item_at_line(u64::from(line));
+            let idx = self
+                .geometry
+                .item_at_line(u64::from(line.saturating_sub(self.lines_above)));
             Some(u32::try_from(idx).unwrap_or(u32::MAX))
         }
     }

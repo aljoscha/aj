@@ -110,6 +110,12 @@ pub trait ScrollableView: Widget {
     fn item_at_line(&self, _line: u32) -> Option<u32> {
         None
     }
+    /// Lines of content above the first item that the view does not hold
+    /// yet. They count toward `content_extent` and `viewport_top_line`, and
+    /// they mean the first item is not the top of the content.
+    fn lines_above(&self) -> u32 {
+        0
+    }
 }
 
 /// A scrollable view with draggable, hoverable scroll bars.
@@ -284,16 +290,17 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
 
         // Vertical scroll bar. Read the reconciled scroll state through the
         // shared handle, the bar and thumb geometry derive from it.
-        let (scroll_top, has_more_vertical, content_extent, viewport_top_line) = {
+        let (scroll_top, has_more_vertical, content_extent, viewport_top_line, at_top) = {
             let view = self.view.borrow();
             (
                 view.scroll_top(),
                 view.has_more_below(),
                 view.content_extent(),
                 view.viewport_top_line(),
+                view.scroll_top() == 0 && view.lines_above() == 0,
             )
         };
-        if self.draw_vertical_scrollbar && !(scroll_top == 0 && !has_more_vertical) {
+        if self.draw_vertical_scrollbar && !(at_top && !has_more_vertical) {
             // The bar spans the scroll view, which is one row shorter than the
             // widget when the horizontal bar is drawn. The thumb must be placed
             // within this height, not the full `max.height`, or its bottom row
@@ -316,7 +323,7 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                 let content_extent_f = num::u32_to_f32(total);
                 let thumb_height_f = (widget_height_f * widget_height_f / content_extent_f).round();
                 let thumb_height = num::f32_to_u16(thumb_height_f.max(1.0));
-                let thumb_top = if scroll_top == 0 {
+                let thumb_top = if at_top {
                     0
                 } else if has_more_vertical {
                     let top_line_f = num::u32_to_f32(top_line);
