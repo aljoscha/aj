@@ -1,0 +1,20 @@
+# Modified for the standalone AJ extraction: omit unused host integrations (Apache-2.0).
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-utils-output-truncation"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-code-mode-protocol = { workspace = true }
+codex-utils-string = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lib]
+doctest = false

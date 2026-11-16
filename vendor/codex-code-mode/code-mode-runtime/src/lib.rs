@@ -1,4 +1,6 @@
+// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
 mod cell_actor;
+mod output;
 mod runtime;
 mod service;
 mod session_runtime;

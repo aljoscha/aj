@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -193,8 +194,12 @@ class ImportContract(unittest.TestCase):
         self.assertTrue(any(m.get('tool_mode') != 'code_mode_only' for m in models))
 
     def test_parent_can_depend_on_both_nested_workspace_crates(self):
+        override = tomllib.loads((self.vendor / 'Cargo.toml').read_text())['patch']['crates-io']['v8']
+        self.assertEqual(override, tomllib.loads((ROOT / 'Cargo.toml').read_text())['patch']['crates-io']['v8'])
         (self.root / 'Cargo.toml').write_text(
-            '[workspace]\nmembers = ["app"]\nexclude = ["vendor/codex-code-mode"]\nresolver = "3"\n')
+            '[workspace]\nmembers = ["app"]\nexclude = ["vendor/codex-code-mode"]\nresolver = "3"\n'
+            '[patch.crates-io]\nv8 = { git = ' + json.dumps(override['git'])
+            + ', rev = ' + json.dumps(override['rev']) + ' }\n')
         app = self.root / 'app'
         (app / 'src').mkdir(parents=True)
         (app / 'src/lib.rs').write_text('')
@@ -207,6 +212,9 @@ class ImportContract(unittest.TestCase):
                                 cwd=self.root, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         metadata = json.loads(result.stdout)
+        v8 = next(p for p in metadata['packages'] if p['name'] == 'v8')
+        self.assertIn(override['rev'], v8['source'])
+        self.assertFalse((self.vendor / 'code-mode-runtime/src/ui').exists())
         imported = [p for p in metadata['packages'] if p['name'].startswith('codex-code-mode-')]
         self.assertEqual(len(imported), 2)
         for package in imported:
@@ -214,7 +222,7 @@ class ImportContract(unittest.TestCase):
             self.assertEqual(package['edition'], '2024')
             self.assertEqual(package['version'], '0.0.0')
             self.assertNotIn(package['id'], metadata['workspace_members'])
-        self.assertFalse(any(p['name'] in ('tonic', 'prost', 'protoc-bin-vendored')
+        self.assertFalse(any(p['name'] in ('tonic', 'prost', 'protoc-bin-vendored', 'codex-plugin-host')
                              for p in metadata['packages']))
 
 

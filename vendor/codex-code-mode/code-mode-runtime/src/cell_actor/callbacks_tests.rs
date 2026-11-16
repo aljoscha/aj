@@ -1,3 +1,4 @@
+// Modified for AJ: acknowledged stored-value completion (Apache-2.0).
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
@@ -40,8 +41,7 @@ impl CellHost for PanickingCallbackHost {
     async fn commit_completion(
         &self,
         _stored_value_writes: HashMap<String, Arc<JsonValue>>,
-        _event: CellEvent,
-        _pending_initial_yield_items: Option<Vec<crate::session_runtime::OutputItem>>,
+        _event: impl FnOnce(Option<String>) -> CellEvent + Send,
         _cell_state: Arc<CellState>,
     ) -> CompletionCommit {
         panic!("unexpected completion commit");

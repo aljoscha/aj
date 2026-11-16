@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+pub(crate) use codex_code_mode_protocol::FunctionCallOutputContentItem as OutputItem;
 use opentelemetry::context::FutureExt;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
@@ -18,11 +19,9 @@ pub(crate) use self::types::CellEvent;
 pub(crate) use self::types::CellId;
 pub(crate) use self::types::CreateCellRequest;
 pub(crate) use self::types::Error;
-pub(crate) use self::types::ImageDetail;
 pub(crate) use self::types::NestedToolCall;
 pub(crate) use self::types::Observation;
 pub(crate) use self::types::ObserveMode;
-pub(crate) use self::types::OutputItem;
 pub(crate) use self::types::SessionRuntimeDelegate;
 pub(crate) use self::types::ToolDefinition;
 pub(crate) use self::types::ToolKind;
@@ -56,6 +55,7 @@ struct Inner {
 }
 
 impl SessionRuntime {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::new_with_task_failure_handler(/*task_failure_handler*/ None)
     }
@@ -170,7 +170,7 @@ impl SessionRuntime {
     fn allocate_cell_id(&self) -> Result<CellId, Error> {
         self.inner
             .next_cell_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next_cell_id| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next_cell_id| {
                 next_cell_id.checked_add(1)
             })
             .map(|cell_id| CellId::new(cell_id.to_string()))
@@ -307,22 +307,21 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, Arc<JsonValue>>,
-        mut event: CellEvent,
-        pending_initial_yield_items: Option<Vec<OutputItem>>,
+        event: impl FnOnce(Option<String>) -> CellEvent + Send,
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
         let cancellation_token = cell_state.cancellation_token();
         let mut stored_values = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                return CompletionCommit::Rejected(event);
+                return CompletionCommit::Rejected;
             }
             stored_values = self.inner.stored_values.lock() => stored_values,
         };
         if !cell_state.reserve_completion() {
-            return CompletionCommit::Rejected(event);
+            return CompletionCommit::Rejected;
         }
-        // Keep snapshots and other commits behind the acknowledgement. Once reserved,
+        // Snapshots and other commits wait for acknowledgment. Once reserved,
         // termination and root cancellation must wait for this callback to finish.
         let saved = if stored_value_writes.is_empty() {
             Ok(())
@@ -331,27 +330,19 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                 .store(self.cell_id.clone(), stored_value_writes.clone())
                 .await
         };
-        let apply_writes = match saved {
-            Ok(()) => true,
-            Err(error) => {
-                if let CellEvent::Completed { error_text, .. } = &mut event {
-                    let message = format!("stored values were not saved: {error}");
-                    match error_text {
-                        Some(original) => {
-                            original.push('\n');
-                            original.push_str(&message);
-                        }
-                        None => *error_text = Some(message),
-                    }
+        let store_error = saved
+            .err()
+            .map(|error| format!("stored values were not saved: {error}"));
+        let apply_writes = store_error.is_none();
+        cell_state.commit_completion(
+            || event(store_error),
+            || {
+                if apply_writes {
+                    stored_values.extend(stored_value_writes);
                 }
-                false
-            }
-        };
-        cell_state.commit_completion(event, pending_initial_yield_items, || {
-            if apply_writes {
-                stored_values.extend(stored_value_writes);
-            }
-        })
+                drop(stored_values);
+            },
+        )
     }
 
     async fn closed(&self) {

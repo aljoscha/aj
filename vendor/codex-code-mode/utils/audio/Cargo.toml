@@ -1,0 +1,23 @@
+# Modified for the standalone AJ extraction: omit unused host integrations (Apache-2.0).
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-utils-audio"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+codex-code-mode-protocol = { workspace = true }
+codex-utils-string = { workspace = true }
+symphonia = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lib]
+doctest = false

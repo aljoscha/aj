@@ -164,3 +164,7 @@ opt-level = 3
 # Release builds are part of the local edit-install loop, not only distribution
 # builds. Preserve optimized output while reusing unchanged code generation.
 incremental = true
+
+# Match the bindings and native archive pinned by the Code Mode extraction.
+[patch.crates-io]
+v8 = { git = "https://github.com/openai-oss-forks/rusty_v8.git", rev = "90a65f887a0c0f048f3784afbcb320b373c8a2e0" }

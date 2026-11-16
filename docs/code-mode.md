@@ -22,7 +22,8 @@ text(result.stdout);
 
 No imports, Node, filesystem, or networking are provided by the evaluator.
 Use AJ's tools for those operations. Only explicitly emitted output reaches
-the model. Text and image output are supported. AJ does not support audio
+the model. `content()` forwards MCP content blocks or an iterable of blocks.
+Text and image output are supported. AJ does not support audio
 tool output. `notify()` displays a notice and queues model context for the
 next inference boundary rather than sending duplicate tool results.
 
@@ -51,6 +52,13 @@ stderr, exit status, truncation and background-task metadata. Text reads
 return unnumbered text plus line and continuation metadata. Other tools
 return content blocks, including images that can be forwarded with `image()`.
 Tool failures reject the JavaScript call and can be caught with `try/catch`.
+
+The runtime bounds buffered output and applies each `exec` or `wait` output
+budget, including `wait` with `terminate: true`. Oversized text retains its
+beginning and end. Loss notices and execution status remain visible even with
+a zero output budget. A truncated error still marks the script as failed.
+`exit()` stops the whole cell immediately, including catch/finally handlers,
+and commits only writes made before it was called.
 
 ## Lifetime and visibility
 
@@ -104,7 +112,8 @@ Session shutdown owns their cancellation and waits for callbacks to settle.
 Run `python3 scripts/bootstrap-codex-code-mode-v8.py` before ordinary Cargo
 commands in a fresh checkout. Native GNU Linux and macOS archive/binding pairs
 are pinned for x86_64 and aarch64. Cross-compilation is not configured. No Node
-installation is required at runtime. V8 is linked into AJ even when the setting
+installation is required at runtime. The extracted runtime excludes Codex's
+independent UI/plugin runner. V8 is linked into AJ even when the setting
 is off.
 
 [Vendor documentation](../third-party/codex-code-mode/README.md) describes

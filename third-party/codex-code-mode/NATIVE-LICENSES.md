@@ -1,80 +1,90 @@
 # Native V8 redistribution evidence
 
-**The external dependency notice gaps are closed, but binary release is not cleared.**
+**Native notice evidence is refreshed, but binary release is not cleared.**
 Do not treat the Rust crate's `MIT` metadata or Codex's `Apache-2.0` license as
 covering the statically linked native archive. Shipping an AJ binary requires
 the packaging and final-link checks below. This is bounded redistribution
 evidence, not a reproducible-build attestation or legal opinion.
 
-## Provenance
+## Provenance and scope
 
-This investigation is specific to Codex commit
-`44984d20817fc58026a8bbccf053e288c6897c8f` and its four Darwin/GNU Linux
-pointer-compression/sandbox archive and binding pairs for Rusty V8 150.4.0.
-`licenses/provenance.json` records their URLs and SHA-256 hashes from
-`MODULE.bazel`, the evidence-file hashes, and each collected file's origin.
-The native bootstrap verifies these artifact hashes, not license completeness.
+This review covers Codex commit `75fc67e8f4284a669eebd90ab6bc9ef7697e876e`,
+Rusty V8 152.2.0 from the OpenAI fork, and the four Darwin/GNU Linux
+pointer-compression/sandbox archive and binding pairs consumed by AJ.
+`licenses/provenance.json` records their declared URLs and SHA-256 hashes from
+`MODULE.bazel`, source/build evidence hashes, and each collected file's origin.
+This licensing review did not download or inspect the new native artifacts.
+The native bootstrap checks artifact hashes, not license completeness.
+Windows and musl artifacts now present upstream are outside this review.
 
-The pinned `third_party/v8/README.md`, `BUILD.bazel`, and
-`.github/workflows/rusty-v8-release.yml` describe Codex's Bazel-produced native
-archives. These are not simply the binaries from denoland/rusty_v8's releases.
-The graph incorporates ICU and custom libc++/libc++abi runtime objects.
-The native bytes are identified by the recorded digests, but this investigation
-does not independently reproduce their builds or attest their complete contents.
+Verified source downloads:
 
-Verified sources:
+- V8 15.2.124.1 archive, SHA-256
+  `68d3791b8dbba906cfff9a3e35738d81747c66f4ba9a37fa99f008ea3b71cb32`,
+  matches the `MODULE.bazel` integrity. All root and non-test subtree
+  `LICENSE*` files are collected under `licenses/v8/`. The newly present
+  disarm and fadec licenses are retained conservatively. Codex's engine importer
+  says neither package is in its closure. V8's former `third_party/glibc`
+  directory is absent, so its obsolete wrapper notices were removed.
+- Rusty V8 fork archive at `90a65f887a0c0f048f3784afbcb320b373c8a2e0`,
+  SHA-256 `b0b188d1f1d851abd78337818a28a15e84f143b082ce966976e9206617684373`,
+  matches `MODULE.bazel`. Its MIT `LICENSE` is unchanged. The collected
+  `Cargo.toml` identifies version 152.2.0. This replaces the former crates.io
+  150.4.0 archive and its `.cargo_vcs_info.json`, not just its version label.
+- libc++, libc++abi, llvm-libc, ICU, and FP16 notices were fetched from their
+  exact Chromium Git revisions. Decoded-byte hashes and immutable URLs are
+  recorded. libc++ and llvm-libc revisions changed, but their license texts
+  did not. libc++abi remains at the previous revision.
+- Highway, fast_float, and the hermetic LLVM override archives were downloaded
+  and matched to the new graph's hashes. Unchanged Abseil, simdutf and Dragonbox
+  notices retain their prior collection evidence. Their exact archive hashes
+  or Git revisions were compared with the new declarations.
 
-- V8 15.0.245.2 source archive, SHA-256
-  `164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5`,
-  matching the integrity value in pinned `MODULE.bazel`. All root and non-test
-  subtree `LICENSE*` files present in that archive are copied under `licenses/v8/`.
-  This does not include external repositories fetched by its build graph.
-- The crates.io `v8-150.4.0.crate`, SHA-256
-  `42a978ff11f15b24e5c05a7123cf2b68f41e763546699781a924ef4e2cf43a49`,
-  also matches `MODULE.bazel`. Its `.cargo_vcs_info.json` identifies Rusty V8
-  commit `5c15a6995c9bb4bacd3e341b59fff32c909c80bf`. The MIT license was
-  retrieved from that exact commit, not a moving branch.
-- libc++, libc++abi, and llvm-libc license texts were retrieved from the exact
-  Chromium Git revisions pinned in `MODULE.bazel`. ICU's full license and
-  third-party notice text comes from the revision in `patches/v8_module_deps.patch`.
-  Their immutable retrieval URLs and decoded-byte hashes are in the manifest.
+## Native source graph and dependencies
 
-## External native dependencies
+The old `v8_module_deps.patch` and `v8_bazel_rules.patch` are no longer the
+source of this graph. `third_party/v8/engine_repository.bzl` imports filegroups
+from V8's pinned BUILD, applies four patches, and replaces its MODULE/root BUILD
+with Codex-owned policy. `engine.BUILD.bazel` supplies the engine targets.
+`dependencies.bzl`, `abseil_repository.bzl`, and dependency BUILD overlays own
+the external sources. These files, artifact profiles, native runtime rules,
+patches, checksum manifests, and release workflow are hashed in the manifest.
 
-`patches/v8_module_deps.patch` supplies the external repositories and
-`patches/v8_bazel_rules.patch` connects them to V8's libraries. The four
-Darwin/GNU Linux source archive targets in `third_party/v8/BUILD.bazel` depend
-on `v8_150_4_0_binding` (which uses `@v8//:core_lib_icu`) and the custom C++
-runtime. The workflow's matching pointer-compression/sandbox matrix uses these
-Bazel targets. Header-only dependencies count here, even without named archive
-members.
+The workflow selects `rusty_v8_sandbox_release_pair_<target>` for the reviewed
+artifacts. `artifact_profile.bzl` selects pointer compression, sandboxing and
+Chromium's custom libc++ runtime for these release profiles. The binding target
+uses `@v8//:core_lib_icu`, and runtime objects are folded into the static archive.
+The ordinary Bazel source profile instead uses the workspace C++ runtime on
+Darwin/Linux. It must not be confused with the published release profile.
+The pinned workflow describes the producer path, not a proof that the published
+bytes were built from this checkout or a complete inventory of their contents.
 
 | Component | Resolved source | Collected files under `licenses/` |
 | --- | --- | --- |
 | Abseil | 20250814.1 | `abseil/LICENSE`, `AUTHORS` |
-| Highway | 1.2.0 | `highway/LICENSE`, `LICENSE-BSD3` |
+| Highway | `2607d3b5b0113992fe84d3848859eae13b3b52c1` | `highway/LICENSE` |
 | simdutf | 7.7.0 | `simdutf/LICENSE-APACHE`, `LICENSE-MIT`, `AUTHORS`, `isadetection-NOTICE` |
-| fast_float | 8.0.2 | `fast_float/LICENSE-APACHE`, `LICENSE-MIT`, `LICENSE-BOOST`, `AUTHORS` |
+| fast_float | 8.2.10 | `fast_float/LICENSE-APACHE`, `LICENSE-MIT`, `LICENSE-BOOST`, `AUTHORS` |
 | Dragonbox | `beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44` | `dragonbox/LICENSE-Apache2-LLVM`, `LICENSE-Boost` |
-| FP16 | `3d2de1816307bac63c16a297e8c4dc501b4076df` | `fp16/LICENSE` |
+| FP16 | `782eea126dc5c755827be751a099eb01826175cf` | `fp16/LICENSE` |
+| ICU | `d578f2e8b7bd5938e21cfb6bf15c079e0aa5b738` | `icu/LICENSE` |
+| libc++ | `b16984ce99c702355a5b2b4c52574e82cec41fb9` | `libcxx/LICENSE.TXT` |
+| libc++abi | `8f11bb1d4438d0239d0dfc1bd9456a9f31629dda` | `libcxxabi/LICENSE.TXT` |
+| llvm-libc | `75ae50cd48c8a9d70f552ccff040029968778da9` | `libc/LICENSE.TXT` |
 
-Abseil's requested V8 module version is 20250814.0, but Codex's lockfile selects
-20250814.1's `source.json`. The collected registry metadata matches the
-lockfile's SHA-256 values, and the downloaded source matches that metadata's
-integrity. The root override patches Windows thread identity without pinning
-an older version. Highway, simdutf, and fast_float archive bytes match the
-SHA-256 values in the dependency patch. Dragonbox and FP16 notices were checked
-against the exact Chromium Git revisions, not V8 wrapper licenses. Every
-collected byte hash and source URL is in `licenses/provenance.json`.
+V8's private Abseil now uses a direct hash-pinned archive, a lifetime-capture
+patch and the `codex_v8_lts_20250814` namespace. The retained Abseil registry
+metadata is prior corroborating evidence, not the new V8 resolution mechanism.
+Highway's single LICENSE now includes Apache, BSD and CC0 terms, replacing the
+separate LICENSE-BSD3 file. ICU's full updated third-party notice text is copied.
+Header-only dependencies count even without named archive members.
 
-The root license/author files were collected from all six sources. No separate
-NOTICE file was present in these source archives. simdutf's compiled header
-`include/simdutf/internal/isadetection.h` contains an additional BSD-3-Clause
-notice that requires binary attribution. `isadetection-NOTICE` preserves its
-entire opening comment, lines 1–44, byte-for-byte. Its full-source hash and
-extraction range are recorded. Benchmark-only simdutf competitor licenses and
-Dragonbox's unreferenced `subproject/3rdparty` are not native graph inputs and
-are not copied. A full source-archive redistribution must preserve those too.
+simdutf's compiled `include/simdutf/internal/isadetection.h` contains an additional
+BSD-3-Clause notice. `isadetection-NOTICE` retains its opening comment, lines
+1–44, byte-for-byte, with the source hash and range recorded. Its source pin
+has not changed. Benchmark-only competitor licenses and Dragonbox's unreferenced
+`subproject/3rdparty` are not native graph inputs. Full source redistribution
+must preserve those too. This collection is not a full source distribution.
 
 ## Established notice requirements
 
@@ -91,7 +101,8 @@ are not copied. A full source-archive redistribution must preserve those too.
 - V8's other subdirectory licenses have their own terms. The collected set is
   deliberately broader than a proven list of linked components. Presence here
   does not establish inclusion in a particular native binary.
-- Abseil is Apache-2.0. Highway offers Apache-2.0/BSD-3-Clause, simdutf offers
+- Abseil is Apache-2.0. Highway offers Apache-2.0/BSD-3-Clause with a CC0 exception for
+  `hwy/contrib/random/random-inl.h`, simdutf offers
   Apache-2.0/MIT, fast_float offers Apache-2.0/MIT/Boost, and Dragonbox offers
   Apache-2.0 with LLVM exceptions/Boost. The alternative texts are retained,
   not combined into a new license. FP16 is MIT. Include the simdutf embedded
@@ -102,68 +113,68 @@ The notice files here are unmodified upstream texts. `licenses/evidence/`
 contains registry/build evidence, not a claim that every toolchain source is
 linked. This document summarizes evidence and does not replace license terms.
 
-## glibc: trig fork versus system runtime
+## glibc and system runtime limitations
 
-The local `native/archive.a.gz` matches the x86_64 GNU Linux artifact digest
-`a35c75d1f26e6a983885a45b33490a4ebe54f05050568b32b89cfb421b30b583`.
-Its decompressed archive digest is
-`82e3368ef77a5427d781104c3903fcffadfaef1fc324d55162cfa598a509e927`.
-`ar t` reports 1,810 members. GNU `nm -A -C` reads it without diagnostics.
-Commands, tool versions, and representative observations are in the manifest.
+The previous x86_64 GNU Linux archive inspection belongs to Rusty V8 150.4.0.
+It is retained only as `historical_native_inspection` in the manifest. Its
+1,810-member count, fdlibm-path symbols and digests are **not findings about
+152.2.0**. No new archive member/symbol inspection or final AJ link audit was
+performed here.
 
-The pinned V8 source gives a useful discriminator, not just missing names:
-`src/base/ieee754.h` and `.cc` select `sin`/`cos` when
-`V8_USE_LIBM_TRIG_FUNCTIONS` is absent. The other branch selects
-`fdlibm_sin`/`fdlibm_cos` plus `glibc_sin`/`glibc_cos`. The archive defines
-`v8::base::ieee754::sin(double)` and `cos(double)` in `ieee754.pic.o`, with no
-`glibc_sin`, `glibc_cos`, `__branred`, `fdlibm_sin`, or `fdlibm_cos` symbols.
-There are no `branred`, `s_sin`, or `sincostab` members. It also defines
-Abseil `lts_20250814`, Highway, and simdutf symbols, consistent with the graph.
+The hash-verified V8 15.2.124.1 archive contains no `third_party/glibc` paths.
+Its `BUILD.bazel`/`BUILD.gn` no longer contain the old glibc trig selection, and
+its math sources have changed. The old `sin`/`cos` symbol discriminator therefore
+must not be carried forward. This source observation does not establish that a
+final binary contains no glibc code.
 
-V8's `BUILD.gn` lists the glibc trig sources behind
-`v8_use_libm_trig_functions`. Its `BUILD.bazel` and the Codex Bazel patches do
-not select those sources or define that macro. Together, the source selection
-and positive fdlibm-path symbols are proportionate evidence that **the V8
-glibc trig fork is not incorporated in the inspected archive**. Its generic
-`README.v8` “shipped” marker is not a target-specific finding. The LGPL text
-remains collected conservatively. The other three archives have the same
-Bazel source selection, but their members/symbols were not inspected here.
+The GNU custom libc++/libc++abi graph still uses `gnu_libc_headers`. The root
+module declares LLVM 0.8.11 but **overrides its source** with hermetic LLVM commit
+`d27493f0386c9d4d28f7b12630cb91b0cdfd20f1`, archive SHA-256
+`2938e58c5100f1d99790ea15cfa5afdf2aa431faab6d2e620effde7f8198b2ed`.
+`licenses/evidence/hermetic-llvm/` now contains that archive's glibc repository
+definitions, header URL/hash index and bundled glibc notices. The definitions
+and index changed. The notices did not. The old LLVM registry source record was
+removed because it does not describe the override actually selected.
 
-This does not mean “no glibc obligations.” The GNU custom libc++/libc++abi
-targets explicitly use `gnu_libc_headers` from hermetic LLVM 0.8.11. Its
-lockfile-verified source archive, glibc repository definitions, header URL/hash
-index, and bundled glibc notices are recorded under `licenses/evidence/`.
-That header target contains headers, not a static glibc library. The native
-archive has undefined C library references such as `malloc` and `memcpy`, which do
-not themselves show that glibc implementation objects were copied into it.
-Final AJ linkage determines the system runtime actually distributed. Header
-inlines/macros require separate consideration under LGPL-2.1 section 5,
-including its small-inline/accessor exception. If non-exempt LGPL code is
-incorporated, section 6's applicable notice, source and relinking requirements
-must be satisfied. Keeping a license file alone does not satisfy that case.
+That target provides headers, not a static glibc library. Header inlines/macros
+require separate consideration under LGPL-2.1 section 5, including its
+small-inline/accessor exception. If non-exempt LGPL code is incorporated,
+section 6's applicable notice, source and relinking requirements must be met.
+Keeping a license file alone does not satisfy that case. Final AJ linkage and
+packaging determine the system runtime actually distributed.
 
-## Remaining release work and limits
+## Verification and remaining release work
 
-1. Include the applicable collected license/attribution texts and Codex notices
-   in the actual binary package. For native source redistribution, retain source
-   notices and the producer's patches/modification notices. A URL is provenance,
-   not a substitute for delivering required notices or corresponding source.
-2. Resolve the GNU toolchain-header case above and inspect the final binary's
-   runtime linkage. If shipping glibc or incorporating non-exempt LGPL code,
-   supply the applicable source/relinking mechanism and notices. If relying on
-   the user's shared runtime, document that packaging choice. This review does
-   not establish that final-link result or clear a statically linked AJ release.
-3. Before shipping another target, check its actual archive/runtime selection
-   against this graph, especially any glibc trig or additional runtime objects.
-   No byte-for-byte rebuild or absolute source-closure proof is required for
-   this notice review. The source pins, build selection, and observed symbols
-   are evidence with the target limits stated above.
-4. Repeat on upgrades or overridden native artifacts. Parent Rust dependencies
+The refresh verified source-archive hashes against MODULE/dependency declarations,
+fetched the changed Git-pinned notices, and checked every collected file against
+the manifest. Unchanged notice bytes are not represented as changed terms merely
+because their source revision changed. The full source license inventory was
+reviewed for V8 and the downloaded Highway/fast_float archives.
+
+A source reconstruction limitation remains: sequential GNU
+`patch --batch --fuzz=0 -p3` on files extracted from the hash-matched V8 archive
+applies the portability and array-sort patches (some hunks with offsets), but
+rejects the first `bazel/defs.bzl` hunk in `v8_defs.patch`. The subsequent
+`v8_windows_snapshot_wine.patch` also rejects its first hunk against that
+partially patched file. This was repeated from clean scratch. No upstream file
+was changed. This is not a Bazel `ctx.patch` test, successful engine import,
+producer rebuild or reproducible-build attestation.
+
+Before binary release:
+
+1. Deliver the applicable license/attribution texts and Codex notices in the
+   actual package. For source redistribution, preserve producer modifications,
+   patch notices and source notices. URLs alone do not deliver required notices
+   or corresponding source.
+2. Resolve GNU header-code obligations and inspect final runtime linkage. If
+   shipping glibc or incorporating non-exempt LGPL code, supply the applicable
+   source/relinking mechanism and notices. If relying on the user's shared
+   runtime, document that packaging choice. This review does not clear a
+   statically linked AJ release.
+3. Inspect the new target archive/runtime selection before shipping. This refresh
+   supplies source-level notice evidence, not new native-content verification.
+   Windows/musl require their own runtime and notice review. No byte-for-byte
+   rebuild or absolute source-closure proof is claimed or required by this review.
+4. Repeat for future upgrades or overridden artifacts. Parent Rust dependencies
    and final AJ packaging are separate. The importer does not refresh or certify
    this collection.
-
-One source-build discrepancy was observed without changing upstream: applying
-`v8_bazel_rules.patch` with GNU patch to the hash-matched V8 tarball rejects its
-first `bazel/defs.bzl` flag-helper hunk. The dependency/BUILD hunks apply, and
-the rejected hunk does not select glibc sources. This investigation therefore
-does not claim to have successfully reconstructed or built the producer tree.

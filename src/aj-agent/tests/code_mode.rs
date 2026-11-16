@@ -848,3 +848,90 @@ async fn background_store_failure_during_admission_prevents_the_next_inference()
         "known store failure must prevent the provider request, not merely reject its response"
     );
 }
+
+#[tokio::test]
+async fn exit_cannot_be_caught_and_keeps_only_prior_store_writes() {
+    let echo = Echo::default();
+    let mut h = Harness::new(true, vec![echo.clone().into()]);
+    h.exec(
+        r#"store("phase", "before"); text("before");
+try { exit(); } catch { text("caught"); }
+finally { store("phase", "after"); await tools.echo({value: "after"}); }"#,
+    )
+    .await;
+    assert_eq!(h.result("exec"), "Script completed\nbefore");
+    assert!(echo.0.lock().unwrap().is_empty());
+    h.exec(r#"text(load("phase"));"#).await;
+    assert_eq!(h.result("exec"), "Script completed\nbefore");
+}
+
+#[tokio::test]
+async fn server_output_budget_preserves_loss_notices_and_does_not_duplicate_errors() {
+    let mut h = Harness::new(true, vec![]);
+    // Exceed the collector's byte bound as well as the much smaller observation budget.
+    h.exec("// @exec: {\"max_output_tokens\": 8}\ntext('HEAD' + 'x'.repeat(2 * 1024 * 1024) + 'TAIL');").await;
+    let output = h.result("exec");
+    assert!(output.contains("HEAD"), "{output}");
+    assert!(output.contains("TAIL"), "{output}");
+    assert!(
+        output.contains("Code Mode session output limit reached"),
+        "{output}"
+    );
+    assert!(
+        output.len() < 1024,
+        "observation budget not applied: {} bytes",
+        output.len()
+    );
+    h.exec("content([{type: 'text', text: 'forwarded'}]); throw Error('unique failure');")
+        .await;
+    let output = h.result("exec");
+    assert!(output.starts_with("Script failed\nforwarded\n"), "{output}");
+    assert_eq!(output.matches("unique failure").count(), 1, "{output}");
+    h.exec("// @exec: {\"max_output_tokens\": 0}\nthrow Error('hidden diagnostic');")
+        .await;
+    let output = h.result("exec");
+    assert!(output.starts_with("Script failed"), "{output}");
+    assert!(!output.contains("hidden diagnostic"), "{output}");
+}
+
+#[tokio::test]
+async fn wait_and_terminate_apply_their_own_output_budgets() {
+    for terminate in [false, true] {
+        let gate = Gate::default();
+        let mut h = Harness::new(true, vec![gate.clone().into()]);
+        h.exec(
+            r#"yield_control(); text("HEAD" + "x".repeat(1000) + "TAIL"); await tools.gate({});"#,
+        )
+        .await;
+        bounded(gate.entered.cancelled()).await;
+        let (_, cell_id) = h.cell();
+        if !terminate {
+            gate.release.cancel();
+        }
+        h.provider.enqueue(
+            "wait",
+            json!({"cell_id": cell_id, "terminate": terminate, "max_tokens": 2}),
+        );
+        h.provider.done();
+        h.prompt().await;
+        bounded(h.registry.wait_for_quiescence()).await;
+        let output = h.result("wait");
+        assert!(
+            output.contains(if terminate {
+                "Script terminated"
+            } else {
+                "Script completed"
+            }),
+            "{output}"
+        );
+        assert!(
+            output.contains("HEAD") && output.contains("TAIL"),
+            "{output}"
+        );
+        assert!(
+            output.len() < 256,
+            "wait budget not applied: {} bytes",
+            output.len()
+        );
+    }
+}

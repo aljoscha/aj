@@ -13,7 +13,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 SUPPORT = ROOT / 'third-party/codex-code-mode'
-REVISION = '44984d20817fc58026a8bbccf053e288c6897c8f'
+REVISION = '75fc67e8f4284a669eebd90ab6bc9ef7697e876e'
 
 
 def git(repo, *args):
@@ -68,11 +68,16 @@ def materialize(repo, revision, out):
             continue
         if upstream_workspace['dependencies'].get(name) != value:
             raise RuntimeError(f'Workspace dependency changed upstream: {name}. Review Cargo.toml and Cargo.lock.')
+    upstream_patches = tomllib.loads(source('codex-rs/Cargo.toml').decode()).get('patch', {}).get('crates-io', {})
+    for name, value in tomllib.loads(template.read_text()).get('patch', {}).get('crates-io', {}).items():
+        if upstream_patches.get(name) != value:
+            raise RuntimeError(f'Upstream patched dependency changed: {name}')
     if upstream_workspace['package']['edition'] != local_workspace['package']['edition']:
         raise RuntimeError('Upstream Rust edition changed. Review Cargo.toml.')
     if upstream_workspace['package']['license'] != local_workspace['package']['license']:
         raise RuntimeError('Upstream license changed. Review licensing before importing.')
-    for name in ('code-mode-runtime', 'code-mode-protocol'):
+    for name in ('code-mode-runtime', 'code-mode-protocol',
+                 'utils/string', 'utils/output-truncation', 'utils/audio'):
         prefix = f'codex-rs/{name}/'
         entries = git(repo, 'ls-tree', '-rz', revision, '--', prefix).decode().split('\0')
         paths = []
@@ -84,6 +89,9 @@ def materialize(repo, revision, out):
         if not paths:
             raise RuntimeError(f'Missing upstream directory {prefix}')
         for path in paths:
+            # The plugin-process UI runner is independent of Code Mode sessions.
+            if path.startswith('codex-rs/code-mode-runtime/src/ui/'):
+                continue
             relative = path.removeprefix('codex-rs/')
             dest = out / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +138,34 @@ def materialize(repo, revision, out):
     audio = section(media, '/// Maximum accepted decoded byte length for prompt audio inputs.\n',
                     '/// Snapshots local image and audio input into portable, validated data URLs.\n')
     (shared / 'audio_limits.rs').write_text('/// Maximum accepted decoded byte length for prompt audio inputs.\n' + audio)
+    models = source('codex-rs/protocol/src/models.rs').decode()
+    def between(text, start, end):
+        return start + section(text, start, end)
+    media_refs = between(models,
+        '#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]\n#[serde(untagged)]\n#[ts(untagged)]\npub enum ImageReference',
+        '#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]\n#[serde(tag = "type", rename_all = "snake_case")]\npub enum AgentMessageInputContent')
+    detail = between(models,
+        '#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]\n#[serde(rename_all = "lowercase")]\npub enum ImageDetail',
+        '#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]\n#[serde(rename_all = "snake_case")]\n/// Classifies assistant text')
+    output = between(models, '/// Responses API compatible content items that can be returned by a tool call.\n',
+        '/// Converts message content to tool output, preserving media and image detail.\n')
+    plain_text = between(models, '/// Converts structured function-call output content into plain text for\n',
+        'impl From<crate::dynamic_tools::DynamicToolCallOutputContentItem>')
+    payload = between(models, '/// The payload we send back to OpenAI when reporting a tool call result.\n',
+        'impl CallToolResult {\n')
+    (shared / 'models.rs').write_text('use serde::{Deserialize, Deserializer, Serialize, Serializer};\n\n'
+        + media_refs + detail + output + plain_text + payload + '\nmod mcp_content;\n')
+    (shared / 'models').mkdir()
+    (shared / 'models/mcp_content.rs').write_bytes(source('codex-rs/protocol/src/models/mcp_content.rs'))
+    mcp = source('codex-rs/protocol/src/mcp.rs').decode()
+    (shared / 'mcp.rs').write_text('use serde::{Deserialize, Serialize};\n\n'
+        + between(mcp, '/// A known resource that the server is capable of reading.\n',
+                  '/// A template description for resources available on the server.\n')
+        + between(mcp, "/// The server's response to a tool call.\n", '// === Adapter helpers ==='))
+    policy = source('codex-rs/protocol/src/protocol.rs').decode()
+    (shared / 'truncation.rs').write_text('use serde::{Deserialize, Serialize};\nuse std::ops::Mul;\n\n'
+        + between(policy, '#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]\n#[serde(tag = "mode", content = "limit", rename_all = "snake_case")]\npub enum TruncationPolicy',
+                  '#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]\npub struct GitInfo'))
     # Git-format patches inside an enclosing worktree can be silently skipped
     # as outside the current prefix. Apply against this standalone staging tree.
     patch_env = {**os.environ, 'GIT_CEILING_DIRECTORIES': str(out.parent)}

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["code-mode-protocol", "code-mode-runtime"]
+members = ["code-mode-protocol", "code-mode-runtime", "utils/string", "utils/output-truncation", "utils/audio"]
 
 [workspace.package]
 version = "0.0.0"
@@ -13,7 +13,7 @@ license = "Apache-2.0"
 base64 = "0.22.1"
 codex-code-mode-protocol = { path = "code-mode-protocol" }
 codex-code-mode-runtime = { path = "code-mode-runtime" }
-deno_core_icudata = "0.77.0"
+deno_core_icudata = "0.78.0"
 futures = { version = "0.3", default-features = false }
 opentelemetry = "0.31.0"
 serde = { version = "1", features = ["rc"] }
@@ -21,11 +21,21 @@ serde_json = "1"
 tokio = "1"
 tokio-util = "0.7.18"
 tracing = "0.1.44"
-v8 = "=150.4.0"
+v8 = "=152.2.0"
 pretty_assertions = "1.4.1"
 glob = "0.3"
 tonic = { version = "0.14.3", default-features = false, features = ["channel", "codegen"] }
 tonic-prost = "0.14.3"
+
+codex-utils-string = { path = "utils/string" }
+codex-utils-output-truncation = { path = "utils/output-truncation" }
+codex-utils-audio = { path = "utils/audio" }
+regex-lite = "0.1.8"
+thiserror = "2.0.17"
+symphonia = { version = "0.6.0", default-features = false, features = ["isomp4", "mkv", "mp3", "ogg", "wav"] }
+
+[patch.crates-io]
+v8 = { git = "https://github.com/openai-oss-forks/rusty_v8.git", rev = "90a65f887a0c0f048f3784afbcb320b373c8a2e0" }
 
 [profile.dev]
 debug = 0

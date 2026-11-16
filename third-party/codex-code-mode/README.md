@@ -1,22 +1,28 @@
 # Codex Code Mode extraction
 
 Source: <https://github.com/openai/codex>, commit
-`44984d20817fc58026a8bbccf053e288c6897c8f`.
+`75fc67e8f4284a669eebd90ab6bc9ef7697e876e`.
 
 `vendor/codex-code-mode` is an independent Cargo workspace containing:
 
 - `code-mode-protocol`, package `codex-code-mode-protocol`
 - `code-mode-runtime`, package `codex-code-mode-runtime`
+- `utils/string`, `utils/output-truncation`, and the uncached portion of `utils/audio`
 - The complete upstream `models-manager/models.json`, at `models.json`
 - Unmodified upstream `LICENSE`, `NOTICE`, and `clippy.toml`
 - `v8-artifacts.json`, derived from the pinned `MODULE.bazel`
 
 Patch `0001-standalone-protocol.patch` decouples Codex's larger protocol crate by extracting
-`ToolName`, model tool messages, and the audio size limit. Only the model-message
-schema/TypeScript derives are removed. Protocol gRPC and its build dependencies
+`ToolName`, model tool messages, media/MCP output types, truncation policy, and
+the audio size limit. Schema/TypeScript derives are removed from extracted data
+types. The shared output helpers keep upstream truncation and media semantics.
+Unused audio response preparation and caching are excluded. The independent
+`src/ui` plugin-process runner is not imported or linked, and its plugin-host
+dependency and export are removed. Protocol gRPC and its build dependencies
 are behind the optional `grpc` feature, disabled by default. The V8 sandbox
-feature and all upstream tests are retained. Changed files carry
-modification notices. `upstream.json` records SHA-256 hashes of source inputs,
+feature and upstream Code Mode session tests are retained. Tests for the
+excluded UI runner and audio response preparation are omitted with that code.
+Changed files carry modification notices. `upstream.json` records SHA-256 hashes of source inputs,
 the patch, workspace template, and every imported file.
 
 Patch `0002-durable-store.patch` is an AJ runtime extension. It adds initial
@@ -42,6 +48,10 @@ exclude = ["vendor/codex-code-mode"]
 [workspace.dependencies]
 codex-code-mode-protocol = { path = "vendor/codex-code-mode/code-mode-protocol" }
 codex-code-mode-runtime = { path = "vendor/codex-code-mode/code-mode-runtime" }
+
+# Cargo only reads patches from the root workspace.
+[patch.crates-io]
+v8 = { git = "https://github.com/openai-oss-forks/rusty_v8.git", rev = "90a65f887a0c0f048f3784afbcb320b373c8a2e0" }
 ```
 
 Consume `vendor/codex-code-mode/models.json` directly. Select catalog entries by
@@ -52,8 +62,11 @@ do not establish eligibility. The catalog is data, not an AJ model-registry
 override. Eligibility policy and provider gating belong to the parent.
 
 The nested `Cargo.lock` pins standalone verification. Parent builds resolve
-their own lockfile. Keep V8 at the workspace's exact `150.4.0` requirement and
-retain its `v8_enable_sandbox` feature.
+their own lockfile. Keep V8 at the workspace's exact `152.2.0` requirement and
+retain its `v8_enable_sandbox` feature and the exact upstream fork override.
+The native bindings and archive must match that fork, not crates.io V8 alone.
+Cargo fetches the fork and its Git submodules even when using prebuilt native
+artifacts, so a fresh dependency fetch can be substantial.
 
 ## Native prerequisite
 
@@ -84,13 +97,12 @@ containing the upstream artifact filenames. Revalidate an installation with:
 python3 scripts/bootstrap-codex-code-mode-v8.py --check
 ```
 
-**Build tradeoff:** Rusty V8 150.4.0 has no content-checksum verification in its
-downloader. Its `.sum` records the URL, not a digest. `RUSTY_V8_MIRROR` constructs
-`BASE/v150.4.0/...` URLs, unlike Codex's `rusty-v8-v150.4.0` release tag, and writes
-downloaded bindings into the dependency source directory. Fully automatic,
-verified first-build downloads would require a Rusty V8 change or additional
-build machinery. This extraction instead requires the explicit prerequisite.
-No dependency cache is patched and sandboxing is not disabled.
+**Build tradeoff:** the pinned native pair requires an explicit bootstrap rather
+than relying on Rusty V8's downloader. No dependency cache is patched and
+sandboxing is not disabled. When upgrading an existing installation, move the
+old `native/` directory aside, run bootstrap for the new pin, and retain the
+old pair until verification succeeds. Bootstrap refuses to overwrite a pair
+whose hashes do not match the new pin.
 
 Cargo does not rehash the installed pair on every build. Run bootstrap in CI
 before Cargo, including when restoring cached native files. Explicit environment
@@ -142,6 +154,12 @@ and refresh lockfiles and native artifacts separately when dependencies change.
 Licensing evidence is revision-specific and must also be reviewed on upgrade.
 
 ### AJ compatibility review
+
+AJ selects `CodeModeOutputTruncation::Server`. The runtime bounds buffered
+output and applies each exec/wait/terminate budget. AJ renders the resulting
+content without truncating it again or appending the diagnostic a second time.
+Error status remains independent of how much diagnostic text fits the budget.
+The default embedding mode remains upstream's client-side truncation policy.
 
 After an upstream refresh, review both extraction patches, not only whether
 they apply. In particular, inspect the completion/cancellation state machine

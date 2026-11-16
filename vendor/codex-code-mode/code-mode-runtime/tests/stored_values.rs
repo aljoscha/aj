@@ -124,14 +124,14 @@ async fn termination_waits_for_reserved_commit_and_readers_wait_for_ack() {
         HashMap::from([("key".into(), Arc::new(json!("saved")))])
     );
 
-    let mut termination = Box::pin(session.terminate(id.clone()));
+    let mut termination = Box::pin(session.terminate(id.clone().into()));
     assert!(
         poll_fn(|cx| Poll::Ready(termination.as_mut().poll(cx)))
             .await
             .is_pending()
     );
     assert!(
-        bounded(session.terminate(id))
+        bounded(session.terminate(id.into()))
             .await
             .unwrap_err()
             .contains("already terminating")
@@ -262,4 +262,66 @@ async fn shutdown_waits_for_reserved_commit() {
         None
     );
     bounded(shutdown).await.unwrap();
+}
+
+#[tokio::test]
+async fn bounded_completion_waits_for_store_and_budgets_both_errors_once() {
+    let session = InProcessCodeModeSession::with_stored_values_and_options(
+        HashMap::from([("key".into(), json!("old"))]),
+        CodeModeSessionOptions {
+            output_truncation: CodeModeOutputTruncation::Server,
+            ..Default::default()
+        },
+    );
+    let (delegate, mut entered) = StoreDelegate::new(Err("disk unavailable".into()));
+    let cell = session
+        .execute(
+            request(r#"store("key", "new"); text("output"); throw Error("script failed");"#),
+            delegate.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    let (id, _) = bounded(entered.recv()).await.unwrap();
+    let mut termination = Box::pin(session.terminate(id.into()));
+    assert!(
+        poll_fn(|cx| Poll::Ready(termination.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    let mut reader = Box::pin(read(&session, r#"text(load("key"));"#));
+    assert!(
+        poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    delegate.release.notify_one();
+    let WaitOutcome::LiveCell(response) = bounded(termination).await.unwrap() else {
+        panic!("missing cell")
+    };
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        ..
+    } = response
+    else {
+        panic!("missing completion")
+    };
+    let error = error_text.unwrap();
+    assert!(error.contains("script failed"));
+    assert!(error.contains("stored values were not saved: disk unavailable"));
+    assert_eq!(
+        content_items,
+        vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "output".into()
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: format!("Script error:\n{error}")
+            },
+        ]
+    );
+    assert_eq!(completed(bounded(reader).await, "old"), None);
+    bounded(cell.initial_response()).await.unwrap();
+    session.shutdown().await.unwrap();
 }

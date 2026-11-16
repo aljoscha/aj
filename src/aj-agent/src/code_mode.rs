@@ -75,7 +75,7 @@ pub(crate) fn catalog(
     tools: &HashMap<String, ErasedToolDefinition>,
 ) -> Vec<aj_models::types::ToolDefinition> {
     let nested = nested_tools(tools);
-    let mut description = protocol::build_exec_tool_description(
+    let (mut description, _) = protocol::build_exec_tool_description_and_definitions(
         &nested,
         &[],
         &BTreeMap::new(),
@@ -83,6 +83,7 @@ pub(crate) fn catalog(
         true,
         protocol::ImageDetailVisibility::Hidden,
         protocol::DeferredToolDiscovery::Catalog,
+        false,
         None,
     );
     // The evaluator's notification callback belongs to the host. AJ delivers
@@ -101,7 +102,9 @@ pub(crate) fn catalog(
         "values. Tool availability is checked on each nested call. An open cell stays in the ",
         "task list until collected or terminated, even if evaluation has finished. Use cell ",
         "`wait` to collect it rather than waiting for a task-completion notice. AJ's input-yield ",
-        "tool, when present, is named `yield`. AJ supports text and image output, not audio output."
+        "tool, when present, is named `yield`. AJ supports text and image output, not audio output. ",
+        "`content(blockOrBlocks: ContentBlock | Iterable<ContentBlock>)` forwards MCP content ",
+        "blocks, for example `content(result.content)`. Audio blocks are unsupported in AJ."
     ));
     // Codex's exec grammar, from core/src/tools/code_mode/execute_spec.rs.
     // The vendored Apache-2.0 license and NOTICE cover this grammar as well.
@@ -244,7 +247,13 @@ impl CodeMode {
             .clone()
             .into_iter()
             .collect();
-        let runtime = Arc::new(InProcessCodeModeSession::with_stored_values(values));
+        let runtime = Arc::new(InProcessCodeModeSession::with_stored_values_and_options(
+            values,
+            protocol::CodeModeSessionOptions {
+                output_truncation: protocol::CodeModeOutputTruncation::Server,
+                ..Default::default()
+            },
+        ));
         let owner_cancel = CancellationToken::new();
         let shutdown_runtime = Arc::clone(&runtime);
         let owner = owner_cancel.clone();
@@ -299,7 +308,7 @@ impl CodeMode {
         input: Value,
     ) -> Result<ToolOutcome, BoxError> {
         self.shared.check_store()?;
-        let (response, budget) = if name == "exec" {
+        let response = if name == "exec" {
             let parsed = protocol::parse_exec_source(
                 input.as_str().ok_or("exec expects raw JavaScript source")?,
             )?;
@@ -345,7 +354,7 @@ impl CodeMode {
                         output: Arc::new(CellOutput::default()),
                     },
                 );
-            (started.initial_response().await?, parsed.max_output_tokens)
+            started.initial_response().await?
         } else {
             let args: WaitInput = serde_json::from_value(input)?;
             let cell_id = protocol::CellId::new(
@@ -355,12 +364,18 @@ impl CodeMode {
                     .to_owned(),
             );
             let response = if args.terminate {
-                self.runtime.terminate(cell_id).await?
+                self.runtime
+                    .terminate(protocol::TerminateRequest {
+                        cell_id,
+                        max_output_tokens: args.max_tokens,
+                    })
+                    .await?
             } else {
                 self.runtime
                     .wait(
                         protocol::WaitRequest {
                             cell_id,
+                            max_output_tokens: args.max_tokens,
                             yield_time_ms: args
                                 .yield_time_ms
                                 .unwrap_or(protocol::DEFAULT_WAIT_YIELD_TIME_MS),
@@ -369,11 +384,11 @@ impl CodeMode {
                     )
                     .await?
             };
-            (response.into(), args.max_tokens)
+            response.into()
         };
         let cell_id = response_id(&response).clone();
         let status = terminal_status(&response);
-        let outcome = render(self.shared.public_response(response), budget);
+        let outcome = render(self.shared.public_response(response));
         if let Some(status) = status {
             self.shared.finish(&cell_id, status, &outcome);
         } else {
@@ -439,9 +454,9 @@ impl CodeMode {
                 result = completed.wait_for(|status| status.is_some()) => result.ok().and_then(|status| *status).unwrap_or(TaskStatus::Killed),
             };
             if status == TaskStatus::Killed {
-                match runtime.terminate(cell_id.clone()).await {
+                match runtime.terminate(cell_id.clone().into()).await {
                     Ok(response) => {
-                        let outcome = render(shared.public_response(response.into()), None);
+                        let outcome = render(shared.public_response(response.into()));
                         shared.finish(&cell_id, status, &outcome);
                     }
                     Err(error) => tracing::warn!(%cell_id, "code mode termination failed: {error}"),
@@ -485,8 +500,8 @@ impl CodeMode {
                 registry.kill(task);
                 registry.wait_terminal(task).await;
             } else {
-                let response = self.runtime.terminate(cell_id.clone()).await?;
-                let outcome = render(self.shared.public_response(response.into()), None);
+                let response = self.runtime.terminate(cell_id.clone().into()).await?;
+                let outcome = render(self.shared.public_response(response.into()));
                 self.shared.finish(&cell_id, TaskStatus::Killed, &outcome);
             }
         }
@@ -790,8 +805,8 @@ fn terminal_status(response: &protocol::RuntimeResponse) -> Option<TaskStatus> {
     }
 }
 
-fn render(response: protocol::RuntimeResponse, budget: Option<usize>) -> ToolOutcome {
-    let (status, mut items, mut error) = match response {
+fn render(response: protocol::RuntimeResponse) -> ToolOutcome {
+    let (status, items, mut error) = match response {
         protocol::RuntimeResponse::Yielded {
             cell_id,
             content_items,
@@ -820,26 +835,13 @@ fn render(response: protocol::RuntimeResponse, budget: Option<usize>) -> ToolOut
         ),
     };
     let mut content = vec![UserContent::text(&status)];
-    if let Some(error) = &error {
-        items.push(protocol::FunctionCallOutputContentItem::InputText {
-            text: format!("Script error:\n{error}"),
-        });
-    }
-    // Approximate token budget, in UTF-8 bytes. Keep status and one truncation
-    // notice outside the budget so even a zero budget remains understandable.
-    let mut remaining = budget
-        .unwrap_or(protocol::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
-        .saturating_mul(4);
-    let mut truncated = false;
+    // The runtime budgets each observation, including script errors. Preserve its
+    // content and loss notices without appending diagnostics or truncating twice.
     for item in items {
         match item {
             protocol::FunctionCallOutputContentItem::InputText { text } => {
-                let end = text.floor_char_boundary(remaining.min(text.len()));
-                let output = text[..end].to_owned();
-                remaining = remaining.saturating_sub(end);
-                truncated |= end < text.len();
-                if !output.is_empty() {
-                    content.push(UserContent::text(output));
+                if !text.is_empty() {
+                    content.push(UserContent::text(text));
                 }
             }
             protocol::FunctionCallOutputContentItem::InputImage { image_url, .. } => {
@@ -863,9 +865,6 @@ fn render(response: protocol::RuntimeResponse, budget: Option<usize>) -> ToolOut
                 ));
             }
         }
-    }
-    if truncated {
-        content.push(UserContent::text("[Code Mode output truncated]"));
     }
     ToolOutcome {
         structured_content: None,

@@ -1,4 +1,4 @@
-// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
 use serde::{Deserialize, Serialize};
 
 /// Model-owned messages for a built-in tool.
@@ -9,7 +9,8 @@ pub struct ToolMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools, Code Mode wait,
-    /// request_user_input_async (the send_user_message_async catalog key), and MCP resource helpers.
+    /// request_user_input_async (the send_user_message_async catalog key), MCP resource helpers,
+    /// and Memento V2 tools.
     /// Uses the harness's supported schema subset; unrecognized keywords are ignored.
     /// Missing, null, invalid or unsupported structures, or a root without `type: "object"`
     /// retains the harness parameters. Schema semantics must remain API-compatible.

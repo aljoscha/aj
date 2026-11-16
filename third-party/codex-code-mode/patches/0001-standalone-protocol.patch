@@ -1,3 +1,5 @@
+diff --git a/code-mode-protocol/Cargo.toml b/code-mode-protocol/Cargo.toml
+index cad10b4..daf1200 100644
 --- a/code-mode-protocol/Cargo.toml
 +++ b/code-mode-protocol/Cargo.toml
 @@ -1,3 +1,4 @@
@@ -5,10 +7,10 @@
  [package]
  edition.workspace = true
  license.workspace = true
-@@ -12,20 +13,23 @@
+@@ -12,20 +13,24 @@ path = "src/lib.rs"
  [lints]
  workspace = true
- 
+
 +[features]
 +default = []
 +grpc = ["dep:prost", "dep:tonic", "dep:tonic-prost", "dep:glob", "dep:protoc-bin-vendored", "dep:tonic-prost-build"]
@@ -16,6 +18,7 @@
  [dependencies]
 -codex-protocol = { workspace = true }
 -prost = "0.14.3"
++codex-utils-string = { workspace = true }
 +prost = { version = "0.14.3", optional = true }
  serde = { workspace = true, features = ["derive"] }
  serde_json = { workspace = true }
@@ -25,7 +28,7 @@
 -tonic-prost = { workspace = true }
 +tonic = { workspace = true, optional = true }
 +tonic-prost = { workspace = true, optional = true }
- 
+
  [build-dependencies]
 -glob = { workspace = true }
 -protoc-bin-vendored = "3.2.0"
@@ -33,22 +36,24 @@
 +glob = { workspace = true, optional = true }
 +protoc-bin-vendored = { version = "3.2.0", optional = true }
 +tonic-prost-build = { version = "=0.14.3", default-features = false, features = ["transport"], optional = true }
- 
+
  # Cargo-shear cannot inspect the prost and tonic-prost references in generated gRPC bindings.
  [package.metadata.cargo-shear]
+diff --git a/code-mode-protocol/build.rs b/code-mode-protocol/build.rs
+index d8d8bbf..1ec9d96 100644
 --- a/code-mode-protocol/build.rs
 +++ b/code-mode-protocol/build.rs
 @@ -1,5 +1,8 @@
 +// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
 +#[cfg(feature = "grpc")]
  use std::path::PathBuf;
- 
+
 +#[cfg(feature = "grpc")]
  fn main() -> Result<(), Box<dyn std::error::Error>> {
      println!("cargo:rustc-check-cfg=cfg(codex_bazel)");
      println!("cargo:rerun-if-changed=src/grpc");
-@@ -15,3 +18,8 @@
- 
+@@ -15,3 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+
      Ok(())
  }
 +
@@ -56,22 +61,24 @@
 +fn main() {
 +    println!("cargo:rustc-check-cfg=cfg(codex_bazel)");
 +}
+diff --git a/code-mode-protocol/src/audio_limits.rs b/code-mode-protocol/src/audio_limits.rs
+index 3f41c73..f4bbb6c 100644
 --- a/code-mode-protocol/src/audio_limits.rs
 +++ b/code-mode-protocol/src/audio_limits.rs
-@@ -1,5 +1,5 @@
-+// Modified for the standalone AJ extraction: retain only the shared audio limit.
- /// Maximum accepted decoded byte length for prompt audio inputs.
+@@ -2,4 +2,3 @@
  ///
  /// This matches the Responses API audio input limit.
  pub const MAX_PROMPT_AUDIO_INPUT_BYTES: usize = 50 * 1024 * 1024;
 -
+diff --git a/code-mode-protocol/src/description.rs b/code-mode-protocol/src/description.rs
+index 4e48588..b3dcc6b 100644
 --- a/code-mode-protocol/src/description.rs
 +++ b/code-mode-protocol/src/description.rs
 @@ -1,8 +1,9 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  //! Composes Code Mode descriptions, retaining runtime-owned tool declarations.
  //! Exec templates substitute only the documented literal placeholders.
- 
+
 -use codex_protocol::ToolName;
 -use codex_protocol::openai_models::CodeModeToolMessages;
 +use crate::CodeModeToolMessages;
@@ -79,8 +86,8 @@
  use serde::Deserialize;
  use serde::Serialize;
  use serde_json::Value as JsonValue;
-@@ -556,7 +557,7 @@
-     use super::build_exec_tool_description;
+@@ -592,7 +593,7 @@ mod tests {
+     use super::build_exec_tool_description_and_definitions;
      use super::normalize_code_mode_identifier;
      use super::parse_exec_source;
 -    use codex_protocol::ToolName;
@@ -88,17 +95,19 @@
      use pretty_assertions::assert_eq;
      use serde_json::Value as JsonValue;
      use serde_json::json;
+diff --git a/code-mode-protocol/src/description_override_tests.rs b/code-mode-protocol/src/description_override_tests.rs
+index e151964..1e8073e 100644
 --- a/code-mode-protocol/src/description_override_tests.rs
 +++ b/code-mode-protocol/src/description_override_tests.rs
 @@ -1,3 +1,4 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  //! Tests catalog exec template rendering and runtime description composition.
- 
+
  use super::CodeModeToolKind;
-@@ -10,9 +11,9 @@
+@@ -10,9 +11,9 @@ use super::TOOL_SEARCH_GUIDANCE;
  use super::ToolDefinition;
  use super::UNIFIED_IMAGE_HELPER_DESCRIPTION;
- use super::build_exec_tool_description;
+ use super::build_exec_tool_description_and_definitions;
 -use codex_protocol::ToolName;
 -use codex_protocol::openai_models::CodeModeToolMessages;
 -use codex_protocol::openai_models::ToolMessage;
@@ -108,161 +117,512 @@
  use pretty_assertions::assert_eq;
  use serde_json::json;
  use std::collections::BTreeMap;
+diff --git a/code-mode-protocol/src/host/payload.rs b/code-mode-protocol/src/host/payload.rs
+index 53bbabb..d8a1e30 100644
 --- a/code-mode-protocol/src/host/payload.rs
 +++ b/code-mode-protocol/src/host/payload.rs
 @@ -1,7 +1,8 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use std::num::TryFromIntError;
  use std::time::Duration;
- 
+
 -use codex_protocol::ToolName;
 +use crate::ToolName;
  use serde::Deserialize;
  use serde::Serialize;
  use serde_json::Value as JsonValue;
+diff --git a/code-mode-protocol/src/lib.rs b/code-mode-protocol/src/lib.rs
+index 81d9c0a..c756c46 100644
 --- a/code-mode-protocol/src/lib.rs
 +++ b/code-mode-protocol/src/lib.rs
 @@ -1,4 +1,6 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  mod description;
 +#[cfg(feature = "grpc")]
  pub mod grpc;
  pub mod host;
  mod json_schema_types;
-@@ -53,3 +55,10 @@
- 
+@@ -60,3 +62,14 @@ pub use session::ToolInvocationFuture;
+
  pub const PUBLIC_TOOL_NAME: &str = "exec";
  pub const WAIT_TOOL_NAME: &str = "wait";
 +
 +mod audio_limits;
++pub mod mcp;
 +mod model_messages;
++pub mod models;
 +mod tool_name;
++mod truncation;
 +pub use audio_limits::MAX_PROMPT_AUDIO_INPUT_BYTES;
 +pub use model_messages::{CodeModeToolMessages, ToolMessage};
 +pub use tool_name::{DEFAULT_FUNCTION_NAMESPACE, ToolName};
++pub use truncation::TruncationPolicy;
+diff --git a/code-mode-protocol/src/mcp.rs b/code-mode-protocol/src/mcp.rs
+index 73951a5..aac93d7 100644
+--- a/code-mode-protocol/src/mcp.rs
++++ b/code-mode-protocol/src/mcp.rs
+@@ -1,80 +1,64 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ use serde::{Deserialize, Serialize};
+
+ /// A known resource that the server is capable of reading.
+-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct Resource {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub annotations: Option<serde_json::Value>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub description: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub mime_type: Option<String>,
+     pub name: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+-    #[ts(type = "number")]
+     pub size: Option<i64>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub title: Option<String>,
+     pub uri: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub icons: Option<Vec<serde_json::Value>>,
+     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub meta: Option<serde_json::Value>,
+ }
+
+ /// Contents returned when reading a resource from an MCP server.
+-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ #[serde(untagged)]
+ pub enum ResourceContent {
+     #[serde(rename_all = "camelCase")]
+-    #[ts(rename_all = "camelCase")]
+     Text {
+         /// The URI of this resource.
+         uri: String,
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+-        #[ts(optional)]
+         mime_type: Option<String>,
+         text: String,
+         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+-        #[ts(optional)]
+         meta: Option<serde_json::Value>,
+     },
+     #[serde(rename_all = "camelCase")]
+-    #[ts(rename_all = "camelCase")]
+     Blob {
+         /// The URI of this resource.
+         uri: String,
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+-        #[ts(optional)]
+         mime_type: Option<String>,
+         blob: String,
+         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+-        #[ts(optional)]
+         meta: Option<serde_json::Value>,
+     },
+ }
+
+ /// The server's response to a tool call.
+-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct CallToolResult {
+     pub content: Vec<serde_json::Value>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub structured_content: Option<serde_json::Value>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub is_error: Option<bool>,
+     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+-    #[ts(optional)]
+     pub meta: Option<serde_json::Value>,
+ }
+
+@@ -92,4 +76,3 @@ pub fn plain_output_text(block: &serde_json::Value) -> Option<&str> {
+     }
+     Some(text)
+ }
+-
+diff --git a/code-mode-protocol/src/model_messages.rs b/code-mode-protocol/src/model_messages.rs
+index 24058c2..ab46ae7 100644
 --- a/code-mode-protocol/src/model_messages.rs
 +++ b/code-mode-protocol/src/model_messages.rs
 @@ -1,7 +1,8 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use serde::{Deserialize, Serialize};
- 
+
  /// Model-owned messages for a built-in tool.
 -#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 +#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
  pub struct ToolMessage {
      /// Missing or null uses the built-in description; an empty string suppresses its static
      /// text without disabling the tool. Tool-owned runtime guidance is retained.
-@@ -19,7 +20,7 @@
+@@ -20,7 +21,7 @@ pub struct ToolMessage {
  }
- 
+
  /// Model-owned instructions for Code Mode's exec and wait tools.
 -#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 +#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
  pub struct CodeModeToolMessages {
      /// Instructional template supporting `{{ default_exec_yield_time_ms }}` and `{{ image_helper }}`.
      /// Runtime tool declarations are appended. Unknown placeholders remain literal.
-@@ -39,4 +40,3 @@
+@@ -40,4 +41,3 @@ pub struct CodeModeToolMessages {
      #[serde(default, skip_serializing_if = "Option::is_none")]
      pub mcp_typescript_preamble: Option<String>,
  }
 -
+diff --git a/code-mode-protocol/src/models.rs b/code-mode-protocol/src/models.rs
+index b23768e..d7e97b8 100644
+--- a/code-mode-protocol/src/models.rs
++++ b/code-mode-protocol/src/models.rs
+@@ -1,23 +1,22 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ #[serde(untagged)]
+-#[ts(untagged)]
+ pub enum ImageReference {
+     Inline { image_url: String },
+     File { file_id: String },
+ }
+
+ /// Inline audio data or an uploaded file loaded by the Responses API.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ #[serde(untagged)]
+-#[ts(untagged)]
+ pub enum AudioReference {
+     Inline { audio_url: String },
+     File { file_id: String },
+ }
+
+-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
++#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+ #[serde(rename_all = "lowercase")]
+ pub enum ImageDetail {
+     Auto,
+@@ -30,7 +29,7 @@ pub const DEFAULT_IMAGE_DETAIL: ImageDetail = ImageDetail::High;
+
+ /// Responses API compatible content items that can be returned by a tool call.
+ /// This is a subset of ContentItem with the types we support as function call outputs.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ #[serde(tag = "type", rename_all = "snake_case")]
+ pub enum FunctionCallOutputContentItem {
+     // Do not rename, these are serialized and used directly in the responses API.
+@@ -42,7 +41,6 @@ pub enum FunctionCallOutputContentItem {
+         #[serde(flatten)]
+         image: ImageReference,
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+-        #[ts(optional)]
+         detail: Option<ImageDetail>,
+     },
+     // Do not rename, these are serialized and used directly in the responses API.
+@@ -102,13 +100,13 @@ pub fn function_call_output_content_items_to_text(
+ ///
+ /// `body` serializes directly as the wire value for `function_call_output.output`.
+ /// `success` remains internal metadata for downstream handling.
+-#[derive(Debug, Default, Clone, PartialEq, JsonSchema, TS)]
++#[derive(Debug, Default, Clone, PartialEq)]
+ pub struct FunctionCallOutputPayload {
+     pub body: FunctionCallOutputBody,
+     pub success: Option<bool>,
+ }
+
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ #[serde(untagged)]
+ pub enum FunctionCallOutputBody {
+     Text(String),
+@@ -209,5 +207,4 @@ impl<'de> Deserialize<'de> for FunctionCallOutputPayload {
+     }
+ }
+
+-
+ mod mcp_content;
+diff --git a/code-mode-protocol/src/models/mcp_content.rs b/code-mode-protocol/src/models/mcp_content.rs
+index 8b78812..395ade2 100644
+--- a/code-mode-protocol/src/models/mcp_content.rs
++++ b/code-mode-protocol/src/models/mcp_content.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ //! Converts individual MCP content blocks into model-visible tool output.
+
+ use super::DEFAULT_IMAGE_DETAIL;
+@@ -85,18 +86,3 @@ impl FunctionCallOutputContentItem {
+         })
+     }
+ }
+-
+-pub(super) fn convert_mcp_content_to_items(
+-    contents: &[Value],
+-) -> Vec<FunctionCallOutputContentItem> {
+-    contents
+-        .iter()
+-        .map(|block| {
+-            FunctionCallOutputContentItem::from_mcp_content_block(block).unwrap_or_else(|_| {
+-                FunctionCallOutputContentItem::InputText {
+-                    text: serde_json::to_string(block).unwrap_or_else(|_| "<content>".to_string()),
+-                }
+-            })
+-        })
+-        .collect()
+-}
+diff --git a/code-mode-protocol/src/response.rs b/code-mode-protocol/src/response.rs
+index 6ff96bd..f461ae4 100644
+--- a/code-mode-protocol/src/response.rs
++++ b/code-mode-protocol/src/response.rs
+@@ -1,5 +1,6 @@
+-pub use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+-pub use codex_protocol::models::ImageDetail;
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
++pub use crate::models::DEFAULT_IMAGE_DETAIL;
++pub use crate::models::ImageDetail;
+ use serde::Deserialize;
+ use serde::Serialize;
+
+diff --git a/code-mode-protocol/src/runtime.rs b/code-mode-protocol/src/runtime.rs
+index 9ed15f0..2ab03b0 100644
 --- a/code-mode-protocol/src/runtime.rs
 +++ b/code-mode-protocol/src/runtime.rs
 @@ -1,8 +1,9 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use std::error::Error;
  use std::fmt;
  use std::time::Duration;
- 
+
 -use codex_protocol::ToolName;
 +use crate::ToolName;
  use serde::Deserialize;
  use serde::Serialize;
  use serde_json::Value as JsonValue;
+diff --git a/code-mode-protocol/src/truncation.rs b/code-mode-protocol/src/truncation.rs
+index 80c0749..a9dd837 100644
+--- a/code-mode-protocol/src/truncation.rs
++++ b/code-mode-protocol/src/truncation.rs
+@@ -1,22 +1,14 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ use serde::{Deserialize, Serialize};
+ use std::ops::Mul;
+
+-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
++#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+ #[serde(tag = "mode", content = "limit", rename_all = "snake_case")]
+ pub enum TruncationPolicy {
+     Bytes(usize),
+     Tokens(usize),
+ }
+
+-impl From<crate::openai_models::TruncationPolicyConfig> for TruncationPolicy {
+-    fn from(config: crate::openai_models::TruncationPolicyConfig) -> Self {
+-        match config.mode {
+-            crate::openai_models::TruncationMode::Bytes => Self::Bytes(config.limit as usize),
+-            crate::openai_models::TruncationMode::Tokens => Self::Tokens(config.limit as usize),
+-        }
+-    }
+-}
+-
+ impl TruncationPolicy {
+     pub fn token_budget(&self) -> usize {
+         match self {
+@@ -52,4 +44,3 @@ impl Mul<f64> for TruncationPolicy {
+         }
+     }
+ }
+-
+diff --git a/code-mode-runtime/Cargo.toml b/code-mode-runtime/Cargo.toml
+index 1060315..5e42dae 100644
 --- a/code-mode-runtime/Cargo.toml
 +++ b/code-mode-runtime/Cargo.toml
 @@ -1,3 +1,4 @@
-+# Modified for the standalone AJ extraction: decouple protocol dependencies.
++# Modified for the standalone AJ extraction: omit unused host integrations (Apache-2.0).
  [package]
  edition.workspace = true
  license.workspace = true
-@@ -15,7 +16,6 @@
+@@ -15,8 +16,6 @@ workspace = true
  [dependencies]
  base64 = { workspace = true }
  codex-code-mode-protocol = { workspace = true }
+-codex-plugin-host = { workspace = true }
 -codex-protocol = { workspace = true }
- deno_core_icudata = { workspace = true }
- futures = { workspace = true }
- opentelemetry = { workspace = true }
+ codex-utils-audio = { workspace = true }
+ codex-utils-output-truncation = { workspace = true }
+ codex-utils-string = { workspace = true }
+@@ -30,5 +29,6 @@ tracing = { workspace = true }
+ v8 = { workspace = true, features = ["v8_enable_sandbox"] }
+
+ [dev-dependencies]
++futures = { workspace = true, features = ["async-await"] }
+ pretty_assertions = { workspace = true }
+ tokio = { workspace = true, features = ["test-util"] }
+diff --git a/code-mode-runtime/src/cell_actor/conversions.rs b/code-mode-runtime/src/cell_actor/conversions.rs
+index b015d50..455a32c 100644
 --- a/code-mode-runtime/src/cell_actor/conversions.rs
 +++ b/code-mode-runtime/src/cell_actor/conversions.rs
-@@ -1,9 +1,10 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+@@ -1,7 +1,8 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use codex_code_mode_protocol::CodeModeToolKind;
  use codex_code_mode_protocol::ExecuteRequest;
- use codex_code_mode_protocol::FunctionCallOutputContentItem;
- use codex_code_mode_protocol::ImageDetail;
  use codex_code_mode_protocol::ToolDefinition;
 -use codex_protocol::ToolName;
 +use codex_code_mode_protocol::ToolName;
- 
+
  use crate::session_runtime::CreateCellRequest as CellRequest;
- use crate::session_runtime::ImageDetail as CellImageDetail;
+ use crate::session_runtime::ToolKind as CellToolKind;
+diff --git a/code-mode-runtime/src/cell_actor/tests.rs b/code-mode-runtime/src/cell_actor/tests.rs
+index 1ae1bea..15e800b 100644
 --- a/code-mode-runtime/src/cell_actor/tests.rs
 +++ b/code-mode-runtime/src/cell_actor/tests.rs
 @@ -1,3 +1,4 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use std::collections::HashMap;
  use std::sync::Arc;
  use std::sync::atomic::AtomicBool;
-@@ -428,7 +429,7 @@
+@@ -580,7 +581,7 @@ async fn dropped_pending_observer_preserves_the_frontier_for_the_next_observatio
          .event_tx
-         .send(RuntimeEvent::ToolCall {
+         .blocking_send(RuntimeEvent::ToolCall {
              id: "tool-1".to_string(),
 -            name: codex_protocol::ToolName {
 +            name: codex_code_mode_protocol::ToolName {
                  name: "echo".to_string(),
                  namespace: None,
              },
+diff --git a/code-mode-runtime/src/lib.rs b/code-mode-runtime/src/lib.rs
+index c3dd01d..b818ef3 100644
+--- a/code-mode-runtime/src/lib.rs
++++ b/code-mode-runtime/src/lib.rs
+@@ -1,15 +1,14 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ mod cell_actor;
+ mod output;
+ mod runtime;
+ mod service;
+ mod session_runtime;
+-mod ui;
+ mod v8_init;
+
+ pub(crate) type TaskFailureHandler = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
+ pub use codex_code_mode_protocol::*;
+ pub use service::InProcessCodeModeSession;
+-pub use ui::run as run_ui_sandbox;
+ pub use v8_init::V8JitMode;
+ pub use v8_init::initialize_v8;
+diff --git a/code-mode-runtime/src/output/output_render.rs b/code-mode-runtime/src/output/output_render.rs
+index 9a15ea3..c616f35 100644
+--- a/code-mode-runtime/src/output/output_render.rs
++++ b/code-mode-runtime/src/output/output_render.rs
+@@ -1,12 +1,13 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ //! Applies the outer Code Mode response budget at an observation boundary.
+
+ use codex_code_mode_protocol::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+ use codex_code_mode_protocol::FunctionCallOutputContentItem as OutputItem;
+ use codex_code_mode_protocol::ImageDetail;
+-use codex_protocol::models::AudioReference;
+-use codex_protocol::models::FunctionCallOutputContentItem;
+-use codex_protocol::models::ImageDetail as ProtocolImageDetail;
+-use codex_protocol::models::ImageReference;
++use codex_code_mode_protocol::models::AudioReference;
++use codex_code_mode_protocol::models::FunctionCallOutputContentItem;
++use codex_code_mode_protocol::models::ImageDetail as ProtocolImageDetail;
++use codex_code_mode_protocol::models::ImageReference;
+ use codex_utils_audio::estimate_tool_audio_tokens_without_cache;
+ use codex_utils_output_truncation::OutputBoundary;
+ use codex_utils_output_truncation::formatted_output_at_token_boundaries;
+diff --git a/code-mode-runtime/src/runtime/audio.rs b/code-mode-runtime/src/runtime/audio.rs
+index c17b4bc..8493548 100644
 --- a/code-mode-runtime/src/runtime/audio.rs
 +++ b/code-mode-runtime/src/runtime/audio.rs
 @@ -1,9 +1,10 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  //! Measures tool-generated PCM WAV clips using the audio bytes actually present.
  //! Unknown formats retain the existing audio output behavior.
- 
+
  use base64::Engine;
  use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 -use codex_protocol::models::MAX_PROMPT_AUDIO_INPUT_BYTES;
 +use codex_code_mode_protocol::MAX_PROMPT_AUDIO_INPUT_BYTES;
- 
+
  pub(super) fn wav_duration_seconds(audio_url: &str) -> Option<f64> {
      let (metadata, payload) = audio_url.split_once(',')?;
+diff --git a/code-mode-runtime/src/runtime/callbacks_tests.rs b/code-mode-runtime/src/runtime/callbacks_tests.rs
+index 06e410d..b0b2fbb 100644
+--- a/code-mode-runtime/src/runtime/callbacks_tests.rs
++++ b/code-mode-runtime/src/runtime/callbacks_tests.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ //! Exercises the host guard separately from V8's interrupt mechanism. Simulate
+ //! V8 continuing to execute after exit was requested, including during getters.
+
+@@ -7,7 +8,7 @@ use std::sync::mpsc as std_mpsc;
+
+ use codex_code_mode_protocol::CodeModeToolKind;
+ use codex_code_mode_protocol::EnabledToolMetadata;
+-use codex_protocol::ToolName;
++use codex_code_mode_protocol::ToolName;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+ use tokio::sync::mpsc;
+diff --git a/code-mode-runtime/src/runtime/mod.rs b/code-mode-runtime/src/runtime/mod.rs
+index 44b61fb..9c2567c 100644
 --- a/code-mode-runtime/src/runtime/mod.rs
 +++ b/code-mode-runtime/src/runtime/mod.rs
 @@ -1,3 +1,4 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  mod audio;
  mod callbacks;
- mod globals;
-@@ -16,8 +17,8 @@
+ mod event_channel;
+@@ -19,8 +20,8 @@ use crate::v8_init::ensure_v8_initialized;
+ use codex_code_mode_protocol::CodeModeToolKind;
  use codex_code_mode_protocol::EnabledToolMetadata;
  use codex_code_mode_protocol::ExecuteRequest;
- use codex_code_mode_protocol::FunctionCallOutputContentItem;
 +use codex_code_mode_protocol::ToolName;
- use codex_code_mode_protocol::enabled_tool_metadata;
+ use codex_code_mode_protocol::normalize_code_mode_identifier;
 -use codex_protocol::ToolName;
+ pub(crate) use event_channel::RuntimeEventReceiver;
+ pub(crate) use event_channel::RuntimeEventSender;
+ pub(crate) use event_channel::runtime_event_channel;
+diff --git a/code-mode-runtime/src/runtime/value.rs b/code-mode-runtime/src/runtime/value.rs
+index 3ad82eb..a6716ba 100644
+--- a/code-mode-runtime/src/runtime/value.rs
++++ b/code-mode-runtime/src/runtime/value.rs
+@@ -1,11 +1,12 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use serde_json::Value as JsonValue;
- use tokio::sync::mpsc;
- 
+
+ use crate::session_runtime::OutputItem;
+ use codex_code_mode_protocol::DEFAULT_IMAGE_DETAIL;
+ use codex_code_mode_protocol::ImageDetail;
+-use codex_protocol::models::AudioReference;
+-use codex_protocol::models::FunctionCallOutputContentItem;
+-use codex_protocol::models::ImageReference;
++use codex_code_mode_protocol::models::AudioReference;
++use codex_code_mode_protocol::models::FunctionCallOutputContentItem;
++use codex_code_mode_protocol::models::ImageReference;
+
+ use super::RuntimeState;
+ use super::audio::wav_duration_seconds;
+diff --git a/code-mode-runtime/src/service.rs b/code-mode-runtime/src/service.rs
+index ad00999..12272ce 100644
 --- a/code-mode-runtime/src/service.rs
 +++ b/code-mode-runtime/src/service.rs
 @@ -1,3 +1,4 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use std::sync::Arc;
  use std::time::Duration;
- 
-@@ -274,7 +275,7 @@
+
+@@ -338,7 +339,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
                  CodeModeNestedToolCall {
                      cell_id: protocol_cell_id(&invocation.cell_id),
                      runtime_tool_call_id: invocation.runtime_tool_call_id,
@@ -271,15 +631,17 @@
                          name: invocation.tool_name.name,
                          namespace: invocation.tool_name.namespace,
                      },
+diff --git a/code-mode-runtime/src/service_contract_tests.rs b/code-mode-runtime/src/service_contract_tests.rs
+index de19e9c..3e38107 100644
 --- a/code-mode-runtime/src/service_contract_tests.rs
 +++ b/code-mode-runtime/src/service_contract_tests.rs
 @@ -1,3 +1,4 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
  use std::sync::Arc;
  use std::sync::atomic::AtomicBool;
-@@ -6,7 +7,7 @@
- 
+@@ -6,7 +7,7 @@ use std::time::Duration;
+
  use codex_code_mode_protocol::NotificationFuture;
  use codex_code_mode_protocol::ToolInvocationFuture;
 -use codex_protocol::ToolName;
@@ -287,14 +649,16 @@
  use pretty_assertions::assert_eq;
  use tokio::sync::Notify;
  use tokio::sync::mpsc;
+diff --git a/code-mode-runtime/src/service_tests.rs b/code-mode-runtime/src/service_tests.rs
+index b49b209..0ea7c70 100644
 --- a/code-mode-runtime/src/service_tests.rs
 +++ b/code-mode-runtime/src/service_tests.rs
 @@ -1,3 +1,4 @@
-+// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
  use std::sync::Arc;
  use std::time::Duration;
-@@ -20,7 +21,7 @@
+@@ -20,7 +21,7 @@ use codex_code_mode_protocol::CodeModeSession;
  use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
  use codex_code_mode_protocol::NotificationFuture;
  use codex_code_mode_protocol::ToolInvocationFuture;
@@ -303,3 +667,439 @@
  use pretty_assertions::assert_eq;
  use serde_json::Value as JsonValue;
  use tokio::sync::Notify;
+diff --git a/utils/audio/Cargo.toml b/utils/audio/Cargo.toml
+index 9054022..e2109a6 100644
+--- a/utils/audio/Cargo.toml
++++ b/utils/audio/Cargo.toml
+@@ -1,3 +1,4 @@
++# Modified for the standalone AJ extraction: omit unused host integrations (Apache-2.0).
+ [package]
+ edition.workspace = true
+ license.workspace = true
+@@ -9,8 +10,7 @@ workspace = true
+
+ [dependencies]
+ base64 = { workspace = true }
+-codex-protocol = { workspace = true }
+-codex-utils-cache = { workspace = true }
++codex-code-mode-protocol = { workspace = true }
+ codex-utils-string = { workspace = true }
+ symphonia = { workspace = true }
+ thiserror = { workspace = true }
+diff --git a/utils/audio/src/audio_preparation_tests.rs b/utils/audio/src/audio_preparation_tests.rs
+index fc2d6ab..fc1bbac 100644
+--- a/utils/audio/src/audio_preparation_tests.rs
++++ b/utils/audio/src/audio_preparation_tests.rs
+@@ -1,175 +1,6 @@
+-use codex_protocol::models::AudioReference;
+-use codex_protocol::models::FunctionCallOutputBody;
+-use codex_protocol::models::FunctionCallOutputPayload;
+-use pretty_assertions::assert_eq;
+-
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ use super::*;
+-
+-#[test]
+-fn preparation_canonicalizes_data_urls_and_rejects_remote_urls() {
+-    let mut items = vec![ResponseItem::Message {
+-        status: None,
+-        encrypted_content: None,
+-        id: None,
+-        role: "user".to_string(),
+-        content: vec![
+-            ContentItem::InputAudio {
+-                audio: AudioReference::File {
+-                    file_id: "file_audio".into(),
+-                },
+-            },
+-            ContentItem::InputAudio {
+-                audio: AudioReference::Inline {
+-                    audio_url: "data:audio/x-wav;base64,YXVkaW8=".to_string(),
+-                },
+-            },
+-            ContentItem::InputAudio {
+-                audio: AudioReference::Inline {
+-                    audio_url: "data:audio/ogg;base64,YXVkaW8=".to_string(),
+-                },
+-            },
+-            ContentItem::InputAudio {
+-                audio: AudioReference::Inline {
+-                    audio_url: "https://example.com/audio.mp3".to_string(),
+-                },
+-            },
+-        ],
+-        phase: None,
+-        internal_chat_message_metadata_passthrough: None,
+-    }];
+-
+-    prepare_response_items(&mut items);
+-
+-    assert_eq!(
+-        items,
+-        vec![ResponseItem::Message {
+-            encrypted_content: None,
+-            status: None,
+-            id: None,
+-            role: "user".to_string(),
+-            content: vec![
+-                ContentItem::InputAudio {
+-                    audio: AudioReference::File {
+-                        file_id: "file_audio".into(),
+-                    }
+-                },
+-                ContentItem::InputAudio {
+-                    audio: AudioReference::Inline {
+-                        audio_url: "data:audio/wav;base64,YXVkaW8=".to_string()
+-                    }
+-                },
+-                ContentItem::InputAudio {
+-                    audio: AudioReference::Inline {
+-                        audio_url: "data:audio/ogg;base64,YXVkaW8=".to_string()
+-                    }
+-                },
+-                ContentItem::InputText {
+-                    text: "audio content omitted because it could not be processed".to_string(),
+-                },
+-            ],
+-            phase: None,
+-            internal_chat_message_metadata_passthrough: None,
+-        }]
+-    );
+-}
+-
+-#[test]
+-fn preparation_replaces_invalid_message_audio_with_placeholders() {
+-    let mut items = vec![ResponseItem::Message {
+-        status: None,
+-        encrypted_content: None,
+-        id: None,
+-        role: "user".to_string(),
+-        content: vec![
+-            ContentItem::InputAudio {
+-                audio: AudioReference::Inline {
+-                    audio_url: "data:audio/wav;base64,%%%".to_string(),
+-                },
+-            },
+-            ContentItem::InputAudio {
+-                audio: AudioReference::Inline {
+-                    audio_url: "data:audio/flac;base64,YXVkaW8=".to_string(),
+-                },
+-            },
+-        ],
+-        phase: None,
+-        internal_chat_message_metadata_passthrough: None,
+-    }];
+-
+-    prepare_response_items(&mut items);
+-
+-    assert_eq!(
+-        items,
+-        vec![ResponseItem::Message {
+-            encrypted_content: None,
+-            status: None,
+-            id: None,
+-            role: "user".to_string(),
+-            content: vec![
+-                ContentItem::InputText {
+-                    text: "audio content omitted because it could not be processed".to_string(),
+-                },
+-                ContentItem::InputText {
+-                    text: "audio content omitted because its format is not supported; use wav, mp3, m4a, webm, or ogg".to_string(),
+-                },
+-            ],
+-            phase: None,
+-            internal_chat_message_metadata_passthrough: None,
+-        }]
+-    );
+-}
+-
+-#[test]
+-fn preparation_replaces_only_failed_tool_audio_and_preserves_metadata() {
+-    let mut items = vec![ResponseItem::FunctionCallOutput {
+-        id: None,
+-        call_id: Some("call-1".to_string()),
+-        name: None,
+-        namespace: None,
+-        output: FunctionCallOutputPayload {
+-            body: FunctionCallOutputBody::ContentItems(vec![
+-                FunctionCallOutputContentItem::InputText {
+-                    text: "before".to_string(),
+-                },
+-                FunctionCallOutputContentItem::inline_audio(
+-                    "data:audio/wav;base64,YXVkaW8=".to_string(),
+-                ),
+-                FunctionCallOutputContentItem::inline_audio(
+-                    "data:audio/wav,not-base64".to_string(),
+-                ),
+-            ]),
+-            success: Some(true),
+-        },
+-        internal_chat_message_metadata_passthrough: None,
+-    }];
+-
+-    prepare_response_items(&mut items);
+-
+-    assert_eq!(
+-        items,
+-        vec![ResponseItem::FunctionCallOutput {
+-            id: None,
+-            call_id: Some("call-1".to_string()),
+-            name: None,
+-            namespace: None,
+-            output: FunctionCallOutputPayload {
+-                body: FunctionCallOutputBody::ContentItems(vec![
+-                    FunctionCallOutputContentItem::InputText {
+-                        text: "before".to_string(),
+-                    },
+-                    FunctionCallOutputContentItem::inline_audio(
+-                        "data:audio/wav;base64,YXVkaW8=".to_string()
+-                    ),
+-                    FunctionCallOutputContentItem::InputText {
+-                        text: "audio content omitted because it could not be processed".to_string(),
+-                    },
+-                ]),
+-                success: Some(true),
+-            },
+-            internal_chat_message_metadata_passthrough: None,
+-        }]
+-    );
+-}
++use pretty_assertions::assert_eq;
+
+ #[test]
+ fn preparation_errors_map_to_expected_placeholders() {
+diff --git a/utils/audio/src/lib.rs b/utils/audio/src/lib.rs
+index 1a8333d..7e60d7d 100644
+--- a/utils/audio/src/lib.rs
++++ b/utils/audio/src/lib.rs
+@@ -1,26 +1,17 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ //! Audio preparation and duration-based token estimates for model inputs.
+
+ use base64::Engine;
+ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+-use codex_protocol::models::AudioReference;
+-use codex_protocol::models::ContentItem;
+-use codex_protocol::models::FunctionCallOutputContentItem;
+-use codex_protocol::models::MAX_PROMPT_AUDIO_INPUT_BYTES;
+-use codex_protocol::models::ResponseItem;
+-use codex_utils_cache::BlockingLruCache;
+-use codex_utils_cache::sha1_digest;
++use codex_code_mode_protocol::MAX_PROMPT_AUDIO_INPUT_BYTES;
++use codex_code_mode_protocol::models::AudioReference;
+ use codex_utils_string::approx_token_count;
+ use std::io::Cursor;
+-use std::num::NonZeroUsize;
+-use std::sync::Arc;
+-use std::sync::LazyLock;
+-use std::sync::OnceLock;
+ use symphonia::core::formats::FormatOptions;
+ use symphonia::core::formats::TrackType;
+ use symphonia::core::formats::probe::Hint;
+ use symphonia::core::io::MediaSourceStream;
+ use symphonia::core::meta::MetadataOptions;
+-use tracing::warn;
+
+ const AUDIO_PROCESSING_ERROR_PLACEHOLDER: &str =
+     "audio content omitted because it could not be processed";
+@@ -30,16 +21,8 @@ const UNSUPPORTED_AUDIO_FORMAT_PLACEHOLDER: &str =
+     "audio content omitted because its format is not supported; use wav, mp3, m4a, webm, or ogg";
+
+ const MAX_PROMPT_AUDIO_BASE64_BYTES: usize = MAX_PROMPT_AUDIO_INPUT_BYTES.div_ceil(3) * 4;
+-const AUDIO_TOKEN_ESTIMATE_CACHE_SIZE: usize = 32;
+ const AUDIO_TOKENS_PER_SECOND: u32 = 10;
+
+-static AUDIO_TOKEN_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Arc<OnceLock<usize>>>> =
+-    LazyLock::new(|| {
+-        BlockingLruCache::new(
+-            NonZeroUsize::new(AUDIO_TOKEN_ESTIMATE_CACHE_SIZE).unwrap_or(NonZeroUsize::MIN),
+-        )
+-    });
+-
+ #[derive(Debug, thiserror::Error)]
+ pub enum AudioPreparationError {
+     #[error("invalid audio data URL: {reason}")]
+@@ -60,66 +43,6 @@ impl AudioPreparationError {
+     }
+ }
+
+-/// Canonicalizes audio inputs and replaces unsupported inputs with text placeholders.
+-pub fn prepare_response_items(items: &mut [ResponseItem]) {
+-    for item in items {
+-        match item {
+-            ResponseItem::Message { content, .. } => prepare_message_content(content),
+-            ResponseItem::FunctionCallOutput { output, .. }
+-            | ResponseItem::CustomToolCallOutput { output, .. } => {
+-                if let Some(content) = output.content_items_mut() {
+-                    prepare_tool_output_content(content);
+-                }
+-            }
+-            ResponseItem::AdditionalTools { .. }
+-            | ResponseItem::Reasoning { .. }
+-            | ResponseItem::AgentMessage { .. }
+-            | ResponseItem::LocalShellCall { .. }
+-            | ResponseItem::FunctionCall { .. }
+-            | ResponseItem::ToolSearchCall { .. }
+-            | ResponseItem::CustomToolCall { .. }
+-            | ResponseItem::ToolSearchOutput { .. }
+-            | ResponseItem::WebSearchCall { .. }
+-            | ResponseItem::ImageGenerationCall { .. }
+-            | ResponseItem::Compaction { .. }
+-            | ResponseItem::ConfigurationUpdate { .. }
+-            | ResponseItem::CompactionTrigger { .. }
+-            | ResponseItem::ContextCompaction { .. }
+-            | ResponseItem::Other => {}
+-        }
+-    }
+-}
+-
+-fn prepare_message_content(items: &mut [ContentItem]) {
+-    for item in items {
+-        if let ContentItem::InputAudio {
+-            audio: AudioReference::Inline { audio_url },
+-        } = item
+-            && let Err(error) = prepare_audio(audio_url)
+-        {
+-            warn!(%error, "failed to prepare message audio");
+-            *item = ContentItem::InputText {
+-                text: error.placeholder().to_string(),
+-            };
+-        }
+-    }
+-}
+-
+-fn prepare_tool_output_content(items: &mut [FunctionCallOutputContentItem]) {
+-    for item in items {
+-        if let FunctionCallOutputContentItem::InputAudio {
+-            audio: AudioReference::Inline { audio_url },
+-        } = item
+-            && let Err(error) = prepare_audio(audio_url)
+-        {
+-            warn!(%error, "failed to prepare tool output audio");
+-            *item = FunctionCallOutputContentItem::InputText {
+-                text: error.placeholder().to_string(),
+-            };
+-        }
+-    }
+-}
+-
+ fn is_data_url(audio_url: &str) -> bool {
+     audio_url
+         .get(.."data:".len())
+@@ -162,11 +85,6 @@ pub fn estimate_file_audio_tokens(duration: Option<std::time::Duration>) -> usiz
+     usize::try_from(tokens).unwrap_or(usize::MAX)
+ }
+
+-/// Estimate tool audio on Core's multi-threaded runtime.
+-pub fn estimate_tool_audio_tokens(audio: &AudioReference) -> usize {
+-    estimate_tool_audio_tokens_with(audio, estimate_audio_token_count)
+-}
+-
+ /// Code Mode can render on a single thread, where blocking cache access is unavailable.
+ pub fn estimate_tool_audio_tokens_without_cache(audio: &AudioReference) -> usize {
+     estimate_tool_audio_tokens_with(audio, estimate_audio_token_count_without_cache)
+@@ -182,13 +100,6 @@ fn estimate_tool_audio_tokens_with(
+     }
+ }
+
+-/// Estimates audio tokens from decoded duration, falling back to the data URL size.
+-fn estimate_audio_token_count(audio_url: &str) -> usize {
+-    let key = sha1_digest(audio_url.as_bytes());
+-    AUDIO_TOKEN_ESTIMATE_CACHE
+-        .get_or_init(key, || estimate_audio_token_count_without_cache(audio_url))
+-}
+-
+ /// The same duration-based estimate without accessing the Tokio-dependent cache.
+ /// Suitable for bounded output rendered on a current-thread runtime.
+ fn estimate_audio_token_count_without_cache(audio_url: &str) -> usize {
+@@ -248,12 +159,6 @@ pub fn prepare_and_measure_inline_audio(
+     Ok(decoded_audio_token_count(mime, bytes, audio_url))
+ }
+
+-fn prepare_audio(audio_url: &mut String) -> Result<(), AudioPreparationError> {
+-    let (mime, _) = decode_audio(audio_url)?;
+-    normalize_validated_header(audio_url, mime);
+-    Ok(())
+-}
+-
+ // The standard base64 decoder has already validated the payload, including padding.
+ fn normalize_validated_header(url: &mut String, mime: &str) {
+     let canonical = format!("data:{mime};base64");
+diff --git a/utils/output-truncation/Cargo.toml b/utils/output-truncation/Cargo.toml
+index 3f83bd5..0d4a4aa 100644
+--- a/utils/output-truncation/Cargo.toml
++++ b/utils/output-truncation/Cargo.toml
+@@ -1,3 +1,4 @@
++# Modified for the standalone AJ extraction: omit unused host integrations (Apache-2.0).
+ [package]
+ edition.workspace = true
+ license.workspace = true
+@@ -8,7 +9,7 @@ version.workspace = true
+ workspace = true
+
+ [dependencies]
+-codex-protocol = { workspace = true }
++codex-code-mode-protocol = { workspace = true }
+ codex-utils-string = { workspace = true }
+ serde_json = { workspace = true }
+
+diff --git a/utils/output-truncation/src/lib.rs b/utils/output-truncation/src/lib.rs
+index e676a9d..3840af0 100644
+--- a/utils/output-truncation/src/lib.rs
++++ b/utils/output-truncation/src/lib.rs
+@@ -1,13 +1,14 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ //! Shared byte/token truncation for tool and exec output.
+
+ use std::borrow::Cow;
+
+-use codex_protocol::mcp::CallToolResult;
+-use codex_protocol::mcp::plain_output_text;
+-use codex_protocol::models::AudioReference;
+-use codex_protocol::models::FunctionCallOutputBody;
+-use codex_protocol::models::FunctionCallOutputContentItem;
+-use codex_protocol::models::FunctionCallOutputPayload;
++use codex_code_mode_protocol::mcp::CallToolResult;
++use codex_code_mode_protocol::mcp::plain_output_text;
++use codex_code_mode_protocol::models::AudioReference;
++use codex_code_mode_protocol::models::FunctionCallOutputBody;
++use codex_code_mode_protocol::models::FunctionCallOutputContentItem;
++use codex_code_mode_protocol::models::FunctionCallOutputPayload;
+ use codex_utils_string::TextTruncation;
+ pub use codex_utils_string::approx_bytes_for_tokens;
+ pub use codex_utils_string::approx_token_count;
+@@ -15,7 +16,7 @@ pub use codex_utils_string::approx_tokens_from_byte_count;
+ use codex_utils_string::plan_token_truncation;
+ use codex_utils_string::truncate_middle_chars;
+
+-pub use codex_protocol::protocol::TruncationPolicy;
++pub use codex_code_mode_protocol::TruncationPolicy;
+
+ /// Adds the existing 20% allowance for serialization and headers.
+ /// Saved history budgets already include this allowance.
+diff --git a/utils/output-truncation/src/truncate_tests.rs b/utils/output-truncation/src/truncate_tests.rs
+index 9f8cf04..4200f4c 100644
+--- a/utils/output-truncation/src/truncate_tests.rs
++++ b/utils/output-truncation/src/truncate_tests.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ use crate::OutputBoundary;
+ use crate::TruncationPolicy;
+ use crate::approx_token_count;
+@@ -10,11 +11,11 @@ use crate::truncate_function_output_items_with_policy;
+ use crate::truncate_mcp_tool_result;
+ use crate::truncate_measured_tool_output;
+ use crate::truncate_text;
+-use codex_protocol::mcp::CallToolResult;
+-use codex_protocol::models::AudioReference;
+-use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+-use codex_protocol::models::FunctionCallOutputContentItem;
+-use codex_protocol::models::ImageReference;
++use codex_code_mode_protocol::mcp::CallToolResult;
++use codex_code_mode_protocol::models::AudioReference;
++use codex_code_mode_protocol::models::DEFAULT_IMAGE_DETAIL;
++use codex_code_mode_protocol::models::FunctionCallOutputContentItem;
++use codex_code_mode_protocol::models::ImageReference;
+ use pretty_assertions::assert_eq;
+
+ #[test]

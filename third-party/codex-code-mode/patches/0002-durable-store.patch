@@ -1,5 +1,5 @@
 diff --git a/code-mode-protocol/src/session.rs b/code-mode-protocol/src/session.rs
-index 1c87cb8..181b0a6 100644
+index 8250117..220cb08 100644
 --- a/code-mode-protocol/src/session.rs
 +++ b/code-mode-protocol/src/session.rs
 @@ -1,3 +1,5 @@
@@ -8,10 +8,10 @@ index 1c87cb8..181b0a6 100644
  use std::fmt;
  use std::future::Future;
  use std::pin::Pin;
-@@ -114,6 +116,19 @@ pub trait CodeModeSessionDelegate: Send + Sync {
+@@ -145,6 +147,19 @@ pub trait CodeModeSessionDelegate: Send + Sync {
          cancellation_token: CancellationToken,
      ) -> NotificationFuture<'a>;
- 
+
 +    /// Saves a completed cell's nonempty writes before they become visible to new cells.
 +    /// Completion has won over cancellation, so this callback must finish even during
 +    /// termination or session shutdown. An error leaves the session's values unchanged.
@@ -28,8 +28,111 @@ index 1c87cb8..181b0a6 100644
      /// Releases delegate state associated with a cell after it reaches a terminal state.
      fn cell_closed(&self, cell_id: &CellId);
  }
+diff --git a/code-mode-runtime/src/cell_actor/callbacks_tests.rs b/code-mode-runtime/src/cell_actor/callbacks_tests.rs
+index 0f60830..db5192d 100644
+--- a/code-mode-runtime/src/cell_actor/callbacks_tests.rs
++++ b/code-mode-runtime/src/cell_actor/callbacks_tests.rs
+@@ -1,3 +1,4 @@
++// Modified for AJ: acknowledged stored-value completion (Apache-2.0).
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::mpsc as std_mpsc;
+@@ -40,7 +41,7 @@ impl CellHost for PanickingCallbackHost {
+     async fn commit_completion(
+         &self,
+         _stored_value_writes: HashMap<String, Arc<JsonValue>>,
+-        _event: impl FnOnce() -> CellEvent + Send,
++        _event: impl FnOnce(Option<String>) -> CellEvent + Send,
+         _cell_state: Arc<CellState>,
+     ) -> CompletionCommit {
+         panic!("unexpected completion commit");
+diff --git a/code-mode-runtime/src/cell_actor/mod.rs b/code-mode-runtime/src/cell_actor/mod.rs
+index fe1c69d..9c21e0b 100644
+--- a/code-mode-runtime/src/cell_actor/mod.rs
++++ b/code-mode-runtime/src/cell_actor/mod.rs
+@@ -1,3 +1,4 @@
++// Modified for AJ: acknowledged stored-value completion (Apache-2.0).
+ mod callbacks;
+ mod conversions;
+ mod types;
+@@ -295,10 +296,10 @@ async fn run_cell<H: CellHost>(
+                     host
+                         .commit_completion(
+                             HashMap::new(),
+-                            || {
+-                                take_completed_event(&mut output, Some(
++                            |store_error| {
++                                take_completed_event(&mut output, merge_errors(Some(
+                                     "exec runtime ended unexpectedly".to_string(),
+-                                ))
++                                ), store_error))
+                             },
+                             Arc::clone(&cell_state),
+                         )
+@@ -416,7 +417,7 @@ async fn run_cell<H: CellHost>(
+                         host
+                             .commit_completion(
+                                 stored_value_writes,
+-                                || take_completed_event(&mut output, error_text),
++                                |store_error| take_completed_event(&mut output, merge_errors(error_text, store_error)),
+                                 Arc::clone(&cell_state),
+                             )
+                             .await;
+@@ -474,6 +475,13 @@ async fn run_cell<H: CellHost>(
+     host.closed().await;
+ }
+
++fn merge_errors(script_error: Option<String>, store_error: Option<String>) -> Option<String> {
++    match (script_error, store_error) {
++        (Some(script), Some(store)) => Some(format!("{script}\n{store}")),
++        (script, store) => script.or(store),
++    }
++}
++
+ /// Construct completion only after the terminal outcome is settled.
+ pub(crate) fn take_completed_event(
+     output: &mut OutputCollector,
+diff --git a/code-mode-runtime/src/cell_actor/tests.rs b/code-mode-runtime/src/cell_actor/tests.rs
+index 15e800b..f1a566f 100644
+--- a/code-mode-runtime/src/cell_actor/tests.rs
++++ b/code-mode-runtime/src/cell_actor/tests.rs
+@@ -1,3 +1,4 @@
++// Modified for AJ: acknowledged stored-value completion (Apache-2.0).
+ // Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
+ use std::collections::HashMap;
+ use std::sync::Arc;
+@@ -51,14 +52,14 @@ impl CellHost for TestHost {
+     async fn commit_completion(
+         &self,
+         _stored_value_writes: HashMap<String, Arc<JsonValue>>,
+-        event: impl FnOnce() -> CellEvent + Send,
++        event: impl FnOnce(Option<String>) -> CellEvent + Send,
+         cell_state: Arc<CellState>,
+     ) -> CompletionCommit {
+         self.commit_started.cancel();
+         if let Some(resume) = &self.resume_commit {
+             resume.cancelled().await;
+         }
+-        cell_state.commit_completion(event, || {})
++        cell_state.commit_completion(|| event(None), || {})
+     }
+
+     async fn closed(&self) {}
+@@ -86,10 +87,10 @@ impl CellHost for RecordingHost {
+     async fn commit_completion(
+         &self,
+         _stored_value_writes: HashMap<String, Arc<JsonValue>>,
+-        event: impl FnOnce() -> CellEvent + Send,
++        event: impl FnOnce(Option<String>) -> CellEvent + Send,
+         cell_state: Arc<CellState>,
+     ) -> CompletionCommit {
+-        cell_state.commit_completion(event, || {})
++        cell_state.commit_completion(|| event(None), || {})
+     }
+
+     async fn closed(&self) {}
 diff --git a/code-mode-runtime/src/cell_actor/types.rs b/code-mode-runtime/src/cell_actor/types.rs
-index 2aa3430..a7120ef 100644
+index 8c488bc..963b214 100644
 --- a/code-mode-runtime/src/cell_actor/types.rs
 +++ b/code-mode-runtime/src/cell_actor/types.rs
 @@ -1,3 +1,4 @@
@@ -37,8 +140,17 @@ index 2aa3430..a7120ef 100644
  use std::collections::HashMap;
  use std::future::Future;
  use std::pin::Pin;
-@@ -116,6 +117,9 @@ pub(crate) struct CellState {
- 
+@@ -55,7 +56,7 @@ pub(crate) trait CellHost: Send + Sync + 'static {
+     fn commit_completion(
+         &self,
+         stored_value_writes: HashMap<String, Arc<JsonValue>>,
+-        event: impl FnOnce() -> CellEvent + Send,
++        event: impl FnOnce(Option<String>) -> CellEvent + Send,
+         cell_state: Arc<CellState>,
+     ) -> impl Future<Output = CompletionCommit> + Send;
+
+@@ -115,6 +116,9 @@ pub(crate) struct CellState {
+
  enum CellPhase {
      Running,
 +    Committing {
@@ -47,7 +159,7 @@ index 2aa3430..a7120ef 100644
      Terminating {
          response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
      },
-@@ -162,7 +166,7 @@ impl CellState {
+@@ -160,7 +164,7 @@ impl CellState {
                  .phase
                  .lock()
                  .unwrap_or_else(std::sync::PoisonError::into_inner),
@@ -56,7 +168,7 @@ index 2aa3430..a7120ef 100644
          );
          accepting_phase && !self.cancellation_token.is_cancelled()
      }
-@@ -179,6 +183,21 @@ impl CellState {
+@@ -177,6 +181,21 @@ impl CellState {
                  self.cancellation_token.cancel();
                  response_event(response_rx)
              }
@@ -78,12 +190,11 @@ index 2aa3430..a7120ef 100644
              CellPhase::Terminating { response_tx } => {
                  *phase = CellPhase::Terminating { response_tx };
                  Box::pin(async { Err(CellError::AlreadyTerminating) })
-@@ -200,6 +219,20 @@ impl CellState {
+@@ -198,6 +217,19 @@ impl CellState {
          }
      }
- 
-+    /// Reserves the terminal outcome before awaiting persistence, without holding
-+    /// the phase mutex across that await. Later cancellation cannot undo the write.
+
++    /// Reserve completion before awaiting persistence. Later cancellation cannot undo it.
 +    pub(crate) fn reserve_completion(&self) -> bool {
 +        let mut phase = self
 +            .phase
@@ -98,41 +209,44 @@ index 2aa3430..a7120ef 100644
 +
      pub(crate) fn commit_completion(
          &self,
-         event: CellEvent,
-@@ -210,14 +243,26 @@ impl CellState {
+         event: impl FnOnce() -> CellEvent,
+@@ -207,16 +239,27 @@ impl CellState {
              .phase
              .lock()
              .unwrap_or_else(std::sync::PoisonError::into_inner);
 -        if !matches!(*phase, CellPhase::Running) || self.cancellation_token.is_cancelled() {
--            return CompletionCommit::Rejected(event);
+-            return CompletionCommit::Rejected;
 +        match &*phase {
 +            CellPhase::Running if !self.cancellation_token.is_cancelled() => {}
 +            CellPhase::Committing { .. } => {}
-+            _ => return CompletionCommit::Rejected(event),
++            _ => return CompletionCommit::Rejected,
          }
          commit();
 -        *phase = CellPhase::Completed {
--            pending_initial_yield_items,
--            event,
+-            // Construct terminal output only after completion wins. In bounded
+-            // mode, an error may evict user output; termination must not see it.
+-            event: event(),
+-            completed_at: Instant::now(),
 -        };
++        // Build terminal output only after completion wins, including persistence errors.
++        let event = event();
 +        if let CellPhase::Committing {
 +            terminator: Some(response_tx),
 +        } = std::mem::replace(&mut *phase, CellPhase::Tombstone)
 +        {
-+            let event = prepend_initial_yield(event, pending_initial_yield_items);
 +            *phase = CellPhase::CompletionClaimed(event.clone());
 +            let _ = response_tx.send(Ok(event));
 +            self.cancellation_token.cancel();
 +        } else {
 +            *phase = CellPhase::Completed {
-+                pending_initial_yield_items,
 +                event,
++                completed_at: Instant::now(),
 +            };
 +        }
          CompletionCommit::Committed
      }
- 
-@@ -275,8 +320,8 @@ impl CellState {
+
+@@ -269,8 +312,8 @@ impl CellState {
              .lock()
              .unwrap_or_else(std::sync::PoisonError::into_inner);
          match std::mem::replace(&mut *phase, CellPhase::Tombstone) {
@@ -143,7 +257,7 @@ index 2aa3430..a7120ef 100644
                  ObservationDelivery::Running(response_tx)
              }
              CellPhase::Completed {
-@@ -357,6 +402,12 @@ impl CellState {
+@@ -317,6 +360,12 @@ impl CellState {
              .unwrap_or_else(std::sync::PoisonError::into_inner);
          let observer_event = match std::mem::replace(&mut *phase, CellPhase::Tombstone) {
              CellPhase::Running => Some(event),
@@ -157,35 +271,41 @@ index 2aa3430..a7120ef 100644
                  let _ = response_tx.send(Ok(event.clone()));
                  Some(event)
 diff --git a/code-mode-runtime/src/service.rs b/code-mode-runtime/src/service.rs
-index c50caa0..2d57406 100644
+index 12272ce..45b9c1e 100644
 --- a/code-mode-runtime/src/service.rs
 +++ b/code-mode-runtime/src/service.rs
-@@ -1,4 +1,6 @@
- // Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+@@ -1,3 +1,5 @@
 +// Modified for AJ: restored values and acknowledged commits (Apache-2.0).
 +use std::collections::HashMap;
+ // Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
  use std::sync::Arc;
  use std::time::Duration;
- 
-@@ -50,6 +52,14 @@ impl InProcessCodeModeSession {
+@@ -73,6 +75,21 @@ impl InProcessCodeModeSession {
          }
      }
- 
-+    /// Creates a session with restored values available to its first cell and default limits.
-+    pub fn with_stored_values(stored_values: HashMap<String, JsonValue>) -> Self {
-+        Self {
-+            runtime: SessionRuntime::with_stored_values(stored_values),
-+            cell_execution_limits: CodeModeSessionCellExecutionLimits::default(),
-+        }
+
++    /// Creates a session with restored values and the supplied output policy.
++    pub fn with_stored_values_and_options(
++        stored_values: HashMap<String, JsonValue>,
++        options: CodeModeSessionOptions,
++    ) -> Self {
++        let mut session = Self::with_options(options, None);
++        session.runtime = SessionRuntime::with_stored_values(stored_values);
++        session
 +    }
 +
-     pub fn with_task_failure_handler(
-         task_failure_handler: Arc<dyn Fn(String) + Send + Sync>,
-         cell_execution_limits: CodeModeSessionCellExecutionLimits,
-@@ -307,6 +317,16 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
++    /// Creates a session with restored values and default options.
++    pub fn with_stored_values(stored_values: HashMap<String, JsonValue>) -> Self {
++        Self::with_stored_values_and_options(stored_values, CodeModeSessionOptions::default())
++    }
++
+     pub async fn execute(
+         &self,
+         request: ExecuteRequest,
+@@ -371,6 +388,16 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
              .await
      }
- 
+
 +    async fn store(
 +        &self,
 +        cell_id: runtime::CellId,
@@ -200,16 +320,16 @@ index c50caa0..2d57406 100644
          self.delegate.cell_closed(&protocol_cell_id(cell_id));
      }
 diff --git a/code-mode-runtime/src/session_runtime/mod.rs b/code-mode-runtime/src/session_runtime/mod.rs
-index 0d2f453..c97a127 100644
+index f8da480..6c42780 100644
 --- a/code-mode-runtime/src/session_runtime/mod.rs
 +++ b/code-mode-runtime/src/session_runtime/mod.rs
 @@ -1,3 +1,4 @@
 +// Modified for AJ: restored values and reserved async commits (Apache-2.0).
  mod types;
- 
+
  use std::collections::HashMap;
 @@ -61,10 +62,26 @@ impl SessionRuntime {
- 
+
      pub(crate) fn new_with_task_failure_handler(
          task_failure_handler: Option<TaskFailureHandler>,
 +    ) -> Self {
@@ -239,7 +359,7 @@ index 0d2f453..c97a127 100644
 @@ -283,10 +300,14 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
              .await
      }
- 
+
 +    #[expect(
 +        clippy::await_holding_invalid_type,
 +        reason = "the async stored-values lock serializes acknowledgements and blocks snapshots until commit"
@@ -247,19 +367,23 @@ index 0d2f453..c97a127 100644
      async fn commit_completion(
          &self,
          stored_value_writes: HashMap<String, Arc<JsonValue>>,
--        event: CellEvent,
-+        mut event: CellEvent,
-         pending_initial_yield_items: Option<Vec<OutputItem>>,
+-        event: impl FnOnce() -> CellEvent + Send,
++        event: impl FnOnce(Option<String>) -> CellEvent + Send,
          cell_state: Arc<CellState>,
      ) -> CompletionCommit {
-@@ -298,8 +319,38 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
+         let cancellation_token = cell_state.cancellation_token();
+@@ -297,10 +318,31 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
              }
              stored_values = self.inner.stored_values.lock() => stored_values,
          };
+-        cell_state.commit_completion(event, || {
+-            stored_values.extend(stored_value_writes);
+-            drop(stored_values);
+-        })
 +        if !cell_state.reserve_completion() {
-+            return CompletionCommit::Rejected(event);
++            return CompletionCommit::Rejected;
 +        }
-+        // Keep snapshots and other commits behind the acknowledgement. Once reserved,
++        // Snapshots and other commits wait for acknowledgment. Once reserved,
 +        // termination and root cancellation must wait for this callback to finish.
 +        let saved = if stored_value_writes.is_empty() {
 +            Ok(())
@@ -268,32 +392,42 @@ index 0d2f453..c97a127 100644
 +                .store(self.cell_id.clone(), stored_value_writes.clone())
 +                .await
 +        };
-+        let apply_writes = match saved {
-+            Ok(()) => true,
-+            Err(error) => {
-+                if let CellEvent::Completed { error_text, .. } = &mut event {
-+                    let message = format!("stored values were not saved: {error}");
-+                    match error_text {
-+                        Some(original) => {
-+                            original.push('\n');
-+                            original.push_str(&message);
-+                        }
-+                        None => *error_text = Some(message),
-+                    }
++        let store_error = saved
++            .err()
++            .map(|error| format!("stored values were not saved: {error}"));
++        let apply_writes = store_error.is_none();
++        cell_state.commit_completion(
++            || event(store_error),
++            || {
++                if apply_writes {
++                    stored_values.extend(stored_value_writes);
 +                }
-+                false
-+            }
-+        };
-         cell_state.commit_completion(event, pending_initial_yield_items, || {
--            stored_values.extend(stored_value_writes);
-+            if apply_writes {
-+                stored_values.extend(stored_value_writes);
-+            }
-         })
++                drop(stored_values);
++            },
++        )
      }
- 
+
+     async fn closed(&self) {
+diff --git a/code-mode-runtime/src/session_runtime/tests.rs b/code-mode-runtime/src/session_runtime/tests.rs
+index c758849..625cbec 100644
+--- a/code-mode-runtime/src/session_runtime/tests.rs
++++ b/code-mode-runtime/src/session_runtime/tests.rs
+@@ -1,3 +1,4 @@
++// Modified for AJ: acknowledged stored-value completion (Apache-2.0).
+ use std::collections::HashMap;
+ use std::future::Future;
+ use std::sync::Arc;
+@@ -112,7 +113,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
+             "candidate".to_string(),
+             Arc::new(JsonValue::String("lost".to_string())),
+         )]),
+-        || panic!("terminated cell must not construct completion output"),
++        |_| panic!("terminated cell must not construct completion output"),
+         Arc::clone(&cell_state),
+     );
+     tokio::pin!(commit);
 diff --git a/code-mode-runtime/src/session_runtime/types.rs b/code-mode-runtime/src/session_runtime/types.rs
-index d1cdd79..3fc1402 100644
+index 770f43f..62232dc 100644
 --- a/code-mode-runtime/src/session_runtime/types.rs
 +++ b/code-mode-runtime/src/session_runtime/types.rs
 @@ -1,5 +1,8 @@
@@ -303,12 +437,12 @@ index d1cdd79..3fc1402 100644
  use std::future::Future;
 +use std::sync::Arc;
  use std::time::Duration;
- 
+
  use serde_json::Value as JsonValue;
-@@ -155,6 +158,14 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
+@@ -139,6 +142,14 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
          cancellation_token: CancellationToken,
      ) -> impl Future<Output = Result<(), String>> + Send;
- 
+
 +    fn store(
 +        &self,
 +        _cell_id: CellId,
@@ -319,13 +453,13 @@ index d1cdd79..3fc1402 100644
 +
      fn cell_closed(&self, cell_id: &CellId);
  }
- 
+
 diff --git a/code-mode-runtime/tests/stored_values.rs b/code-mode-runtime/tests/stored_values.rs
 new file mode 100644
-index 0000000..93eb88c
+index 0000000..35d3270
 --- /dev/null
 +++ b/code-mode-runtime/tests/stored_values.rs
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,327 @@
 +// Added for AJ: acknowledged stored-value runtime contracts (Apache-2.0).
 +use std::collections::HashMap;
 +use std::future::{Future, poll_fn};
@@ -452,14 +586,14 @@ index 0000000..93eb88c
 +        HashMap::from([("key".into(), Arc::new(json!("saved")))])
 +    );
 +
-+    let mut termination = Box::pin(session.terminate(id.clone()));
++    let mut termination = Box::pin(session.terminate(id.clone().into()));
 +    assert!(
 +        poll_fn(|cx| Poll::Ready(termination.as_mut().poll(cx)))
 +            .await
 +            .is_pending()
 +    );
 +    assert!(
-+        bounded(session.terminate(id))
++        bounded(session.terminate(id.into()))
 +            .await
 +            .unwrap_err()
 +            .contains("already terminating")
@@ -590,4 +724,66 @@ index 0000000..93eb88c
 +        None
 +    );
 +    bounded(shutdown).await.unwrap();
++}
++
++#[tokio::test]
++async fn bounded_completion_waits_for_store_and_budgets_both_errors_once() {
++    let session = InProcessCodeModeSession::with_stored_values_and_options(
++        HashMap::from([("key".into(), json!("old"))]),
++        CodeModeSessionOptions {
++            output_truncation: CodeModeOutputTruncation::Server,
++            ..Default::default()
++        },
++    );
++    let (delegate, mut entered) = StoreDelegate::new(Err("disk unavailable".into()));
++    let cell = session
++        .execute(
++            request(r#"store("key", "new"); text("output"); throw Error("script failed");"#),
++            delegate.clone(),
++            None,
++        )
++        .await
++        .unwrap();
++    let (id, _) = bounded(entered.recv()).await.unwrap();
++    let mut termination = Box::pin(session.terminate(id.into()));
++    assert!(
++        poll_fn(|cx| Poll::Ready(termination.as_mut().poll(cx)))
++            .await
++            .is_pending()
++    );
++    let mut reader = Box::pin(read(&session, r#"text(load("key"));"#));
++    assert!(
++        poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx)))
++            .await
++            .is_pending()
++    );
++    delegate.release.notify_one();
++    let WaitOutcome::LiveCell(response) = bounded(termination).await.unwrap() else {
++        panic!("missing cell")
++    };
++    let RuntimeResponse::Result {
++        content_items,
++        error_text,
++        ..
++    } = response
++    else {
++        panic!("missing completion")
++    };
++    let error = error_text.unwrap();
++    assert!(error.contains("script failed"));
++    assert!(error.contains("stored values were not saved: disk unavailable"));
++    assert_eq!(
++        content_items,
++        vec![
++            FunctionCallOutputContentItem::InputText {
++                text: "output".into()
++            },
++            FunctionCallOutputContentItem::InputText {
++                text: format!("Script error:\n{error}")
++            },
++        ]
++    );
++    assert_eq!(completed(bounded(reader).await, "old"), None);
++    bounded(cell.initial_response()).await.unwrap();
++    session.shutdown().await.unwrap();
 +}

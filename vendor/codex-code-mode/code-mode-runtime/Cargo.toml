@@ -1,4 +1,4 @@
-# Modified for the standalone AJ extraction: decouple protocol dependencies.
+# Modified for the standalone AJ extraction: omit unused host integrations (Apache-2.0).
 [package]
 edition.workspace = true
 license.workspace = true
@@ -16,15 +16,19 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 codex-code-mode-protocol = { workspace = true }
+codex-utils-audio = { workspace = true }
+codex-utils-output-truncation = { workspace = true }
+codex-utils-string = { workspace = true }
 deno_core_icudata = { workspace = true }
-futures = { workspace = true }
+futures = { workspace = true, features = ["executor", "std"] }
 opentelemetry = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-tokio-util = { workspace = true, features = ["rt"] }
+tokio-util = { workspace = true, features = ["codec", "compat", "rt"] }
 tracing = { workspace = true }
 v8 = { workspace = true, features = ["v8_enable_sandbox"] }
 
 [dev-dependencies]
+futures = { workspace = true, features = ["async-await"] }
 pretty_assertions = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

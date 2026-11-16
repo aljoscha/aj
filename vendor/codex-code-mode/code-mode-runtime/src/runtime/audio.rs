@@ -1,4 +1,4 @@
-// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+// Modified for the standalone AJ extraction: retain Code Mode dependencies only (Apache-2.0).
 //! Measures tool-generated PCM WAV clips using the audio bytes actually present.
 //! Unknown formats retain the existing audio output behavior.
 
