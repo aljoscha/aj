@@ -390,7 +390,7 @@ text(await tools[entry.name]({value: "native-js-result"}));
 }
 
 #[tokio::test]
-async fn unsupported_model_notices_and_executes_ordinary_tools() {
+async fn unsupported_model_silently_executes_ordinary_tools() {
     let echo = Echo::default();
     let mut h = Harness::new(false, vec![echo.clone().into()]);
     h.provider.enqueue("echo", json!({"value":"fallback"}));
@@ -401,7 +401,7 @@ async fn unsupported_model_notices_and_executes_ordinary_tools() {
     assert_eq!(contexts[0].tools[0].name, "echo");
     assert!(contexts[0].tools[0].input_format.is_none());
     assert_eq!(*echo.0.lock().unwrap(), ["fallback"]);
-    assert!(h.events.lock().unwrap().iter().any(|event| matches!(event,
+    assert!(!h.events.lock().unwrap().iter().any(|event| matches!(event,
         AgentEvent::Notice { text, .. } if text.contains("Code Mode")
     )));
 }

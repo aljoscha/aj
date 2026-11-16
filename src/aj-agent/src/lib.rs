@@ -967,7 +967,7 @@ impl Agent {
     }
 
     /// Request Code Mode for eligible models. Ineligible selections use ordinary
-    /// tools and report the fallback when the next run starts.
+    /// tools silently.
     pub fn set_code_mode(&mut self, enabled: bool) {
         self.code_mode_requested = enabled;
     }
@@ -1004,18 +1004,6 @@ impl Agent {
                 .map(|tool| tool.for_provider(self.provider.as_ref()))
                 .collect();
             self.tools.sort_by(|a, b| a.name.cmp(&b.name));
-            if self.code_mode_requested {
-                self.bus
-                    .emit(AgentEvent::Notice {
-                        agent_id: self.agent_id,
-                        text: format!(
-                            "Code Mode is not available for {}. Using ordinary tools.",
-                            self.model_info.id
-                        ),
-                    })
-                    .await
-                    .map_err(TurnError::Fatal)?;
-            }
         }
         Ok(())
     }
