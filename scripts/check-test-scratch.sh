@@ -7,6 +7,9 @@
 # guard while something was still writing. Both have bitten this project, and
 # both are invisible until /tmp fills up.
 #
+# The tests also run with `HOME` pointed at an empty directory, so they cannot
+# depend on the developer's own `~/.aj`.
+#
 # The suite is built first, under the ambient temp directory, so that rustc's
 # own scratch files are not mistaken for a test's.
 # Arguments select a cargo test target or scheduling mode. With no arguments,
@@ -42,11 +45,21 @@ trap 'rm -rf "$scratch"' EXIT
 scan="$(mktemp)"
 trap 'rm -rf "$scratch" "$scan"' EXIT
 
+# The tests run with an empty home directory. Code under test reads user state
+# from `~/.aj`, such as the model catalog, custom models, and skills, and a
+# test that reaches it would otherwise pass or fail by what the developer
+# happens to keep there. The toolchain is found through the real home, so its
+# locations are pinned before `HOME` moves.
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+home="$(mktemp -d)"
+trap 'rm -rf "$scratch" "$scan" "$home"' EXIT
+
 if (( $# == 0 )); then
     set -- --workspace
 fi
 cargo test --no-run --quiet "$@"
-TMPDIR="$scratch" cargo test --quiet "$@"
+HOME="$home" TMPDIR="$scratch" cargo test --quiet "$@"
 
 # Bash does not propagate a process substitution's status through its reader,
 # so materialize the NUL stream before accepting an empty scan as clean.
