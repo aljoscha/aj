@@ -166,7 +166,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // either a specific session id or "latest for this project";
     // `None` (the default) means "create a fresh session".
     //
-    // `list-sessions` and `update-models` are dispatched in `main.rs`
+    // `list-sessions`, `version` and `update-models` are dispatched in `main.rs`
     // before any session setup; reaching them here would mean
     // the dispatcher routed incorrectly. The remote-control modes are
     // their own frontends and never combine with print mode.
@@ -174,6 +174,7 @@ async fn run_inner<W: Write + Send + 'static>(
         None => None,
         Some(Command::Continue { session_id, .. }) => Some(session_id.clone()),
         Some(Command::ListSessions)
+        | Some(Command::Version)
         | Some(Command::UpdateModels)
         | Some(Command::Serve)
         | Some(Command::Gateway { .. })

@@ -3669,7 +3669,7 @@ async fn hello_names_the_gateway_and_omits_a_working_directory() {
     let hello = fixture.client.hello().await.expect("hello");
 
     assert_eq!(hello.protocol, PROTOCOL_VERSION);
-    assert_eq!(hello.app_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello.app_version, aj_app::VERSION);
     assert!(!hello.host_id.is_empty(), "a gateway names itself too");
     assert_eq!(
         hello.working_directory, None,

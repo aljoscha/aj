@@ -69,6 +69,7 @@ you run `aj` in:
 
 ```bash
 aj list-sessions       # list this project's sessions
+aj version             # print the cargo version and git revision of this build
 aj continue            # resume the most recent session that is not archived
 aj continue <id>       # resume a specific session, archived or not
 ```

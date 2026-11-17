@@ -58,6 +58,15 @@ pub mod test_support;
 
 pub use system_prompt::SYSTEM_PROMPT;
 
+/// What this build calls itself: the cargo version, then the git revision it
+/// was built from, as in `0.1.0 (8cff8cc1abcd)`.
+///
+/// The revision ends in `-dirty` when the tree had uncommitted changes, and
+/// is `unknown` for a build made outside a git checkout. Display only: the
+/// cargo version does not move between builds, so the revision is the part
+/// that tells two of them apart.
+pub const VERSION: &str = env!("AJ_VERSION");
+
 /// Bounded grace both modes give task drivers to observe the root
 /// cancel, kill their process groups, and reap before teardown
 /// proceeds. Drivers respond promptly (SIGKILL + reap, or a cancelled

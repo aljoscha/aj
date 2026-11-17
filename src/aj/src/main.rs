@@ -176,6 +176,10 @@ async fn async_main() -> Result<()> {
     match args.command {
         Some(Command::UpdateModels) => aj_app::handle_update_models_command().await,
         Some(Command::ListSessions) => aj_app::handle_list_sessions(),
+        Some(Command::Version) => {
+            println!("aj {}", aj_app::VERSION);
+            Ok(())
+        }
         Some(Command::Serve) => serve::run(args).await,
         Some(Command::Gateway { .. }) => gateway::run(args).await,
         Some(Command::Continue {

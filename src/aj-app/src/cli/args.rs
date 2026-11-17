@@ -2,8 +2,8 @@
 //!
 //! The `--print` / `--json` toggles select the non-interactive
 //! print mode; otherwise the binary runs the interactive
-//! TUI. Subcommands (`list-sessions`, `continue`, `update-models`)
-//! short-circuit before mode dispatch.
+//! TUI. Subcommands (`list-sessions`, `version`, `continue`,
+//! `update-models`) short-circuit before mode dispatch.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -186,7 +186,7 @@ pub struct Args {
     pub name: Option<String>,
 
     /// Subcommand selector for the non-conversational utilities
-    /// (`list-sessions`, `continue`, `update-models`) and the
+    /// (`list-sessions`, `version`, `continue`, `update-models`) and the
     /// remote-control modes (`serve`, `connect`).
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -235,6 +235,7 @@ fn command_options(command: &str) -> &'static [&'static str] {
 
 #[derive(Parser, Debug)]
 #[command(name = "aj")]
+#[command(version = crate::VERSION)]
 #[command(about = "AI-driven agent for software engineering")]
 #[command(long_about = None)]
 struct CliParser {
@@ -651,6 +652,9 @@ pub enum PrintFormat {
 pub enum Command {
     /// List existing conversation sessions for this project.
     ListSessions,
+    /// Print the version: the cargo version and the git revision this
+    /// binary was built from. Same output as `--version`.
+    Version,
     /// Continue a conversation session (latest unarchived one if no id
     /// given). Fails if there is no session to resume.
     ///

@@ -1805,7 +1805,7 @@ async fn hello_reports_the_protocol_the_working_directory_and_the_name() {
 
     assert_eq!(hello.protocol, PROTOCOL_VERSION);
     assert!(!hello.host_id.is_empty(), "a host names its store");
-    assert_eq!(hello.app_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello.app_version, aj_app::VERSION);
     assert!(
         hello.working_directory.is_some(),
         "a host serves one working directory",

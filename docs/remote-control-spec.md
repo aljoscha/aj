@@ -149,7 +149,10 @@ parameters are ignored.
 `GET /v1/hello` is the reachability and identity probe: `{protocol,
 app_version, host_id, working_directory?, name?}`. A gateway omits
 `working_directory` and `name`, which is how a client tells the two
-roles apart.
+roles apart. `app_version` is display text naming the build, the cargo
+version and the git revision it was built from, as in
+`0.1.0 (8cff8cc1abcd)`. Clients show it and never parse or compare it.
+Compatibility is `protocol`'s job.
 
 A host's `name` is display metadata, never an address, and may collide.
 The host states it at startup (`--name` or `AJ_NAME`, else its working

@@ -299,7 +299,7 @@ impl Gateway {
     pub(crate) fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: aj_app::VERSION.to_string(),
             host_id: self.inner.id.clone(),
             working_directory: None,
             // A gateway names the hosts behind it and not itself: there is no

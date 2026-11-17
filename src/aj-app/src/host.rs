@@ -934,7 +934,7 @@ impl SessionHost {
     pub fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: crate::VERSION.to_string(),
             host_id: self.inner.host_id.clone(),
             working_directory: Some(self.inner.working_directory.clone()),
             name: self.inner.name.clone(),
