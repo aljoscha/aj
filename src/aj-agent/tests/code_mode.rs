@@ -94,6 +94,10 @@ impl Provider for RecordingProvider {
 
 fn model(eligible: bool) -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: if eligible {
             "gpt-6-astra"
         } else {

@@ -764,7 +764,9 @@ schema-keyed string maps in the editor's vocabulary (`<unset>` for absent
 optionals, comma-separated name lists), `project_keys`, `has_project`, and
 the host's `models`, `tools`, and `skills` catalogs. Model choices include only
 providers with configured host credentials (stored credentials, environment
-keys, or runtime API-key overrides). Credentials are not validated or refreshed
+keys, or runtime API-key overrides). Custom models from the host's
+`~/.aj/models-custom.json` are included when no authentication is required, or when
+their configured `custom_auth.api_key_env` variable is nonempty. Credentials are not validated or refreshed
 for this read. No credential values or arbitrary config-file keys are returned.
 Connections are trusted, so complete model and catalog URLs round-trip without masking. The
 standalone model and thinking selectors read the same model catalog through

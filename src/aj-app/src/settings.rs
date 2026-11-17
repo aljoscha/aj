@@ -823,7 +823,7 @@ pub async fn confirm_model(
             {
                 let mut run = run_config.lock().expect("run config mutex poisoned");
                 run.accounts
-                    .install(&mut model.stream_options, auth, &model.model_info.provider);
+                    .install_model(&mut model.stream_options, auth, &model.model_info);
                 *target.model_mut(&mut run) = model;
             }
             // Record the change on the session log's user thread so a
@@ -924,7 +924,7 @@ pub async fn confirm_model_for_sub(
                 .lock()
                 .expect("run config mutex poisoned")
                 .accounts
-                .install(&mut stream_options, auth, &info.provider);
+                .install_model(&mut stream_options, auth, info);
             // Stage the standing bundle choice; the sub's next turn
             // applies it.
             //

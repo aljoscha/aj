@@ -245,6 +245,8 @@ async fn run_stream_inner(
         return Ok(());
     }
 
+    crate::provider::validate_tools(model, context)?;
+
     let credential =
         match select_cancel(options.cancel.as_ref(), options.resolve_api_key()).await {
             SelectOutcome::Ready(result) => result,
@@ -2053,6 +2055,10 @@ mod tests {
 
     fn fake_model(reasoning: bool) -> ModelInfo {
         ModelInfo {
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![crate::registry::InputModality::Text],
             id: "gpt-5".into(),
             name: "GPT-5".into(),
             family: None,

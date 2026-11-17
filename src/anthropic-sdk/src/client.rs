@@ -69,6 +69,7 @@ impl Client {
         client: ReqwestClient,
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| BASE_URL.to_string());
+        let base_url = base_url.trim_end_matches('/').to_string();
         let auth_mode = if api_key.starts_with("sk-ant-oat") {
             AuthMode::OAuth
         } else {
@@ -167,7 +168,9 @@ impl Client {
     ) -> reqwest::RequestBuilder {
         match self.auth_mode {
             AuthMode::ApiKey => {
-                builder = builder.header("x-api-key", self.api_key.clone());
+                if !self.api_key.is_empty() {
+                    builder = builder.header("x-api-key", self.api_key.clone());
+                }
             }
             AuthMode::OAuth => {
                 builder = builder
@@ -663,6 +666,34 @@ mod tests {
             "the response source error must terminate the public stream"
         );
         assert_eq!(polls.load(Ordering::SeqCst), 1, "exactly one body poll");
+    }
+
+    #[test]
+    fn trailing_slashes_do_not_change_the_messages_route() {
+        let request = Client::new(Some("http://localhost:8080/".into()), String::new())
+            .build_request()
+            .build()
+            .unwrap();
+        assert_eq!(request.url().as_str(), "http://localhost:8080/v1/messages");
+    }
+
+    #[test]
+    fn anonymous_endpoints_receive_no_authentication_header() {
+        for (key, expected) in [("", None), ("secret", Some("secret"))] {
+            let request = Client::new(None, key.into())
+                .build_request()
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-api-key")
+                    .map(|v| v.to_str().unwrap()),
+                expected,
+            );
+            assert!(!request.headers().contains_key("authorization"));
+            assert!(request.headers().contains_key("anthropic-version"));
+        }
     }
 
     #[test]

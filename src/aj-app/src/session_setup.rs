@@ -135,7 +135,7 @@ impl RunConfigSnapshot {
     pub fn bind_accounts(&mut self, auth: &AuthStorage) {
         for model in [&mut self.main, &mut self.oracle] {
             self.accounts
-                .install(&mut model.stream_options, auth, &model.model_info.provider);
+                .install_model(&mut model.stream_options, auth, &model.model_info);
         }
     }
 
@@ -1532,7 +1532,7 @@ pub fn compose_host(
     let name = args
         .host_name()
         .map_err(|err| anyhow::anyhow!("--name: {err}"))?;
-    let registry = Arc::new(ModelRegistry::load());
+    let registry = Arc::new(ModelRegistry::try_load()?);
     let (run_config, restore) = build_initial_run_config(
         args,
         &config,

@@ -761,7 +761,7 @@ fn reasoning_options_from_models_dev(raw: Option<&[RawReasoningOption]>) -> Vec<
     };
     raw.iter()
         .filter_map(|o| match o.kind.as_deref() {
-            Some("toggle") => Some(ReasoningOption::Toggle),
+            Some("toggle") => Some(ReasoningOption::Toggle {}),
             Some("effort") => {
                 let values: Vec<_> = o
                     .values
@@ -913,6 +913,10 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
     let speed_modes = speed_modes_from_models_dev(m, fixed.api, &cost);
 
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![crate::registry::InputModality::Text],
         id: id.to_string(),
         name: m.name.clone().unwrap_or_else(|| id.to_string()),
         family: m.family.clone(),
@@ -955,6 +959,10 @@ fn map_openrouter_model(m: &OpenRouterModel, family: Option<String>) -> ModelInf
     }
 
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![crate::registry::InputModality::Text],
         id: m.id.clone(),
         name: m.name.clone().unwrap_or_else(|| m.id.clone()),
         family,
@@ -1855,7 +1863,7 @@ mod tests {
         assert_eq!(
             reasoning_options_from_models_dev(Some(&raw)),
             vec![
-                ReasoningOption::Toggle,
+                ReasoningOption::Toggle {},
                 ReasoningOption::Effort {
                     values: vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Max],
                 },

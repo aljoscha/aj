@@ -42,6 +42,10 @@ const FIXTURE_DIR: &str = "anthropic-messages";
 /// shape so any cost/finalize logic also exercises sensible numbers.
 fn fixture_model() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "claude-sonnet-4-20250514".into(),
         name: "Claude Sonnet 4".into(),
         family: None,

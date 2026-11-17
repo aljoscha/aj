@@ -39,6 +39,10 @@ const FIXTURE_DIR: &str = "openai-responses";
 
 fn fixture_model() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "gpt-5".into(),
         name: "GPT-5".into(),
         family: None,

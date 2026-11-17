@@ -483,3 +483,60 @@ async fn model_selector_does_not_require_the_config_editor_endpoint() {
     let _ = peer.await;
     remote.shutdown().await;
 }
+
+#[tokio::test]
+async fn custom_models_are_selectable_through_local_and_remote_controls() {
+    let dir = TempDir::new().unwrap();
+    let handles = crate::remote::tests::HostHandles::new(&dir);
+    let run =
+        crate::remote::tests::snapshot(crate::remote::tests::scripted(vec![], 0, Duration::ZERO));
+    let mut setup = crate::remote::tests::host_setup(&dir, run, handles, Some("custom-models"));
+    let anonymous = ModelInfo {
+        provider: "custom-no-stored-credentials".into(),
+        id: "anonymous".into(),
+        custom_auth: Some(aj_models::registry::CustomAuth { api_key_env: None }),
+        ..aj_app::test_support::scripted_model_info()
+    };
+    assert!(!setup.auth.has_auth(&anonymous.provider).await.unwrap());
+    let missing_env = "AJ_TEST_CUSTOM_SELECTOR_ABSENT_7635";
+    assert!(std::env::var_os(missing_env).is_none());
+    let unavailable = ModelInfo {
+        id: "missing-env".into(),
+        custom_auth: Some(aj_models::registry::CustomAuth {
+            api_key_env: Some(missing_env.into()),
+        }),
+        ..anonymous.clone()
+    };
+    assert!(!std::env::var("PATH").unwrap().is_empty());
+    let environment = ModelInfo {
+        id: "environment".into(),
+        custom_auth: Some(aj_models::registry::CustomAuth {
+            api_key_env: Some("PATH".into()),
+        }),
+        ..anonymous.clone()
+    };
+    setup.catalog = Arc::new(vec![anonymous, unavailable, environment]);
+    let host = aj_app::host::SessionHost::new(setup).unwrap();
+    let session = host.create().await.unwrap();
+    let server = crate::remote::RemoteServer::bind(
+        host.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        crate::remote::IdentityGate::local(),
+    )
+    .await
+    .unwrap();
+    for control in [
+        Control::local(host.clone()),
+        Control::remote(crate::remote::RemoteClient::new(&server.url()).unwrap()),
+    ] {
+        let models = control.models(&session).await.unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["anonymous", "environment"]
+        );
+        assert!(models.iter().all(|m| m.custom_auth.is_some()));
+        let config = control.config(&session).await.unwrap();
+        assert_eq!(config.models.len(), 2);
+    }
+    server.shutdown().await;
+}

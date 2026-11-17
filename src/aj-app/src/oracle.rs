@@ -62,9 +62,9 @@ pub async fn warning(
     auth: &aj_models::auth::AuthStorage,
     check_credentials: bool,
 ) -> Option<String> {
-    crate::model::credential_warning(
+    crate::model::model_credential_warning(
         auth,
-        &run.oracle.model_info.provider,
+        &run.oracle.model_info,
         check_credentials && run.oracle.model_info.provider != run.main.model_info.provider,
     )
     .await

@@ -37,6 +37,10 @@ const TEARDOWN_BOUND: Duration = Duration::from_secs(8);
 
 fn model_info() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: SCRIPTED.to_string(),
         name: SCRIPTED.to_string(),
         family: None,

@@ -23,6 +23,10 @@ const MODEL_ID: &str = "openai/gpt-oss-20b:free";
 
 fn model() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: MODEL_ID.into(),
         name: MODEL_ID.into(),
         family: None,

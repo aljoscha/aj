@@ -142,6 +142,10 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
 
 fn model(api: &str, base_url: String) -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "gpt-test".into(),
         name: "GPT test".into(),
         family: None,

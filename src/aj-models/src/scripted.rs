@@ -882,6 +882,10 @@ mod tests {
 
     fn fake_model() -> ModelInfo {
         ModelInfo {
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![crate::registry::InputModality::Text],
             id: "scripted-test".into(),
             name: "Scripted".into(),
             family: None,

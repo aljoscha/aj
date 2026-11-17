@@ -43,6 +43,10 @@ use crate::session_setup::RunConfigSnapshot;
 /// provider identity in tests.
 pub fn scripted_model_info() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "scripted".to_string(),
         name: "scripted".to_string(),
         family: None,

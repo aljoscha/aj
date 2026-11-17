@@ -525,6 +525,10 @@ mod tests {
             input.push(InputModality::Image);
         }
         ModelInfo {
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![crate::registry::InputModality::Text],
             id: id.into(),
             name: id.into(),
             family: None,

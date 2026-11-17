@@ -1001,6 +1001,7 @@ impl Agent {
             self.tools = self
                 .tool_definitions
                 .values()
+                .filter(|_| self.model_info.supports_tools)
                 .map(|tool| tool.for_provider(self.provider.as_ref()))
                 .collect();
             self.tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -4401,6 +4402,10 @@ mod event_protocol_tests {
     /// what the provider claims", so any consistent triple works.
     fn scripted_model_info() -> ModelInfo {
         ModelInfo {
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![aj_models::registry::InputModality::Text],
             id: SCRIPT_MODEL.to_string(),
             name: SCRIPT_MODEL.to_string(),
             family: None,
@@ -6926,6 +6931,45 @@ mod event_protocol_tests {
                 .push((model.clone(), context.clone(), options.clone()));
             self.scripted.stream_simple(model, context, options)
         }
+    }
+
+    #[tokio::test]
+    async fn model_tool_capability_controls_requests_and_survives_switching_back() {
+        let provider = Arc::new(ChildRecordingProvider {
+            scripted: ScriptedProvider::from_event_vecs(vec![
+                finalize_script(finalize_text("plain reply")),
+                finalize_script(finalize_text("tools available")),
+            ])
+            .on_exhausted(ExhaustedBehavior::Panic),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut agent = build_agent(Vec::new(), vec![PingTool.into()]);
+        let mut model = scripted_model_info();
+        model.supports_tools = false;
+        agent.set_provider(
+            Arc::<ChildRecordingProvider>::clone(&provider),
+            Arc::new(model.clone()),
+            StreamOptions::default(),
+        );
+        agent.run_single_turn("hello".into()).await.unwrap();
+        assert!(provider.calls.lock().unwrap()[0].1.tools.is_empty());
+        model.supports_tools = true;
+        agent.set_provider(
+            Arc::<ChildRecordingProvider>::clone(&provider),
+            Arc::new(model),
+            StreamOptions::default(),
+        );
+        agent.run_single_turn("hello again".into()).await.unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            calls[1]
+                .1
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ping"]
+        );
     }
 
     #[tokio::test]

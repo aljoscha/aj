@@ -62,6 +62,10 @@ async fn concurrent_commands(code_mode: bool) {
     let provider = ScriptedProvider::from_messages(vec![calls, done], 1024, Duration::ZERO)
         .on_exhausted(ExhaustedBehavior::Panic);
     let model = ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "gpt-6-astra".into(),
         name: "bash concurrency test".into(),
         family: None,

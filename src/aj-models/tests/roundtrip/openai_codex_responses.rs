@@ -51,6 +51,10 @@ const PROVIDER_ID: &str = "openai-codex";
 
 fn fixture_model() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "gpt-5.1".into(),
         name: "GPT-5.1".into(),
         family: None,

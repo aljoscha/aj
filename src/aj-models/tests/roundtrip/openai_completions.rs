@@ -54,6 +54,10 @@ const FIXTURE_DIR: &str = "openai-completions";
 /// numbers.
 fn fixture_model() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "gpt-4o".into(),
         name: "GPT-4o".into(),
         family: None,

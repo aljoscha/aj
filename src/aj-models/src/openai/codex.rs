@@ -186,6 +186,8 @@ async fn run_stream_inner(
         return Ok(());
     }
 
+    crate::provider::validate_tools(model, context)?;
+
     let credential =
         match select_cancel(options.cancel.as_ref(), options.resolve_api_key()).await {
             SelectOutcome::Ready(result) => result,
@@ -752,6 +754,10 @@ mod tests {
 
     fn fake_model(id: &str, reasoning: bool) -> ModelInfo {
         ModelInfo {
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![crate::registry::InputModality::Text],
             id: id.into(),
             name: id.into(),
             family: None,

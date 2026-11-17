@@ -84,6 +84,10 @@ pub fn resolve_or_explain(name: &str) -> Result<ResolvedScriptedModel> {
 /// scripted path is free).
 fn scripted_model_info(name: &str) -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: format!("scripted/{name}"),
         name: format!("scripted: {name}"),
         family: None,

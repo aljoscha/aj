@@ -58,6 +58,7 @@ impl Client {
         client: ReqwestClient,
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| OPENAI_API_BASE_URL.to_string());
+        let base_url = base_url.trim_end_matches('/').to_string();
 
         Self {
             client,
@@ -73,7 +74,13 @@ impl Client {
         self
     }
 
-    fn apply_extra_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn apply_request_headers(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        if !self.api_key.is_empty() {
+            builder = builder.bearer_auth(&self.api_key);
+        }
         for (name, value) in &self.extra_headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -90,12 +97,7 @@ impl Client {
     ) -> Result<CreateChatCompletionResponse, ClientError> {
         let url = format!("{}/chat/completions", self.base_url);
         debug_log_request(&url, &request);
-        let request_builder = self.apply_extra_headers(
-            self.client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&request),
-        );
+        let request_builder = self.apply_request_headers(self.client.post(&url).json(&request));
 
         let response = request_builder.send().await?;
 
@@ -130,12 +132,7 @@ impl Client {
 
         let url = format!("{}/chat/completions", self.base_url);
         debug_log_request(&url, &request);
-        let request_builder = self.apply_extra_headers(
-            self.client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&request),
-        );
+        let request_builder = self.apply_request_headers(self.client.post(&url).json(&request));
 
         let response = request_builder.send().await?;
 
@@ -163,12 +160,7 @@ impl Client {
     ) -> Result<ResponsesResponse, ClientError> {
         let url = format!("{}/responses", self.base_url);
         debug_log_request(&url, &request);
-        let request_builder = self.apply_extra_headers(
-            self.client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&request),
-        );
+        let request_builder = self.apply_request_headers(self.client.post(&url).json(&request));
 
         let response = request_builder.send().await?;
 
@@ -237,12 +229,7 @@ impl Client {
 
         let url = format!("{}{}", self.base_url, path);
         debug_log_request(&url, &request);
-        let request_builder = self.apply_extra_headers(
-            self.client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&request),
-        );
+        let request_builder = self.apply_request_headers(self.client.post(&url).json(&request));
 
         let response = request_builder.send().await?;
 
@@ -395,6 +382,148 @@ impl ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_is_omitted_only_for_an_empty_key() {
+        for (key, expected) in [("", None), ("secret", Some("Bearer secret"))] {
+            let client = Client::new(None, key.into()).with_extra_header("x-test", "preserved");
+            let request = client
+                .apply_request_headers(client.client.post("http://localhost/responses"))
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap()),
+                expected
+            );
+            assert_eq!(request.headers()["x-test"], "preserved");
+        }
+    }
+
+    #[test]
+    fn captured_llama_cpp_streams_decode_without_fallback() {
+        use crate::types::responses::{ResponseOutputItem, ResponseStatus};
+
+        for (fixture, is_tool) in [
+            (include_str!("../tests/fixtures/llama-cpp-text.sse"), false),
+            (include_str!("../tests/fixtures/llama-cpp-tool.sse"), true),
+        ] {
+            let mut reasoning = String::new();
+            let mut text = String::new();
+            let mut arguments = String::new();
+            let mut created = false;
+            let mut in_progress = false;
+            let mut completed = false;
+            let mut reasoning_done = false;
+            let mut tool_done = false;
+            for data in fixture
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+            {
+                let event = parse_sse_event::<ResponseStreamEvent>(data)
+                    .unwrap()
+                    .unwrap();
+                match event {
+                    ResponseStreamEvent::Other(value) => panic!("untyped event: {value}"),
+                    ResponseStreamEvent::ResponseCreated {
+                        response,
+                        sequence_number,
+                    } => {
+                        assert_eq!(sequence_number, 0);
+                        assert_eq!(response.status, Some(ResponseStatus::InProgress));
+                        assert!(!response.id.is_empty());
+                        created = true;
+                    }
+                    ResponseStreamEvent::ResponseInProgress { .. } => in_progress = true,
+                    ResponseStreamEvent::ReasoningTextDelta { delta, .. } => {
+                        reasoning.push_str(&delta)
+                    }
+                    ResponseStreamEvent::OutputTextDelta { delta, .. } => text.push_str(&delta),
+                    ResponseStreamEvent::FunctionCallArgumentsDelta { delta, .. } => {
+                        arguments.push_str(&delta)
+                    }
+                    ResponseStreamEvent::OutputItemAdded { item, .. } => {
+                        assert!(!matches!(item, ResponseOutputItem::Other(_)));
+                    }
+                    ResponseStreamEvent::OutputItemDone { item, .. } => match item {
+                        ResponseOutputItem::Reasoning {
+                            summary,
+                            content,
+                            encrypted_content,
+                            ..
+                        } => {
+                            assert!(summary.is_empty());
+                            assert_eq!(encrypted_content.as_deref(), Some(""));
+                            let content = content.unwrap();
+                            assert!(content.iter().all(|part| part.r#type == "reasoning_text"));
+                            assert_eq!(
+                                content
+                                    .iter()
+                                    .map(|part| part.text.as_str())
+                                    .collect::<String>(),
+                                reasoning
+                            );
+                            reasoning_done = true;
+                        }
+                        ResponseOutputItem::FunctionCall {
+                            name,
+                            arguments: done,
+                            call_id,
+                            ..
+                        } => {
+                            assert_eq!(name, "lookup_weather");
+                            assert!(!call_id.is_empty());
+                            assert_eq!(done, arguments);
+                            assert_eq!(
+                                serde_json::from_str::<serde_json::Value>(&done).unwrap(),
+                                serde_json::json!({"city":"Berlin"})
+                            );
+                            tool_done = true;
+                        }
+                        ResponseOutputItem::Other(value) => panic!("untyped item: {value}"),
+                        _ => {}
+                    },
+                    ResponseStreamEvent::ResponseCompleted { response, .. } => {
+                        assert_eq!(response.status, Some(ResponseStatus::Completed));
+                        assert_eq!(response.model, "qwen3.8-27b");
+                        assert_eq!(response.output_text(), text);
+                        assert!(
+                            response
+                                .output
+                                .iter()
+                                .all(|item| !matches!(item, ResponseOutputItem::Other(_)))
+                        );
+                        let usage = response.usage.unwrap();
+                        assert!(usage.input_tokens > 0 && usage.output_tokens > 0);
+                        assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+                        assert!(usage.output_tokens_details.is_none());
+                        completed = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(created && in_progress && completed && reasoning_done);
+            assert!(!reasoning.is_empty());
+            assert_eq!(tool_done, is_tool);
+            assert_eq!(text, if is_tool { "" } else { "hello" });
+        }
+    }
+
+    #[test]
+    fn explicit_sequence_numbers_are_preserved() {
+        let data = r#"{"type":"response.reasoning_text.delta","delta":"hi","item_id":"rs_1","output_index":0,"content_index":0,"sequence_number":42}"#;
+        assert!(matches!(
+            parse_sse_event::<ResponseStreamEvent>(data)
+                .unwrap()
+                .unwrap(),
+            ResponseStreamEvent::ReasoningTextDelta {
+                sequence_number: 42,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn classify_error_response_structures_a_client_error() {

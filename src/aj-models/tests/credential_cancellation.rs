@@ -17,6 +17,10 @@ async fn cancellation_during_credentials_aborts_and_releases_the_resolver() {
         "openai-codex-responses",
     ] {
         let model = ModelInfo {
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![aj_models::registry::InputModality::Text],
             id: "fixture".into(),
             name: "fixture".into(),
             family: None,

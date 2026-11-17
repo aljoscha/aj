@@ -74,6 +74,29 @@ impl SessionAccounts {
         *self.0.write().expect("session accounts poisoned") = accounts;
     }
 
+    /// Bind model-specific authentication without falling back to unrelated credentials.
+    pub fn install_model(
+        &self,
+        options: &mut StreamOptions,
+        auth: &AuthStorage,
+        model: &ModelInfo,
+    ) {
+        if let Some(custom) = &model.custom_auth {
+            let custom = custom.clone();
+            options.set_api_key_resolver(Some(ApiKeyResolver::new(move || {
+                let custom = custom.clone();
+                async move {
+                    Ok(ResolvedApiKey {
+                        key: custom_api_key(&custom)?,
+                        account: None,
+                    })
+                }
+            })));
+        } else {
+            self.install(options, auth, &model.provider);
+        }
+    }
+
     /// Bind a bundle to this session, including bundles retained by subagents.
     pub fn install(&self, options: &mut StreamOptions, auth: &AuthStorage, provider: &str) {
         let choices = self.clone();
@@ -261,7 +284,7 @@ pub fn from_model_info(
     })?;
 
     let mut stream_options = StreamOptions::default();
-    install_api_key_resolver(&mut stream_options, auth, &model_info.provider, None);
+    SessionAccounts::default().install_model(&mut stream_options, auth, &model_info);
     stream_options.speed = speed;
 
     Ok(ResolvedModel {
@@ -285,6 +308,7 @@ pub fn from_model_info(
 /// surfaced as a human-readable error (the provider maps it to an
 /// `Auth`-category failure) rather than a hard startup bail, so a
 /// session can come up uncredentialed and the user can log in later.
+#[cfg(test)]
 fn install_api_key_resolver(
     options: &mut StreamOptions,
     auth: &AuthStorage,
@@ -313,6 +337,34 @@ pub fn missing_key_message(provider_id: &str) -> String {
             vars.join(", "),
         )
     }
+}
+
+pub(crate) fn custom_api_key(custom: &aj_models::registry::CustomAuth) -> Result<String, String> {
+    match &custom.api_key_env {
+        None => Ok(String::new()),
+        Some(name) => std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                format!("custom provider requires a non-empty {name} environment variable")
+            }),
+    }
+}
+
+pub async fn model_credential_warning(
+    auth: &AuthStorage,
+    model: &ModelInfo,
+    credentials_required: bool,
+) -> Option<String> {
+    if !credentials_required {
+        return None;
+    }
+    if let Some(custom) = &model.custom_auth {
+        return custom_api_key(custom)
+            .err()
+            .map(|error| format!("Heads up: {error}"));
+    }
+    credential_warning(auth, &model.provider, true).await
 }
 
 /// Report known credential problems from the inference credential store.
@@ -430,6 +482,10 @@ mod tests {
             id: id.into(),
             name: id.into(),
             family: None,
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![InputModality::Text],
             api: api.into(),
             provider: provider.into(),
             base_url: "https://example.invalid".into(),
@@ -512,6 +568,68 @@ mod tests {
         assert_eq!(
             resolved.account, None,
             "an override-served turn is not stamped with the account that was asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_auth_survives_session_binding_without_catalog_credentials() {
+        let (_dir, auth) = auth_storage("custom-auth");
+        // A custom endpoint must not receive a catalog provider's stored secret,
+        // even when the user deliberately reuses that provider ID.
+        auth.set_runtime_api_key("openai", "unrelated-secret".into())
+            .await;
+        let mut info = sample_model("openai", "local-model", "openai-responses");
+        info.custom_auth = Some(aj_models::registry::CustomAuth { api_key_env: None });
+        let mut resolved = from_model_info(&auth, info, None).unwrap();
+        assert_eq!(
+            resolved.stream_options.resolve_api_key().await.unwrap().key,
+            ""
+        );
+        let accounts = SessionAccounts::default();
+        accounts.set("openai", Some("work".into()));
+        accounts.install_model(&mut resolved.stream_options, &auth, &resolved.model_info);
+        let credential = resolved.stream_options.resolve_api_key().await.unwrap();
+        assert_eq!(credential.key, "");
+        assert_eq!(credential.account, None);
+        assert_eq!(
+            model_credential_warning(&auth, &resolved.model_info, true).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_env_auth_is_explicit_and_missing_keys_are_actionable() {
+        let (_dir, auth) = auth_storage("custom-env");
+        let mut info = sample_model("local", "local-model", "openai-responses");
+        let name = "AJ_TEST_CUSTOM_KEY_INTENTIONALLY_ABSENT_7635";
+        assert!(std::env::var_os(name).is_none());
+        info.custom_auth = Some(aj_models::registry::CustomAuth {
+            api_key_env: Some(name.into()),
+        });
+        let resolved = from_model_info(&auth, info.clone(), None).unwrap();
+        assert!(
+            resolved
+                .stream_options
+                .resolve_api_key()
+                .await
+                .unwrap_err()
+                .contains(name)
+        );
+        assert!(
+            model_credential_warning(&auth, &info, true)
+                .await
+                .unwrap()
+                .contains(name)
+        );
+        // Read an existing, non-secret variable rather than mutate process-global
+        // environment while tests execute concurrently.
+        let path = std::env::var("PATH").unwrap();
+        assert!(!path.is_empty());
+        info.custom_auth.as_mut().unwrap().api_key_env = Some("PATH".into());
+        let resolved = from_model_info(&auth, info, None).unwrap();
+        assert_eq!(
+            resolved.stream_options.resolve_api_key().await.unwrap().key,
+            path
         );
     }
 

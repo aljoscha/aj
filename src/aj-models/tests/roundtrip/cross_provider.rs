@@ -56,6 +56,10 @@ use serde_json::json;
 /// are fixed to harmless defaults.
 fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: id.into(),
         name: id.into(),
         family: None,

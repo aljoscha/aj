@@ -215,7 +215,7 @@ async fn run_inner<W: Write + Send + 'static>(
         &auth,
         thinking,
         speed,
-        Arc::new(aj_models::registry::ModelRegistry::load()),
+        Arc::new(aj_models::registry::ModelRegistry::try_load()?),
     )?;
     configure_model(&mut run_config.main);
     let run_config = Arc::new(std::sync::Mutex::new(run_config));

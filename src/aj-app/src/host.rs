@@ -790,6 +790,12 @@ impl SessionHost {
         let mut providers = BTreeMap::new();
         let mut models = Vec::new();
         for model in shared.catalog.iter() {
+            if let Some(custom) = &model.custom_auth {
+                if crate::model::custom_api_key(custom).is_ok() {
+                    models.push(model.clone());
+                }
+                continue;
+            }
             let available = match providers.get(&model.provider) {
                 Some(available) => *available,
                 None => {
@@ -2396,9 +2402,18 @@ impl SessionHost {
         // scripted path has no credential-backed restore context and needs no
         // warning. An auth read failure is actionable for the same reason as a
         // missing credential, so carry its exact host-side answer too.
-        let credential_warning = crate::model::credential_warning(
+        let main_model = Arc::clone(
+            &session
+                .core
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .main
+                .model_info,
+        );
+        let credential_warning = crate::model::model_credential_warning(
             &self.inner.shared.auth,
-            &settings_seen.provider,
+            &main_model,
             self.inner.shared.restore.is_some(),
         )
         .await;

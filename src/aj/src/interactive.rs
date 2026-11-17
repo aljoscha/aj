@@ -387,28 +387,22 @@ async fn build_world(
     // the result joins the launch snapshot rather than being re-read from the
     // interactive session-change loop.
     if args.scripted.is_none() {
-        let provider = world
-            .local
-            .as_ref()
-            .expect("a local world has session handles")
-            .run_config
-            .lock()
-            .expect("run config mutex poisoned")
-            .settings()
-            .provider;
+        let model = Arc::clone(
+            &world
+                .local
+                .as_ref()
+                .expect("a local world has session handles")
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .main
+                .model_info,
+        );
         if let Some(key) = args.api_key.clone() {
-            auth.set_runtime_api_key(&provider, key).await;
+            auth.set_runtime_api_key(&model.provider, key).await;
         }
-        world.process_notices.auth_warning = match auth.has_auth(&provider).await {
-            Ok(true) => None,
-            Ok(false) => Some(format!(
-                "Heads up: {}",
-                aj_app::model::missing_key_message(&provider)
-            )),
-            Err(err) => Some(format!(
-                "Couldn't check credentials for {provider:?}: {err}"
-            )),
-        };
+        world.process_notices.auth_warning =
+            aj_app::model::model_credential_warning(auth, &model, true).await;
     }
     if let Some(selection) = args.account_selection() {
         let provider = world
@@ -512,7 +506,7 @@ async fn build_connect_world(
 ) -> Result<World> {
     let config = layers.effective();
     let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
-    let catalog = aj_app::commands::load_model_catalog();
+    let catalog = aj_app::commands::load_model_catalog()?;
     let config = Arc::new(StdMutex::new(config));
     let config_layers = Arc::new(StdMutex::new(layers));
 

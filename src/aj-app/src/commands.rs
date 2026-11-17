@@ -292,8 +292,8 @@ pub const COMMANDS: &[Command] = &[
 /// [`ModelRegistry::load`] (bundled seed plus optional user cache,
 /// plus overrides) and flattens by provider in catalog order so the
 /// resulting list preserves the registry's intentional ordering.
-pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
-    model_catalog(&ModelRegistry::load())
+pub fn load_model_catalog() -> anyhow::Result<Arc<Vec<ModelInfo>>> {
+    Ok(model_catalog(&ModelRegistry::try_load()?))
 }
 
 /// Flatten an existing registry in provider/catalog order.

@@ -23,6 +23,10 @@ use tempfile::TempDir;
 
 fn model() -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "claude-test".into(),
         name: "Claude Test".into(),
         family: None,

@@ -28,7 +28,8 @@ pub(crate) fn eligible(model: &ModelInfo, provider: &dyn aj_models::provider::Pr
         serde_json::from_str(include_str!("../../../vendor/codex-code-mode/models.json"))
             .expect("vendored Codex catalog must be valid JSON")
     });
-    provider.supports_freeform_tools()
+    model.supports_tools
+        && provider.supports_freeform_tools()
         && CATALOG["models"].as_array().is_some_and(|models| {
             models.iter().any(|m| {
                 m["slug"].as_str() == Some(model.id.as_str())

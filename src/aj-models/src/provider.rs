@@ -73,6 +73,27 @@ pub trait Provider: Send + Sync {
     ) -> AssistantMessageEventStream;
 }
 
+/// Reject rather than silently drop tool definitions or tool history.
+pub(crate) fn validate_tools(model: &ModelInfo, context: &Context) -> Result<(), AssistantError> {
+    use crate::types::{AssistantContent, Message};
+    let has_tools = !context.tools.is_empty()
+        || context.messages.iter().any(|message| match message {
+            Message::ToolResult(_) => true,
+            Message::Assistant(message) => message
+                .content
+                .iter()
+                .any(|content| matches!(content, AssistantContent::ToolCall(_))),
+            Message::User(_) => false,
+        });
+    if !model.supports_tools && has_tools {
+        return Err(AssistantError::new(
+            ErrorCategory::InvalidRequest,
+            format!("model '{}' does not support tools", model.id),
+        ));
+    }
+    Ok(())
+}
+
 /// Look up the provider implementation for a given API string.
 ///
 /// Returns [`None`] for an unrecognized `api`. The registered
@@ -195,6 +216,10 @@ mod tests {
 
     fn fake_model(api: &str) -> ModelInfo {
         ModelInfo {
+            custom_auth: None,
+            provider_name: None,
+            supports_tools: true,
+            output: vec![crate::registry::InputModality::Text],
             id: "fake-model-1".into(),
             name: "Fake".into(),
             family: None,

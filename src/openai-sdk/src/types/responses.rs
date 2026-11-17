@@ -335,10 +335,16 @@ pub enum ImageDetail {
 pub struct Response {
     pub id: String,
     pub object: String,
+    // Compatible servers may send only identity and status in lifecycle events.
+    #[serde(default)]
     pub created_at: f64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub output: Vec<ResponseOutputItem>,
+    #[serde(default)]
     pub parallel_tool_calls: bool,
+    #[serde(default)]
     pub tools: Vec<ResponseTool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -863,6 +869,8 @@ pub struct ResponseOutputTokensDetails {
 ///
 /// Events are discriminated by the `type` field. We model the events that AJ
 /// consumes and use `Other` as a catch-all for unrecognized event types.
+/// Servers that omit sequence numbers decode with zero. Consumers must not
+/// use that field to order streams from such servers.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ResponseStreamEvent {
@@ -870,36 +878,42 @@ pub enum ResponseStreamEvent {
     #[serde(rename = "response.created")]
     ResponseCreated {
         response: Response,
+        #[serde(default)]
         sequence_number: u64,
     },
 
     #[serde(rename = "response.in_progress")]
     ResponseInProgress {
         response: Response,
+        #[serde(default)]
         sequence_number: u64,
     },
 
     #[serde(rename = "response.queued")]
     ResponseQueued {
         response: Response,
+        #[serde(default)]
         sequence_number: u64,
     },
 
     #[serde(rename = "response.completed")]
     ResponseCompleted {
         response: Response,
+        #[serde(default)]
         sequence_number: u64,
     },
 
     #[serde(rename = "response.failed")]
     ResponseFailed {
         response: Response,
+        #[serde(default)]
         sequence_number: u64,
     },
 
     #[serde(rename = "response.incomplete")]
     ResponseIncomplete {
         response: Response,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -908,6 +922,7 @@ pub enum ResponseStreamEvent {
     OutputItemAdded {
         item: ResponseOutputItem,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -915,6 +930,7 @@ pub enum ResponseStreamEvent {
     OutputItemDone {
         item: ResponseOutputItem,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -925,6 +941,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -934,6 +951,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -944,6 +962,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -953,6 +972,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -964,6 +984,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -972,6 +993,7 @@ pub enum ResponseStreamEvent {
         delta: String,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
     #[serde(rename = "response.custom_tool_call_input.done")]
@@ -979,6 +1001,7 @@ pub enum ResponseStreamEvent {
         input: String,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -988,6 +1011,7 @@ pub enum ResponseStreamEvent {
         delta: String,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -997,6 +1021,7 @@ pub enum ResponseStreamEvent {
         name: String,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1007,6 +1032,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1016,6 +1042,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1025,6 +1052,7 @@ pub enum ResponseStreamEvent {
         part: ReasoningSummary,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1033,6 +1061,7 @@ pub enum ResponseStreamEvent {
         part: ReasoningSummary,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1041,6 +1070,7 @@ pub enum ResponseStreamEvent {
         delta: String,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1049,6 +1079,7 @@ pub enum ResponseStreamEvent {
         text: String,
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1059,6 +1090,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1068,6 +1100,7 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1076,6 +1109,7 @@ pub enum ResponseStreamEvent {
     WebSearchCallInProgress {
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1083,6 +1117,7 @@ pub enum ResponseStreamEvent {
     WebSearchCallSearching {
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1090,6 +1125,7 @@ pub enum ResponseStreamEvent {
     WebSearchCallCompleted {
         item_id: String,
         output_index: u32,
+        #[serde(default)]
         sequence_number: u64,
     },
 
@@ -1098,6 +1134,7 @@ pub enum ResponseStreamEvent {
     Error {
         code: Option<String>,
         message: String,
+        #[serde(default)]
         sequence_number: u64,
     },
 

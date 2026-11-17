@@ -753,6 +753,90 @@ fields models.dev doesn't carry (e.g.
 indexed upstream. Overrides run on every load — seed and user cache
 alike — so a fresh refresh never wipes our authored corrections.
 
+#### User-defined providers and models
+
+AJ reads `~/.aj/models-custom.json` at startup, after the catalog and bundled
+overrides. This file is user-authored and is never changed by
+`aj update-models`. Each definition replaces the matching provider/model
+pair, or adds it if absent. Model selection uses the provider ID and model
+ID as usual. Changes take effect on restart. For the example below:
+
+```sh
+aj --model-api local --model-name qwen3.8-27b
+```
+
+```json
+{
+  "models": [
+    {
+      "id": "qwen3.8-27b",
+      "name": "Qwen 3.8 27B",
+      "provider": "local",
+      "provider_name": "llama.cpp",
+      "api": "openai-responses",
+      "base_url": "https://llm.tailfb5ac6.ts.net/v1",
+      "custom_auth": {
+        "api_key_env": null
+      },
+      "supports_tools": true,
+      "input": [
+        "text",
+        "image"
+      ],
+      "output": [
+        "text"
+      ],
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        }
+      ],
+      "context_window": 49152,
+      "max_tokens": 16384
+    }
+  ]
+}
+```
+
+`local` is a user-chosen provider ID, not a special transport. The API selects
+an existing adapter: `openai-responses`, `openai-completions` (Chat
+Completions), or `anthropic-messages`. The base URL must be an absolute
+HTTP(S) URL. Capabilities describe the configured server, not just the
+underlying model. Context capacity should match the server's allocation.
+
+Custom endpoints use no authentication unless `custom_auth.api_key_env` names an
+environment variable. AJ resolves that variable on each request and reports
+an error if it is missing or empty. It never falls back to a catalog
+provider's credentials, even when a custom definition reuses its ID.
+Stored accounts and `--api-key` overrides are not used for custom endpoints.
+Entries use the same model schema as the catalog. Omitted `cost` defaults to
+zero. Omitted or null `custom_auth` means no authentication in this file.
+The wrapper contains only `models`, without refresh timestamps, source labels,
+or a catalog schema version. Each entry carries its own provider and URL.
+
+With `supports_tools = false`, AJ sends no tool definitions. Switching back to a
+tool-capable model restores the configured tools.
+
+Output modalities remain explicit, although current adapters only support
+text output. Reasoning controls must match the selected API and server.
+For OpenAI APIs, a toggle allows the `none` effort to disable reasoning.
+Accepted effort values describe what AJ may send, not a guarantee that the
+server implements distinct reasoning budgets.
+
+A missing file is normal. Invalid JSON, unknown fields, unsupported APIs,
+and invalid capability or limit values fail startup with a diagnostic
+naming the file and offending definition. AJ does not silently discard a
+custom endpoint and use a catalog endpoint instead.
+
 #### 3.4.1 Catalog Schema
 
 Seed and user cache share one JSON schema:

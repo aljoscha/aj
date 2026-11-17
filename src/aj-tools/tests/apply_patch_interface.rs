@@ -68,6 +68,10 @@ fn setup_with_interface(
 ) -> (TempDir, Agent, Arc<Recorder>) {
     let directory = TempDir::new().unwrap();
     let model = ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "gpt-6-astra".into(),
         name: "patch interface test".into(),
         family: None,

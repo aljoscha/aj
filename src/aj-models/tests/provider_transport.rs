@@ -23,6 +23,10 @@ const REJECTION: &str = "transport fixture rejection";
 
 fn model(api: &str, listener: &TcpListener) -> ModelInfo {
     ModelInfo {
+        custom_auth: None,
+        provider_name: None,
+        supports_tools: true,
+        output: vec![aj_models::registry::InputModality::Text],
         id: "transport-test".into(),
         name: "Transport test".into(),
         family: None,
@@ -285,5 +289,148 @@ async fn cancelling_one_request_does_not_cancel_another_on_the_same_provider() {
         })
         .await
         .unwrap_or_else(|_| panic!("{api}: concurrent cancellation test timed out"));
+    }
+}
+
+#[tokio::test]
+async fn tool_disabled_models_reject_definitions_and_history_before_auth_or_network() {
+    use aj_models::types::{
+        AssistantContent, Message, SimpleStreamOptions, ToolCall, ToolDefinition, ToolResultMessage,
+    };
+    for (api, _) in APIS {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut model = model(api, &listener);
+        model.supports_tools = false;
+        let mut assistant = AssistantMessage::empty();
+        assistant.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "call-1".into(),
+            name: "test".into(),
+            arguments: json!({}),
+            is_raw: false,
+        }));
+        let contexts = [
+            Context {
+                tools: vec![ToolDefinition {
+                    name: "test".into(),
+                    description: "test".into(),
+                    parameters: json!({}),
+                    input_format: None,
+                }],
+                system_prompt: None,
+                messages: Vec::new(),
+            },
+            Context {
+                messages: vec![Message::Assistant(assistant)],
+                system_prompt: None,
+                tools: Vec::new(),
+            },
+            Context {
+                messages: vec![Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "test".into(),
+                    content: Vec::new(),
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                })],
+                system_prompt: None,
+                tools: Vec::new(),
+            },
+        ];
+        let provider = provider_for(api).unwrap();
+        for context in contexts {
+            // No credentials: a missing tool guard would fail as Auth instead.
+            for simple in [false, true] {
+                let stream = if simple {
+                    provider.stream_simple(&model, &context, &SimpleStreamOptions::default())
+                } else {
+                    provider.stream(&model, &context, &StreamOptions::default())
+                };
+                let result = tokio::time::timeout(BOUND, stream.result()).await.unwrap();
+                let error = result.error.unwrap();
+                assert_eq!(
+                    error.category,
+                    ErrorCategory::InvalidRequest,
+                    "{api}: {error:?}"
+                );
+                assert!(
+                    error.message.contains("does not support tools"),
+                    "{api}: {error:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_openai_toggle_and_effort_reach_the_wire() {
+    use aj_models::registry::{Catalog, ModelRegistry, OverridesFile};
+    use aj_models::types::{SimpleStreamOptions, ThinkingLevel};
+    for (api, path) in &APIS[1..3] {
+        for (level, effort) in [
+            (ThinkingLevel::Off, "none"),
+            (ThinkingLevel::XHigh, "xhigh"),
+        ] {
+            tokio::time::timeout(BOUND, async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let config = dir.path().join("models-custom.json");
+                std::fs::write(&config, json!({"models": [{
+                    "id": "qwen", "name": "Qwen", "provider": "local", "api": api,
+                    "base_url": format!("http://{}", listener.local_addr().unwrap()),
+                    "supports_tools": false, "input": ["text", "image"], "output": ["text"],
+                    "reasoning": true,
+                    "reasoning_options": [{"type":"toggle"}, {"type":"effort","values":["low","medium","xhigh"]}],
+                    "context_window": 49152, "max_tokens": 16384
+                }]}).to_string()).unwrap();
+                let mut registry = ModelRegistry::from_catalog_with_overrides(
+                    Catalog {
+                        schema_version: 0,
+                        updated_at: 0,
+                        source: "test".into(),
+                        models: Vec::new(),
+                    },
+                    OverridesFile {
+                        overrides: Vec::new(),
+                    },
+                    "test",
+                );
+                registry.load_custom_file(&config).unwrap();
+                let model = registry.get("local", "qwen").unwrap();
+                let server = async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = read_request(&mut socket, path).await;
+                    reject(&mut socket).await;
+                    request
+                };
+                let provider = provider_for(api).unwrap();
+                let stream = provider.stream_simple(
+                    model,
+                    &Context {
+                        system_prompt: None,
+                        messages: Vec::new(),
+                        tools: Vec::new(),
+                    },
+                    &SimpleStreamOptions {
+                        base: StreamOptions {
+                            api_key: Some("fixture-key".into()),
+                            ..Default::default()
+                        },
+                        reasoning: level,
+                    },
+                );
+                let (request, result) = tokio::join!(server, stream.result());
+                assert_rejected(result);
+                let actual = if *api == "openai-responses" {
+                    &request.body["reasoning"]["effort"]
+                } else {
+                    &request.body["reasoning_effort"]
+                };
+                assert_eq!(actual, effort, "{api}");
+                assert!(request.body.get("tools").is_none());
+            })
+            .await
+            .unwrap();
+        }
     }
 }
