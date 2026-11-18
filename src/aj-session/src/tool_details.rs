@@ -1,32 +1,26 @@
 //! Persistence codec for structured tool-result details.
 //!
-//! Text tool results often repeat model-facing content in their display body.
-//! The log append codec replaces that duplicate with a reference in its owned
-//! message. Projections, replay, and export resolve the reference before
-//! exposing the details to agent state or renderers.
+//! A tool result's display details often repeat its model-facing content: a
+//! text body that is the content, a command's output that the content starts
+//! with. The log append codec replaces such a copy with a reference into the
+//! content of its owned message. Projections, replay, and export resolve the
+//! reference before exposing the details to agent state or renderers.
+//!
+//! A reference names the content's text blocks joined into one string. Only
+//! the exact shapes written here are resolved. Anything else is left as it
+//! is and decoded as ordinary details.
 
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::tool::ToolDetails;
 use aj_models::types::{Message, ToolResultMessage, UserContent};
-use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 const CONTENT_TEXT_SOURCE: &str = "content_text";
 
-#[derive(Serialize)]
-struct PersistedTextDetails<'a> {
-    kind: &'static str,
-    summary: &'a str,
-    body_ref: PersistedBodyRef,
-}
+/// The command-output fields of bash details that can be references.
+const BASH_STREAMS: [(&str, &str); 2] = [("stdout", "stdout_ref"), ("stderr", "stderr_ref")];
 
-#[derive(Serialize)]
-struct PersistedBodyRef {
-    source: &'static str,
-    append_newline: bool,
-}
-
-/// Compacts duplicated text details in an owned message before persistence.
+/// Compacts duplicated details in an owned message before persistence.
 pub(crate) fn compact_message(message: &mut AgentMessage) {
     let (AgentMessageKind::Wire(Message::ToolResult(result))
     | AgentMessageKind::ToolActivity(aj_agent::message::ToolActivity {
@@ -40,70 +34,102 @@ pub(crate) fn compact_message(message: &mut AgentMessage) {
 }
 
 fn compact_tool_result(result: &mut ToolResultMessage) {
-    let Some(details) = result.details.as_ref() else {
+    let Some(object) = result.details.as_ref().and_then(Value::as_object) else {
         return;
     };
-    let Some(object) = details.as_object() else {
+    let compacted = match object.get("kind").and_then(Value::as_str) {
+        Some("text") => compact_text(object, &result.content),
+        Some("bash") => compact_bash(object, &result.content),
+        _ => None,
+    };
+    let Some(compacted) = compacted else {
         return;
     };
-
-    // We only rewrite the exact schema we produced. An extra field may carry
-    // semantics from a newer writer, so preserving the whole object is safer.
-    if object.len() != 3
-        || object.get("kind").and_then(Value::as_str) != Some("text")
-        || !object.contains_key("summary")
-        || !object.contains_key("body")
-    {
-        return;
-    }
-    let (Some(summary), Some(body)) = (
-        object.get("summary").and_then(Value::as_str),
-        object.get("body").and_then(Value::as_str),
+    let (Ok(full_len), Ok(compact_len)) = (
+        serde_json::to_vec(object).map(|bytes| bytes.len()),
+        serde_json::to_vec(&compacted).map(|bytes| bytes.len()),
     ) else {
         return;
     };
-    let Some(content_text) = concatenated_text(&result.content) else {
-        return;
-    };
-
-    let append_newline = if body == content_text {
-        false
-    } else if body
-        .strip_suffix('\n')
-        .is_some_and(|without_newline| without_newline == content_text)
-    {
-        true
-    } else {
-        return;
-    };
-
-    let marker = PersistedTextDetails {
-        kind: "text",
-        summary,
-        body_ref: PersistedBodyRef {
-            source: CONTENT_TEXT_SOURCE,
-            append_newline,
-        },
-    };
-    let Ok(marker) = serde_json::to_value(marker) else {
-        return;
-    };
-    let (Ok(full_len), Ok(marker_len)) = (
-        serde_json::to_vec(details).map(|bytes| bytes.len()),
-        serde_json::to_vec(&marker).map(|bytes| bytes.len()),
-    ) else {
-        return;
-    };
-    if marker_len < full_len {
-        result.details = Some(marker);
+    if compact_len < full_len {
+        result.details = Some(compacted);
     }
 }
 
-/// Expands persisted text references in an owned message projection.
+/// A text body that is the content: its blocks run together or joined by a
+/// newline, with at most one newline appended.
+fn compact_text(object: &Map<String, Value>, content: &[UserContent]) -> Option<Value> {
+    // We only rewrite the exact schema we produced. An extra field may carry
+    // semantics from a newer writer, so preserving the whole object is safer.
+    if object.len() != 3 {
+        return None;
+    }
+    let summary = object.get("summary")?.as_str()?;
+    let body = object.get("body")?.as_str()?;
+    let blocks = text_blocks(content)?;
+    let (join, append_newline) = ["", "\n"].into_iter().find_map(|join| {
+        let text = blocks.join(join);
+        if body == text {
+            Some((join, false))
+        } else if body.strip_suffix('\n') == Some(text.as_str()) {
+            Some((join, true))
+        } else {
+            None
+        }
+    })?;
+    let mut body_ref = json!({
+        "source": CONTENT_TEXT_SOURCE,
+        "append_newline": append_newline,
+    });
+    // Blocks run together is the form older builds read, so it stays as it was.
+    if !join.is_empty() {
+        body_ref["join"] = json!(join);
+    }
+    Some(json!({ "kind": "text", "summary": summary, "body_ref": body_ref }))
+}
+
+/// A command's output that the content holds verbatim: stdout at its start,
+/// stderr somewhere after it.
+fn compact_bash(object: &Map<String, Value>, content: &[UserContent]) -> Option<Value> {
+    if BASH_STREAMS
+        .iter()
+        .any(|(_, reference)| object.contains_key(*reference))
+    {
+        return None;
+    }
+    let text = text_blocks(content)?.concat();
+    let mut compacted = object.clone();
+    let mut from = 0;
+    for (field, reference) in BASH_STREAMS {
+        let Some(stream) = object.get(field).and_then(Value::as_str) else {
+            return None;
+        };
+        if stream.is_empty() {
+            continue;
+        }
+        let start = if field == "stdout" {
+            text.starts_with(stream).then_some(0)
+        } else {
+            text[from..].find(stream).map(|at| from + at)
+        };
+        let Some(start) = start else {
+            continue;
+        };
+        from = start + stream.len();
+        compacted.remove(field);
+        compacted.insert(
+            reference.to_string(),
+            json!({ "source": CONTENT_TEXT_SOURCE, "start": start, "len": stream.len() }),
+        );
+    }
+    Some(Value::Object(compacted))
+}
+
+/// Expands persisted references in an owned message projection.
 ///
-/// Only exact persisted markers are normalized. This keeps ordinary details
-/// and their unknown fields unchanged while ensuring a valid body reference
-/// becomes the full `ToolDetails::Text` shape expected outside storage.
+/// Only exact persisted references are resolved. This keeps ordinary details
+/// and their unknown fields unchanged while ensuring a valid reference
+/// becomes the full details shape expected outside storage.
 pub(crate) fn expand_message(mut message: AgentMessage) -> AgentMessage {
     let (AgentMessageKind::Wire(Message::ToolResult(result))
     | AgentMessageKind::ToolActivity(aj_agent::message::ToolActivity {
@@ -116,10 +142,7 @@ pub(crate) fn expand_message(mut message: AgentMessage) -> AgentMessage {
     let Some(raw) = result.details.as_ref() else {
         return message;
     };
-    let Some(details) = resolve_text_reference(raw, &result.content) else {
-        return message;
-    };
-    if let Ok(details) = serde_json::to_value(details) {
+    if let Some(details) = resolve_references(raw, &result.content) {
         result.details = Some(details);
     }
     message
@@ -127,52 +150,86 @@ pub(crate) fn expand_message(mut message: AgentMessage) -> AgentMessage {
 
 /// Resolves persisted tool details against their model-facing content.
 ///
-/// Exact text body references are hydrated first. Every other value, including
-/// a valid inline text object with an unrelated `body_ref` field, falls through
-/// to ordinary `ToolDetails` deserialization. A malformed marker-only value or
-/// non-text content returns `None`, allowing callers to use their existing
-/// content fallback without panicking.
+/// Exact references are hydrated first. Every other value, including a valid
+/// inline text object with an unrelated `body_ref` field, falls through to
+/// ordinary `ToolDetails` deserialization. A malformed reference or non-text
+/// content returns `None`, allowing callers to use their existing content
+/// fallback without panicking.
 pub fn resolve_tool_details(raw: &Value, content: &[UserContent]) -> Option<ToolDetails> {
-    resolve_text_reference(raw, content).or_else(|| serde_json::from_value(raw.clone()).ok())
+    let hydrated = resolve_references(raw, content);
+    serde_json::from_value(hydrated.unwrap_or_else(|| raw.clone())).ok()
 }
 
-fn resolve_text_reference(raw: &Value, content: &[UserContent]) -> Option<ToolDetails> {
+/// The details with their references replaced by what they name, `None` for
+/// details that hold no valid reference.
+fn resolve_references(raw: &Value, content: &[UserContent]) -> Option<Value> {
     let object = raw.as_object()?;
-    if object.len() != 3
-        || object.get("kind").and_then(Value::as_str) != Some("text")
-        || !object.contains_key("summary")
-        || !object.contains_key("body_ref")
-    {
+    match object.get("kind").and_then(Value::as_str) {
+        Some("text") => resolve_text_reference(object, content),
+        Some("bash") => resolve_bash_references(object, content),
+        _ => None,
+    }
+}
+
+fn resolve_text_reference(object: &Map<String, Value>, content: &[UserContent]) -> Option<Value> {
+    if object.len() != 3 || !object.contains_key("body_ref") {
         return None;
     }
     let summary = object.get("summary")?.as_str()?;
     let body_ref = object.get("body_ref")?.as_object()?;
-    if body_ref.len() != 2
-        || body_ref.get("source").and_then(Value::as_str) != Some(CONTENT_TEXT_SOURCE)
-        || !body_ref.contains_key("append_newline")
-    {
+    if body_ref.get("source").and_then(Value::as_str) != Some(CONTENT_TEXT_SOURCE) {
         return None;
     }
     let append_newline = body_ref.get("append_newline")?.as_bool()?;
-    let mut body = concatenated_text(content)?;
+    let join = match body_ref.len() {
+        2 => "",
+        3 => body_ref.get("join")?.as_str()?,
+        _ => return None,
+    };
+    let mut body = text_blocks(content)?.join(join);
     if append_newline {
         body.push('\n');
     }
-    Some(ToolDetails::Text {
-        summary: summary.to_string(),
-        body,
-    })
+    Some(json!({ "kind": "text", "summary": summary, "body": body }))
 }
 
-fn concatenated_text(content: &[UserContent]) -> Option<String> {
-    let mut text = String::new();
-    for block in content {
-        match block {
-            UserContent::Text(block) => text.push_str(&block.text),
-            UserContent::Image(_) => return None,
-        }
+fn resolve_bash_references(object: &Map<String, Value>, content: &[UserContent]) -> Option<Value> {
+    if !BASH_STREAMS
+        .iter()
+        .any(|(_, reference)| object.contains_key(*reference))
+    {
+        return None;
     }
-    Some(text)
+    let text = text_blocks(content)?.concat();
+    let mut hydrated = object.clone();
+    for (field, reference) in BASH_STREAMS {
+        let Some(stream_ref) = hydrated.remove(reference) else {
+            continue;
+        };
+        let stream_ref = stream_ref.as_object()?;
+        if stream_ref.len() != 3
+            || object.contains_key(field)
+            || stream_ref.get("source").and_then(Value::as_str) != Some(CONTENT_TEXT_SOURCE)
+        {
+            return None;
+        }
+        let start = usize::try_from(stream_ref.get("start")?.as_u64()?).ok()?;
+        let len = usize::try_from(stream_ref.get("len")?.as_u64()?).ok()?;
+        let stream = text.get(start..start.checked_add(len)?)?;
+        hydrated.insert(field.to_string(), json!(stream));
+    }
+    Some(Value::Object(hydrated))
+}
+
+/// The content's text blocks, `None` when it holds anything else.
+fn text_blocks(content: &[UserContent]) -> Option<Vec<&str>> {
+    content
+        .iter()
+        .map(|block| match block {
+            UserContent::Text(block) => Some(block.text.as_str()),
+            UserContent::Image(_) => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -375,5 +432,143 @@ mod tests {
         });
 
         assert!(resolve_tool_details(&malformed, &[UserContent::text("body")]).is_none());
+    }
+
+    /// Code Mode's `exec` joins its content blocks with a newline to make
+    /// its display body.
+    #[test]
+    fn a_body_of_newline_joined_blocks_is_a_reference_and_hydrates_exactly() {
+        for append_newline in [false, true] {
+            let blocks = ["Script completed", &"{\"stdout\":\"line\\n\"}".repeat(20)];
+            let mut body = blocks.join("\n");
+            if append_newline {
+                body.push('\n');
+            }
+            let details = json!({ "kind": "text", "summary": "exec", "body": body });
+            let content: Vec<_> = blocks
+                .iter()
+                .map(|block| UserContent::text(*block))
+                .collect();
+            let mut result = result(content, details.clone());
+            compact(&mut result);
+
+            let stored = result.details.clone().unwrap();
+            assert_eq!(
+                stored["body_ref"],
+                json!({
+                    "source": "content_text",
+                    "append_newline": append_newline,
+                    "join": "\n",
+                })
+            );
+            assert!(stored.get("body").is_none());
+            let resolved = resolve_tool_details(&stored, &result.content).unwrap();
+            assert_eq!(serde_json::to_value(resolved).unwrap(), details);
+        }
+    }
+
+    fn bash(stdout: &str, stderr: &str) -> Value {
+        serde_json::to_value(ToolDetails::Bash {
+            command: "make".to_string(),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: Some(2),
+            truncated: false,
+            full_output_path: None,
+            stdout_truncation: None,
+            stderr_truncation: None,
+            task_id: None,
+        })
+        .unwrap()
+    }
+
+    /// The model-facing text of a bash result starts with stdout and holds
+    /// stderr after its `STDERR:` line, with markers and a trailer around
+    /// them.
+    #[test]
+    fn bash_streams_the_content_holds_are_references_and_hydrate_exactly() {
+        let stdout = "compiling étape\n".repeat(12);
+        let stderr = "warning: unused\n".repeat(12);
+        let wire = format!("{stdout}STDERR:\n{stderr}Command failed with exit code: 2");
+        for (out, err, text) in [
+            (stdout.as_str(), stderr.as_str(), wire.as_str()),
+            (stdout.as_str(), "", stdout.as_str()),
+            ("", stderr.as_str(), wire.as_str()),
+        ] {
+            let mut details = bash(out, err);
+            // A field this build does not know stays with the details.
+            details["later_field"] = json!(7);
+            let mut result = result(vec![UserContent::text(text)], details.clone());
+            compact(&mut result);
+
+            let stored = result.details.clone().unwrap();
+            for (stream, field, reference) in
+                [(out, "stdout", "stdout_ref"), (err, "stderr", "stderr_ref")]
+            {
+                if stream.is_empty() {
+                    assert_eq!(stored[field], json!(""));
+                } else {
+                    assert!(stored.get(field).is_none(), "{field} is stored once");
+                    assert_eq!(stored[reference]["len"], json!(stream.len()));
+                }
+            }
+            let expanded = expand_message(AgentMessage::wire(Message::ToolResult(result.clone())));
+            let AgentMessageKind::Wire(Message::ToolResult(expanded)) = &expanded.kind else {
+                panic!("a tool result");
+            };
+            assert_eq!(expanded.details.as_ref(), Some(&details));
+            let resolved = resolve_tool_details(&stored, &result.content).unwrap();
+            let mut known = details.clone();
+            known.as_object_mut().unwrap().remove("later_field");
+            assert_eq!(serde_json::to_value(resolved).unwrap(), known);
+        }
+    }
+
+    #[test]
+    fn bash_output_the_content_does_not_hold_stays_inline() {
+        let stdout = "output\n".repeat(20);
+        // A background launch answers with a notice, not with the output.
+        let details = bash(&stdout, "");
+        let mut result = result(vec![UserContent::text("started task #1")], details.clone());
+        compact(&mut result);
+        assert_eq!(result.details, Some(details));
+
+        // A short stream is not worth a reference.
+        let details = bash("ok\n", "");
+        let mut result = result_with("ok\n", details.clone());
+        compact(&mut result);
+        assert_eq!(result.details, Some(details));
+    }
+
+    fn result_with(text: &str, details: Value) -> ToolResultMessage {
+        result(vec![UserContent::text(text)], details)
+    }
+
+    #[test]
+    fn a_bash_reference_the_content_cannot_answer_resolves_to_nothing() {
+        let text = "é".repeat(40);
+        let reference = |start: usize, len: usize| {
+            let mut details = bash("", "");
+            let object = details.as_object_mut().unwrap();
+            object.remove("stdout");
+            object.insert(
+                "stdout_ref".to_string(),
+                json!({ "source": "content_text", "start": start, "len": len }),
+            );
+            details
+        };
+        let content = [UserContent::text(text.as_str())];
+        assert!(resolve_tool_details(&reference(0, 4), &content).is_some());
+        // Past the end, and inside a character.
+        assert!(resolve_tool_details(&reference(0, 400), &content).is_none());
+        assert!(resolve_tool_details(&reference(1, 2), &content).is_none());
+        // A reference beside the field it stands for is not one we wrote,
+        // so the inline value is what the details say.
+        let mut both = reference(0, 4);
+        both["stdout"] = json!("x");
+        let Some(ToolDetails::Bash { stdout, .. }) = resolve_tool_details(&both, &content) else {
+            panic!("inline bash details");
+        };
+        assert_eq!(stdout, "x");
     }
 }
