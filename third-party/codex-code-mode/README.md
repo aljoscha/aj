@@ -50,10 +50,6 @@ exclude = ["vendor/codex-code-mode"]
 [workspace.dependencies]
 codex-code-mode-protocol = { path = "vendor/codex-code-mode/code-mode-protocol" }
 codex-code-mode-runtime = { path = "vendor/codex-code-mode/code-mode-runtime" }
-
-# Cargo only reads patches from the root workspace.
-[patch.crates-io]
-v8 = { git = "https://github.com/openai-oss-forks/rusty_v8.git", rev = "90a65f887a0c0f048f3784afbcb320b373c8a2e0" }
 ```
 
 Consume `vendor/codex-code-mode/models.json` directly. Select catalog entries by
@@ -65,10 +61,16 @@ override. Eligibility policy and provider gating belong to the parent.
 
 The nested `Cargo.lock` pins standalone verification. Parent builds resolve
 their own lockfile. Keep V8 at the workspace's exact `152.2.0` requirement and
-retain its `v8_enable_sandbox` feature and the exact upstream fork override.
-The native bindings and archive must match that fork, not crates.io V8 alone.
-Cargo fetches the fork and its Git submodules even when using prebuilt native
-artifacts, so a fresh dependency fetch can be substantial.
+retain its `v8_enable_sandbox` feature.
+
+The parent uses crates.io V8 rather than the upstream `[patch.crates-io]` fork
+override that the standalone workspace keeps. Cargo fetches a Git dependency's
+submodules even when the build uses prebuilt native artifacts, and for the fork
+that means several gigabytes of V8 and Chromium history. The fork at
+`90a65f88` differs from `v152.2.0` only in Rust-side alignment of cppgc
+`Member` and `WeakMember`, which Code Mode does not use. It changes no C++ and
+no generated bindings, so the pinned archive and bindings link against the
+crates.io crate. Recheck that diff when an upgrade moves the fork pin.
 
 ## Native prerequisite
 
