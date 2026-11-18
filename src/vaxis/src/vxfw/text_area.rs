@@ -1357,6 +1357,45 @@ impl TextArea {
 
     // -- Horizontal movement --
 
+    /// Reveal a text paste when navigation enters its marker. Deletion and
+    /// word movement do not call this, so collapsed pastes remain removable
+    /// and skippable as a unit. Keep the payload for undo and other copies of
+    /// the marker. Registered literal tokens (attachments) are not expanded.
+    fn expand_paste_at_cursor(&mut self, forward: bool) {
+        let mut scan = 0;
+        while let Some((start, end, id)) = find_next_marker(self.current_line(), scan, &self.pastes)
+        {
+            if self.cursor_col == if forward { start } else { end } {
+                let content = self.pastes[&id].clone();
+                let line = self.current_line();
+                let replacement = format!("{}{}{}", &line[..start], content, &line[end..]);
+                let newline_count = content.bytes().filter(|&byte| byte == b'\n').count();
+                let content_end = if newline_count == 0 {
+                    start + content.len()
+                } else {
+                    content.rsplit('\n').next().unwrap().len()
+                };
+                self.save_undo();
+                self.cancel_autocomplete();
+                self.exit_history();
+                self.invalidate_visual_line_cache();
+                self.lines.splice(
+                    self.cursor_line..=self.cursor_line,
+                    replacement.split('\n').map(str::to_string),
+                );
+                if forward {
+                    self.cursor_col = start;
+                } else {
+                    self.cursor_line += newline_count;
+                    self.cursor_col = content_end;
+                }
+                self.reset_sticky_state();
+                return;
+            }
+            scan = end;
+        }
+    }
+
     /// Moves the cursor left by one grapheme, wrapping to the end of the
     /// previous line at column zero. Any horizontal move clears the sticky
     /// column.
@@ -3644,12 +3683,14 @@ impl TextArea {
 
         // Plain horizontal movement.
         if key.matches(Key::LEFT, empty) || key.matches(u32::from('b'), ctrl) {
+            self.expand_paste_at_cursor(false);
             self.move_left();
             self.last_action = LastAction::None;
             self.check_changed(ctx);
             return;
         }
         if key.matches(Key::RIGHT, empty) || key.matches(u32::from('f'), ctrl) {
+            self.expand_paste_at_cursor(true);
             self.move_right();
             self.last_action = LastAction::None;
             self.check_changed(ctx);
@@ -5211,41 +5252,69 @@ mod tests {
     // -- Paste markers: atomic navigation --
 
     #[test]
-    fn treats_paste_marker_as_single_unit_for_right_arrow() {
-        let mut ed = editor();
-        type_str(&mut ed, "A");
-        paste_large(&mut ed);
-        type_str(&mut ed, "B");
-
-        let text = ed.text();
-        let (marker_len, _marker) = find_marker(&text);
-
-        send(&mut ed, &ctrl('a'));
-        assert_eq!(ed.cursor(), (0, 0));
-        send(&mut ed, &right());
-        assert_eq!(ed.cursor(), (0, 1));
-        send(&mut ed, &right());
-        assert_eq!(ed.cursor(), (0, 1 + marker_len));
-        send(&mut ed, &right());
-        assert_eq!(ed.cursor(), (0, 1 + marker_len + 1));
+    fn entering_text_paste_expands_edits_and_submits_from_either_side() {
+        for forward in [true, false] {
+            let mut ed = editor();
+            let payload = "αβ\n".repeat(12);
+            type_str(&mut ed, "before ");
+            send(&mut ed, &paste(&payload));
+            type_str(&mut ed, "after");
+            let collapsed = ed.text();
+            let expected = format!("before {payload}after");
+            assert_eq!(ed.expanded_text(), expected);
+            // Render the collapsed state first to exercise layout invalidation.
+            let _ = ed.draw(&ctx(40, 20));
+            ed.cursor_col = if forward { 7 } else { collapsed.len() - 5 };
+            send(&mut ed, &if forward { right() } else { left() });
+            assert_eq!(ed.text(), expected);
+            assert_eq!(ed.cursor(), if forward { (0, 8) } else { (11, 2) });
+            let surface = ed.draw(&ctx(40, 20));
+            let rows: String = (1..surface.size.height - 1)
+                .map(|row| row_text(&surface, row))
+                .collect();
+            assert!(!rows.contains("[paste #"));
+            assert!(rows.contains("αβ"));
+            // Expansion is one undo unit, separate from subsequent edits.
+            type_str(&mut ed, "X");
+            let edited = ed.text();
+            send(&mut ed, &ctrl('_'));
+            assert_eq!(ed.text(), expected);
+            send(&mut ed, &ctrl('_'));
+            assert_eq!(ed.text(), collapsed);
+            assert_eq!(ed.expanded_text(), expected);
+            send(&mut ed, &if forward { right() } else { left() });
+            type_str(&mut ed, "X");
+            send(&mut ed, &key(Key::ENTER, Modifiers::empty()));
+            assert_eq!(ed.take_submitted(), Some(edited));
+        }
     }
 
     #[test]
-    fn treats_paste_marker_as_single_unit_for_left_arrow() {
+    fn expanding_one_single_line_paste_keeps_other_markers_and_graphemes_intact() {
         let mut ed = editor();
-        type_str(&mut ed, "A");
-        paste_large(&mut ed);
-        type_str(&mut ed, "B");
-
-        let text = ed.text();
-        let (marker_len, _marker) = find_marker(&text);
-
-        send(&mut ed, &left());
-        assert_eq!(ed.cursor(), (0, 1 + marker_len));
-        send(&mut ed, &left());
-        assert_eq!(ed.cursor(), (0, 1));
-        send(&mut ed, &left());
-        assert_eq!(ed.cursor(), (0, 0));
+        let payload = "e\u{301}".repeat(501);
+        type_str(&mut ed, "pre ");
+        send(&mut ed, &paste(&payload));
+        let first_end = ed.cursor_col;
+        type_str(&mut ed, " between ");
+        send(&mut ed, &paste(&payload));
+        let collapsed = ed.text();
+        let expected = ed.expanded_text();
+        ed.cursor_col = first_end;
+        send(&mut ed, &ctrl('b'));
+        assert_eq!(
+            ed.text(),
+            format!("pre {payload}{}", &collapsed[first_end..])
+        );
+        assert_eq!(ed.expanded_text(), expected);
+        assert_eq!(ed.cursor(), (0, 4 + payload.chars().count() - 2));
+        send(&mut ed, &ctrl('_'));
+        assert_eq!(ed.text(), collapsed);
+        assert_eq!(ed.cursor_col, first_end);
+        ed.cursor_col = 4;
+        send(&mut ed, &ctrl('f'));
+        assert_eq!(ed.cursor(), (0, 6));
+        assert_eq!(ed.expanded_text(), expected);
     }
 
     #[test]
@@ -5258,9 +5327,7 @@ mod tests {
         let text = ed.text();
         let (marker_len, _marker) = find_marker(&text);
 
-        send(&mut ed, &ctrl('a'));
-        send(&mut ed, &right()); // past 'A'
-        send(&mut ed, &right()); // past marker
+        send(&mut ed, &left()); // before B, without entering the marker
         assert_eq!(ed.cursor(), (0, 1 + marker_len));
 
         send(&mut ed, &backspace());
@@ -5310,9 +5377,7 @@ mod tests {
 
         let text_before = ed.text();
 
-        send(&mut ed, &ctrl('a'));
-        send(&mut ed, &right()); // past A
-        send(&mut ed, &right()); // past marker
+        send(&mut ed, &left()); // before B, without entering the marker
         send(&mut ed, &backspace());
         assert_eq!(ed.text(), "AB");
 
@@ -5334,11 +5399,11 @@ mod tests {
         let (m1, _) = find_marker(second);
 
         send(&mut ed, &ctrl('a'));
-        send(&mut ed, &right()); // skip first marker
+        send(&mut ed, &ctrl_right()); // skip first marker
         assert_eq!(ed.cursor(), (0, m0));
         send(&mut ed, &right()); // past space
         assert_eq!(ed.cursor(), (0, m0 + 1));
-        send(&mut ed, &right()); // skip second marker
+        send(&mut ed, &ctrl_right()); // skip second marker
         assert_eq!(ed.cursor(), (0, m0 + 1 + m1));
     }
 

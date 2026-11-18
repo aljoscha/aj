@@ -122,6 +122,10 @@ requires `--print`.
   prompt even when connected to a remote host. Quoted and escaped dropped
   paths are supported. Image preparation errors keep your draft intact.
   Images cannot be queued or steered while the agent is busy.
+- **Large text pastes.** Large pastes start collapsed. Move Left/Right into
+  a paste marker to expand it into editable text. Undo restores the marker.
+  Word movement skips collapsed pastes, and Backspace/Delete removes them
+  as a unit. Image attachments remain collapsed.
 
 ## Configuration
 
