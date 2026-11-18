@@ -51,13 +51,13 @@ def section(source, start, end):
     return source[begin:source.index(end, begin)]
 
 
-def materialize(repo, revision, out):
+def materialize(repo, revision, out, models_revision=None):
     sources = {}
-    def source(path):
-        entry = git(repo, 'ls-tree', revision, '--', path).decode()
+    def source(path, ref=revision):
+        entry = git(repo, 'ls-tree', ref, '--', path).decode()
         if entry.split(' ', 1)[0] not in ('100644', '100755'):
             raise RuntimeError(f'Refusing upstream non-regular file: {path}')
-        data = git(repo, 'show', f'{revision}:{path}')
+        data = git(repo, 'show', f'{ref}:{path}')
         sources[path] = hashlib.sha256(data).hexdigest()
         return data
     upstream_workspace = tomllib.loads(source('codex-rs/Cargo.toml').decode())['workspace']
@@ -100,7 +100,7 @@ def materialize(repo, revision, out):
         (out / name).write_bytes(source(name))
     (out / 'Cargo.toml').write_bytes(template.read_bytes())
     (out / '.gitignore').write_text('/target/\n')
-    (out / 'models.json').write_bytes(source('codex-rs/models-manager/models.json'))
+    (out / 'models.json').write_bytes(source('codex-rs/models-manager/models.json', models_revision or revision))
     (out / 'clippy.toml').write_bytes(source('codex-rs/clippy.toml'))
     bazel = source('MODULE.bazel').decode()
     artifacts = []
@@ -183,6 +183,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check', action='store_true')
     mode.add_argument('--upgrade', metavar='FULL_COMMIT', help='explicitly replace a verified import')
+    mode.add_argument('--upgrade-models', metavar='FULL_COMMIT',
+                      help='replace only the model catalog, keeping the runtime revision')
     args = parser.parse_args()
     record = SUPPORT / 'upstream.json'
     dest = ROOT / 'vendor/codex-code-mode'
@@ -192,12 +194,16 @@ def main():
             parser.error(f'refusing symlink path: {path}')
     previous = json.loads(record.read_text()) if record.exists() else None
     revision = args.upgrade or (previous['revision'] if previous else REVISION)
-    if not re.fullmatch(r'[0-9a-f]{40}', revision):
-        parser.error('revision must be a full lowercase 40-character commit SHA')
-    resolved = git(args.upstream, 'rev-parse', f'{revision}^{{commit}}').decode().strip()
-    if revision != resolved:
-        parser.error('upstream does not resolve to the pinned commit')
-    if args.upgrade and (not dest.exists() or previous is None):
+    models_revision = args.upgrade_models or (
+        previous.get('models_revision', revision) if previous else revision)
+    for pin in (revision, models_revision):
+        if not re.fullmatch(r'[0-9a-f]{40}', pin):
+            parser.error('revision must be a full lowercase 40-character commit SHA')
+        resolved = git(args.upstream, 'rev-parse', f'{pin}^{{commit}}').decode().strip()
+        if pin != resolved:
+            parser.error('upstream does not resolve to the pinned commit')
+    upgrading = args.upgrade or args.upgrade_models
+    if upgrading and (not dest.exists() or previous is None):
         parser.error('upgrade requires an existing recorded import')
     if dest.exists() and (previous is None or inventory(dest) != previous['files']):
         parser.error('vendored files have local changes or no provenance record, refusing to overwrite')
@@ -207,19 +213,26 @@ def main():
     try:
         staged = staging / 'new'
         staged.mkdir()
-        files, sources = materialize(args.upstream, resolved, staged)
-        metadata = {'repository': 'https://github.com/openai/codex', 'revision': resolved,
+        files, sources = materialize(args.upstream, revision, staged, models_revision)
+        metadata = {'repository': 'https://github.com/openai/codex', 'revision': revision,
                     'files': files, 'sources': sources,
                     'inputs': {str(p.relative_to(SUPPORT)): hashlib.sha256(p.read_bytes()).hexdigest()
                                for p in [SUPPORT / 'workspace.toml', *sorted((SUPPORT / 'patches').glob('*.patch'))]}}
-        if args.check or (dest.exists() and not args.upgrade):
+        if args.upgrade_models:
+            runtime_files = lambda entries: {k: v for k, v in entries.items() if k != 'models.json'}
+            if (metadata['inputs'] != previous['inputs']
+                    or runtime_files(files) != runtime_files(previous['files'])):
+                parser.error('catalog-only upgrade would change runtime inputs or files; use --upgrade')
+        if models_revision != revision:
+            metadata['models_revision'] = models_revision
+        if args.check or (dest.exists() and not upgrading):
             if not record.exists() or not dest.exists() or json.loads(record.read_text()) != metadata or inventory(dest) != files:
                 parser.error('import differs from the recorded vendor tree')
-            print(f'Reproducible import verified: {resolved}, {len(files)} files')
+            print(f'Reproducible import verified: {revision}, catalog {models_revision}, {len(files)} files')
             return
         publish(staged, dest, record, metadata, staging)
         published = True
-        print(f'Imported {resolved}: {len(files)} files')
+        print(f'Imported {revision}, catalog {models_revision}: {len(files)} files')
     finally:
         if published or not (staging / 'old').exists():
             shutil.rmtree(staging)

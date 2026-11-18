@@ -114,6 +114,41 @@ class ImportContract(unittest.TestCase):
         self.run_import('--upgrade', upgraded)
         self.assertEqual(tree(self.vendor), before)
 
+    def test_catalog_upgrade_keeps_runtime_and_reproduces(self):
+        repo = self.root / 'catalog-upstream'
+        subprocess.run(['git', 'clone', '--quiet', '--shared', '--no-checkout', str(UPSTREAM), str(repo)], check=True)
+        self.upstream = repo
+        record = self.support / 'upstream.json'
+        revision = json.loads(record.read_text())['revision']
+        env = {**os.environ, 'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+               'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
+        def git(*args, data=None):
+            return subprocess.check_output(['git', '-C', str(repo), *args], input=data, env=env).decode().strip()
+        git('read-tree', revision)
+        catalog = (self.vendor / 'models.json').read_bytes() + b'\n'
+        blob = git('hash-object', '-w', '--stdin', data=catalog)
+        git('update-index', '--cacheinfo', f'100644,{blob},codex-rs/models-manager/models.json')
+        upgraded = git('commit-tree', git('write-tree'), '-p', revision, data=b'catalog fixture\n')
+        before = tree(self.vendor)
+        self.run_import('--upgrade-models', upgraded)
+        after = tree(self.vendor)
+        self.assertEqual({k for k in before if before[k] != after[k]}, {'models.json'})
+        self.assertEqual((self.vendor / 'models.json').read_bytes(), catalog)
+        metadata = json.loads(record.read_text())
+        self.assertEqual(metadata['revision'], revision)
+        self.assertEqual(metadata['models_revision'], upgraded)
+        self.assertEqual(metadata['sources']['codex-rs/models-manager/models.json'], after['models.json'])
+        self.run_import('--check')
+        self.run_import()
+        self.run_import('--upgrade', revision)
+        self.assertEqual(tree(self.vendor), after)
+        for ref in ('HEAD', 'main', '44984d2'):
+            self.run_import('--upgrade-models', ref, succeeds=False)
+        (self.vendor / 'models.json').write_bytes(catalog + b' ')
+        before = tree(self.root)
+        self.run_import('--upgrade-models', revision, succeeds=False)
+        self.assertEqual(tree(self.root), before)
+
     def test_moving_refs_and_symlinks_are_rejected(self):
         before = tree(self.root)
         for ref in ('HEAD', 'main', '44984d2'):
@@ -136,6 +171,8 @@ class ImportContract(unittest.TestCase):
         self.run_import('--check', succeeds=False)
         self.assertEqual(tree(self.root), before)
         revision = json.loads((self.support / 'upstream.json').read_text())['revision']
+        self.run_import('--upgrade-models', revision, succeeds=False)
+        self.assertEqual(tree(self.root), before)
         self.run_import('--upgrade', revision)
         self.assertEqual((self.vendor / 'upgrade-fixture.txt').read_text(), 'fixture\n')
         self.run_import('--check')

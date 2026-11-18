@@ -1,7 +1,9 @@
 # Codex Code Mode extraction
 
-Source: <https://github.com/openai/codex>, commit
+Runtime source: <https://github.com/openai/codex>, commit
 `75fc67e8f4284a669eebd90ab6bc9ef7697e876e`.
+Model catalog: Codex CLI `rust-v0.170.0`, commit
+`29eb79e9866b3262a777fdf8195c1b9e63684c91`.
 
 `vendor/codex-code-mode` is an independent Cargo workspace containing:
 
@@ -152,6 +154,24 @@ The new revision becomes the default for subsequent verification and reimports.
 Cargo's root `target/` and `Cargo.lock` are moved intact, not regenerated. Review
 and refresh lockfiles and native artifacts separately when dependencies change.
 Licensing evidence is revision-specific and must also be reviewed on upgrade.
+
+### Catalog-only refresh
+
+Model eligibility can be refreshed without upgrading the runtime, dependencies,
+or native artifacts:
+
+```sh
+python3 scripts/import-codex-code-mode.py --upstream ../codex --upgrade-models FULL_40_CHARACTER_COMMIT_SHA
+python3 scripts/import-codex-code-mode.py --upstream ../codex --check
+```
+
+The importer verifies the existing tree before replacement. It records the
+separate catalog pin as `models_revision` and hashes the complete upstream
+catalog. Reimports and runtime upgrades retain that pin. Use
+`--upgrade-models` again to move it, including to the runtime revision.
+Without a separate pin, the catalog follows the runtime revision.
+Catalog-only updates need importer contracts and AJ's Code Mode eligibility
+tests, not native artifact or runtime compatibility reviews.
 
 ### AJ compatibility review
 

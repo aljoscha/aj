@@ -132,13 +132,17 @@ struct Harness {
 
 impl Harness {
     fn new(eligible: bool, tools: Vec<ErasedToolDefinition>) -> Self {
+        Self::with_model(model(eligible), tools)
+    }
+
+    fn with_model(model: ModelInfo, tools: Vec<ErasedToolDefinition>) -> Self {
         let provider = Arc::new(RecordingProvider::default());
         let mut agent = Agent::with_provider(
             std::env::current_dir().unwrap(),
             tools,
             vec![],
             Arc::<RecordingProvider>::clone(&provider),
-            Arc::new(model(eligible)),
+            Arc::new(model),
             StreamOptions::default(),
             None,
         );
@@ -391,6 +395,36 @@ text(await tools[entry.name]({value: "native-js-result"}));
     );
     assert!(result.contains("native-js-result"), "{result}");
     assert_eq!(*echo.0.lock().unwrap(), ["native-js-result"]);
+}
+
+#[tokio::test]
+async fn gpt_6_2_seed_models_execute_code_mode() {
+    let registry = aj_models::registry::ModelRegistry::from_catalog_with_overrides(
+        serde_json::from_str(include_str!("../../aj-models/data/models.json")).unwrap(),
+        aj_models::registry::bundled_overrides(),
+        "test",
+    );
+    for provider in ["openai", "openai-codex"] {
+        for id in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            let model = registry.get(provider, id).unwrap().clone();
+            let echo = Echo::default();
+            let mut h = Harness::with_model(model, vec![echo.clone().into()]);
+            h.exec(r#"text(await tools.echo({value: "new-model"}));"#)
+                .await;
+            assert!(h.result("exec").contains("Script completed"));
+            assert_eq!(*echo.0.lock().unwrap(), ["new-model"]);
+            let contexts = h.provider.contexts.lock().unwrap();
+            assert_eq!(
+                contexts[0]
+                    .tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["exec", "wait"],
+                "{provider}/{id}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

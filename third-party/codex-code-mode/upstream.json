@@ -76,7 +76,7 @@
     "code-mode-runtime/tests/jit.rs": "3d0109871ad575f7dea5ea13a0a064c1e363ba790a66d29d62ade79694e56d12",
     "code-mode-runtime/tests/settled.rs": "093fc672b92fede2fe917db9377bf727ce4878a17298763aeb827ed67e22d739",
     "code-mode-runtime/tests/stored_values.rs": "6125802e9f83d46f2a8046dd98c805352ba726a889cdfe29d85337e8d4803de7",
-    "models.json": "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10",
+    "models.json": "d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068",
     "utils/audio/BUILD.bazel": "c8a00078fe32137d2c999468be5cb69637f880c17996174d2879ee3af1964542",
     "utils/audio/Cargo.toml": "c2f8469ee68ae25d94f3008260d860ded1e0038dfbd0c44cac6c1c0174154633",
     "utils/audio/src/audio_preparation_tests.rs": "b2168db46f5f010d3d6902102c03356f3491f880ad65bd4dbc106b6bae433156",
@@ -98,6 +98,7 @@
     "patches/0002-durable-store.patch": "419c0ff7ec705d606e15fc101326c20d9b762fc2101549ab76bbb80e55b1c3c8",
     "workspace.toml": "f543a9f4348b90a8df86a0b58c367f4a6077af400e3564010efbd21720ae1473"
   },
+  "models_revision": "29eb79e9866b3262a777fdf8195c1b9e63684c91",
   "repository": "https://github.com/openai/codex",
   "revision": "75fc67e8f4284a669eebd90ab6bc9ef7697e876e",
   "sources": {
@@ -169,7 +170,7 @@
     "codex-rs/code-mode-runtime/tests/array_sort.rs": "1d372e9d2b9c0d213baec309ac4822431a6a2a2c8cb091ce5fcc96acdf81f2e6",
     "codex-rs/code-mode-runtime/tests/jit.rs": "3d0109871ad575f7dea5ea13a0a064c1e363ba790a66d29d62ade79694e56d12",
     "codex-rs/code-mode-runtime/tests/settled.rs": "093fc672b92fede2fe917db9377bf727ce4878a17298763aeb827ed67e22d739",
-    "codex-rs/models-manager/models.json": "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10",
+    "codex-rs/models-manager/models.json": "d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068",
     "codex-rs/protocol/src/local_media.rs": "34e9b0320454dc5e14f2f27aa3be9b55b1ad95c45fbccde0f07ca2815528ac7a",
     "codex-rs/protocol/src/mcp.rs": "61954ad810a9882d5bbf6177d592d3fb3c1e7074be87d567141e68e29c7a8e45",
     "codex-rs/protocol/src/models.rs": "cfbfcc16288247dc3b4b954724a3ea7fff317ab1a82e5e7d0952bc622dca35a6",
