@@ -39,7 +39,7 @@ const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 /// (defensively filtering any upstream re-emission first), and load
 /// splices them in so users on a stale cache or an older bundled seed
 /// still see Codex models. Visible models and reasoning controls follow
-/// Codex CLI rust-v0.160.0's `codex-rs/models-manager/models.json`.
+/// Codex CLI rust-v0.170.0's `codex-rs/models-manager/models.json`.
 /// Reviewed additive overrides include documented, plan-restricted speed modes
 /// that the CLI's bundled catalog does not list.
 /// The CLI's `ultra` is a multi-agent mode that resolves to an ordinary
@@ -1748,6 +1748,9 @@ mod tests {
 
         let ids: std::collections::HashSet<&str> = seed.iter().map(|m| m.id.as_str()).collect();
         let expected: std::collections::HashSet<&str> = [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-terra",
             "gpt-6-astra",
             "gpt-6.1-sol",
             "gpt-6-sol",

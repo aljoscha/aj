@@ -1,6 +1,196 @@
 {
   "models": [
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
+      "id": "gpt-6.2-sol",
+      "name": "GPT-6.2 Sol",
+      "family": "gpt-sol",
+      "api": "openai-codex-responses",
+      "provider": "openai-codex",
+      "base_url": "https://chatgpt.com/backend-api",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "2x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 4.0,
+            "output": 20.0,
+            "cache_read": 0.2,
+            "cache_write": 5.0
+          }
+        }
+      ],
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.1,
+        "cache_write": 2.5,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 4.0,
+            "output": 15.0,
+            "cache_read": 0.2,
+            "cache_write": 5.0
+          }
+        ]
+      },
+      "context_window": 1050000,
+      "max_tokens": 128000
+    },
+    {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
+      "id": "gpt-6.2-astra",
+      "name": "GPT-6.2 Astra",
+      "family": "gpt-astra",
+      "api": "openai-codex-responses",
+      "provider": "openai-codex",
+      "base_url": "https://chatgpt.com/backend-api",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "2x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 16.0,
+            "output": 80.0,
+            "cache_read": 0.8,
+            "cache_write": 20.0
+          }
+        }
+      ],
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 8.0,
+        "output": 40.0,
+        "cache_read": 0.4,
+        "cache_write": 10.0,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 16.0,
+            "output": 60.0,
+            "cache_read": 0.8,
+            "cache_write": 20.0
+          }
+        ]
+      },
+      "context_window": 1050000,
+      "max_tokens": 128000
+    },
+    {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
+      "id": "gpt-6.1-terra",
+      "name": "GPT-6.1 Terra",
+      "family": "gpt-terra",
+      "api": "openai-codex-responses",
+      "provider": "openai-codex",
+      "base_url": "https://chatgpt.com/backend-api",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "1.5x speed",
+          "wire_value": "priority",
+          "cost": {
+            "input": 2.0,
+            "output": 10.0,
+            "cache_read": 0.1,
+            "cache_write": 2.5
+          }
+        }
+      ],
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.05,
+        "cache_write": 1.25,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 2.0,
+            "output": 7.5,
+            "cache_read": 0.1,
+            "cache_write": 2.5
+          }
+        ]
+      },
+      "context_window": 1050000,
+      "max_tokens": 128000
+    },
+    {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-6-astra",
       "name": "GPT-6 Astra",
       "family": "gpt-astra",
@@ -89,6 +279,10 @@
       "max_tokens": 128000
     },
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-6.1-sol",
       "name": "GPT-6.1 Sol",
       "family": "gpt-sol",
@@ -138,17 +332,17 @@
           "description": "Higher speed, increased usage",
           "wire_value": "ultrafast",
           "cost": {
-            "input": 12,
-            "output": 60,
+            "input": 12.0,
+            "output": 60.0,
             "cache_read": 0.6,
-            "cache_write": 15,
+            "cache_write": 15.0,
             "tiers": [
               {
                 "input_tokens_above": 272000,
-                "input": 24,
-                "output": 90,
+                "input": 24.0,
+                "output": 90.0,
                 "cache_read": 1.2,
-                "cache_write": 30
+                "cache_write": 30.0
               }
             ]
           }
@@ -177,6 +371,10 @@
       "max_tokens": 128000
     },
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-6-sol",
       "name": "GPT-6 Sol",
       "family": "gpt-sol",
@@ -236,6 +434,10 @@
       "max_tokens": 128000
     },
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-6-luna",
       "name": "GPT-6 Luna",
       "family": "gpt-luna",
@@ -304,6 +506,10 @@
       "max_tokens": 128000
     },
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-5.5",
       "name": "GPT-5.5",
       "family": "gpt",
@@ -361,6 +567,10 @@
       "max_tokens": 128000
     },
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-5.6-sol",
       "name": "GPT-5.6 Sol",
       "family": "gpt-sol",
@@ -419,6 +629,10 @@
       "max_tokens": 128000
     },
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-5.6-terra",
       "name": "GPT-5.6 Terra",
       "family": "gpt-terra",
@@ -477,6 +691,10 @@
       "max_tokens": 128000
     },
     {
+      "supports_tools": true,
+      "output": [
+        "text"
+      ],
       "id": "gpt-5.6-luna",
       "name": "GPT-5.6 Luna",
       "family": "gpt-luna",
