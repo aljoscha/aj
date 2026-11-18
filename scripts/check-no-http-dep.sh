@@ -39,6 +39,7 @@ pulldown-cmark
 rand
 serde
 serde_json
+shlex
 syntect
 thiserror
 tokio

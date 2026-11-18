@@ -93,7 +93,7 @@ pub enum SessionExit {
     /// for a tree-view switch, which only moves the head.
     Branch {
         target: HeadTarget,
-        prompt: Option<String>,
+        prompt: Option<crate::composer::PreparedPrompt>,
     },
 }
 

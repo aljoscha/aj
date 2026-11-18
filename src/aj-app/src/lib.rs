@@ -28,6 +28,7 @@ pub mod client;
 pub mod clipboard;
 pub mod commands;
 pub mod compaction;
+pub mod composer;
 pub mod directory;
 pub mod export;
 pub mod footer;

@@ -1509,6 +1509,16 @@ by `"$AJ_CONNECT_URL"`, with an instruction to set it to the same connection
 URL. No usage summary is printed. An
 unsupported action never silently does nothing.
 
+Clipboard images and image-file paths pasted by a terminal drop become
+client-local editor attachments. Submission prepares image content on the
+client and sends bytes through the existing prompt `content` field. The
+host never opens the client's path. Preparation or submission failures keep
+the draft in the editor. Hosts and gateways accept request bodies up to 32 MiB,
+including JSON and base64 overhead. Image preparation also precedes a requested
+branch change, and its bytes stay with the pending branch prompt. Follow-up and
+steering queues remain text-only, so busy-agent image submissions are refused
+without discarding the draft.
+
 Account selection attempts the host's endpoint and shows the ordinary
 unsupported-endpoint notice if the peer lacks it. It does not fall back to
 reading or modifying the client's auth store. Credential pickers and the

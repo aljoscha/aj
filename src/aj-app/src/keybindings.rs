@@ -34,10 +34,9 @@ pub const ACTION_TOOLS_EXPAND: &str = "aj.tools.expand";
 ///
 /// Bound by default to `ctrl+v`. The interactive loop intercepts the
 /// keystroke before the editor sees it, reads the clipboard, writes
-/// any image payload to a tempfile, and inserts that file's path
-/// into the editor as plain text. On submit, the model reads the
-/// file through the `read_file` tool. A clipboard miss is a silent
-/// no-op — users expect Ctrl+V to be benign.
+/// any image payload to a tempfile, and inserts an attachment marker.
+/// On submit, image bytes accompany the prompt, including over remote
+/// connections. A clipboard miss is a silent no-op.
 pub const ACTION_CLIPBOARD_PASTE_IMAGE: &str = "aj.clipboard.paste_image";
 
 /// Action ID for the "open command palette" chord.

@@ -11,7 +11,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -27,6 +27,7 @@ use aj_app::cli::args::{
 };
 use aj_app::client::{Attach, Refusal, SessionClient};
 use aj_app::commands::CommandAction;
+use aj_app::composer::{ImageAttachments, PreparedPrompt};
 use aj_app::directory::SessionDirectory;
 #[cfg(test)]
 use aj_app::host::AttachRequest;
@@ -1048,7 +1049,7 @@ enum PendingTransition {
     },
     Head {
         branching: bool,
-        prompt: Option<String>,
+        prompt: Option<PreparedPrompt>,
     },
 }
 
@@ -1087,7 +1088,7 @@ enum FocusRequest {
     /// handed off.
     Branch {
         target: HeadTarget,
-        prompt: Option<String>,
+        prompt: Option<PreparedPrompt>,
     },
 }
 
@@ -1284,7 +1285,7 @@ async fn focus_session(
         ..
     }) = world.transition.take()
     {
-        replace_editor_preserving_draft(&shell.borrow().view().editor, &prompt);
+        replace_editor_preserving_draft(&shell.borrow().view().editor, &prompt.draft);
     }
     let attaching = !world.directory.is_attached(&session);
     let reopening = attaching
@@ -1498,7 +1499,7 @@ async fn complete_pending_transition(
                 .borrow()
                 .show_toast(branch_switch_notice(prompt.is_some()));
             if let Some(prompt) = prompt {
-                auto_submit_launch(world, vec![UserContent::text(prompt)]).await;
+                submit_prepared_editor(world, shell, prompt, AgentId::Main).await;
                 shell
                     .borrow()
                     .view()
@@ -1581,7 +1582,7 @@ fn fail_pending_transition(
         PendingTransition::Head { branching, prompt } => {
             let restored_prompt = prompt.is_some();
             if let Some(prompt) = &prompt {
-                replace_editor_preserving_draft(&shell.borrow().view().editor, prompt);
+                replace_editor_preserving_draft(&shell.borrow().view().editor, &prompt.draft);
             }
             let action = if branching {
                 "The branch changed"
@@ -1628,11 +1629,16 @@ async fn branch_focused_session(
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
     target: HeadTarget,
-    prompt: Option<String>,
+    prompt: Option<PreparedPrompt>,
 ) {
     if refuse_while_attaching(world, shell, "change branches") {
         if let Some(prompt) = &prompt {
-            shell.borrow().view().editor.borrow_mut().set_text(prompt);
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow_mut()
+                .set_text(&prompt.draft);
         }
         app.request_redraw();
         return;
@@ -1673,7 +1679,12 @@ async fn branch_focused_session(
         // already in prompt history (recorded at the submit site), so it is
         // never lost either way.
         if let Some(prompt) = prompt {
-            shell.borrow().view().editor.borrow_mut().set_text(&prompt);
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow_mut()
+                .set_text(&prompt.draft);
             refusal.push_str(" Your message is back in the editor.");
         }
         shell.borrow().show_toast(refusal);
@@ -3216,6 +3227,7 @@ fn branch_armed_refusal(what: &str) -> String {
 /// snapshot at draw) and is delivered by the host's post-turn wake. History
 /// is recorded by the callers (the drive loop and [`handle_steer`]), which
 /// own the editor. Returns whether the message was accepted for delivery.
+#[cfg(test)]
 async fn handle_submit(world: &mut World, text: String) -> bool {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
@@ -3252,13 +3264,66 @@ async fn prompt_host(world: &mut World, command: Command) -> bool {
 
 /// Submit editor text and return the transcript to its live tail when accepted.
 async fn handle_editor_submit(world: &mut World, shell: &Rc<RefCell<Shell>>, text: String) {
-    if handle_submit(world, text).await {
+    if let Some(prompt) = prepare_editor_prompt(world, shell, &text).await {
+        let target = world.chat.borrow().active_view();
+        submit_prepared_editor(world, shell, prompt, target).await;
+    }
+}
+
+async fn prepare_editor_prompt(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    text: &str,
+) -> Option<PreparedPrompt> {
+    let attachments = shell.borrow().attachments.borrow().clone();
+    let auto_resize = world
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .image_auto_resize;
+    let draft = text.to_string();
+    let result = tokio::task::spawn_blocking(move || attachments.prepare(&draft, auto_resize))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+    match result {
+        Ok(prompt) => Some(prompt),
+        Err(err) => {
+            shell.borrow().view().editor.borrow_mut().set_text(text);
+            shell
+                .borrow()
+                .show_toast(format!("{err:#}. Your draft is still in the editor."));
+            None
+        }
+    }
+}
+
+async fn submit_prepared_editor(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    prompt: PreparedPrompt,
+    target: AgentId,
+) {
+    if prompt.content.is_empty() {
+        return;
+    }
+    let accepted = prompt_host(
+        world,
+        Command::Prompt {
+            agent: target,
+            content: prompt.content,
+        },
+    )
+    .await;
+    if accepted {
         shell
             .borrow()
             .view()
             .transcript
             .borrow_mut()
             .resume_follow_tail();
+    } else {
+        replace_editor_preserving_draft(&shell.borrow().view().editor, &prompt.draft);
     }
 }
 
@@ -3384,9 +3449,8 @@ async fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> 
     true
 }
 
-/// Handle the clipboard-image paste chord: read the clipboard image to a
-/// tempfile and insert its path at the editor cursor. Returns whether
-/// anything changed.
+/// Attach a clipboard image at the editor cursor. Preparation at submit time
+/// reads this client-local file and sends its bytes, not the path, to the host.
 ///
 /// Silent on failure (no clipboard image, unsupported backend), matching
 /// `aj`.
@@ -3395,18 +3459,7 @@ fn paste_clipboard_image(shell: &Rc<RefCell<Shell>>) -> bool {
         tracing::debug!("clipboard: no image to paste");
         return false;
     };
-    insert_pasted_image_path(&shell.borrow().view().editor, &path)
-}
-
-/// Insert a pasted clipboard-image path at the editor cursor as plain text
-/// and return `true` (the editor changed).
-///
-/// NOTE: We insert the bare path, not an inline image attachment. The agent
-/// opens it with `read_file` on submit, matching `aj`.
-fn insert_pasted_image_path(editor: &Rc<RefCell<TextArea>>, path: &Path) -> bool {
-    editor
-        .borrow_mut()
-        .insert_at_cursor(&path.display().to_string());
+    shell.borrow().attach_image(path);
     true
 }
 
@@ -3421,6 +3474,23 @@ fn insert_pasted_image_path(editor: &Rc<RefCell<TextArea>>, path: &Path) -> bool
 /// its tail, an empty one promotes silently.
 async fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
     let target = world.chat.borrow().active_view();
+    let draft = shell.borrow().view().editor.borrow().expanded_text();
+    let has_images = shell.borrow().attachments.borrow().contains_images(&draft);
+    if has_images {
+        if view_busy(world, target) {
+            shell.borrow().show_toast("Image attachments cannot be steered while the agent is busy. Your draft is still in the editor.");
+        } else {
+            shell.borrow().view().editor.borrow_mut().clear();
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow_mut()
+                .add_to_history(&draft);
+            handle_editor_submit(world, shell, draft).await;
+        }
+        return;
+    }
     // Read and clear the editor upfront: the queue and spawn branches both
     // consume the draft (matching `aj`), and the promote/no-op branches only
     // run when it was already empty, so clearing is right on every branch.
@@ -3518,8 +3588,7 @@ async fn handle_host_action(
             }
             yank_pending_into_editor(world, shell).await
         }
-        // Read the clipboard image to a tempfile and insert its path at the
-        // editor cursor. Silent when there is no image, matching `aj`.
+        // Attach clipboard image content. Silent when there is no image.
         AjAction::PasteImage => paste_clipboard_image(shell),
         // The direct chords open the same overlays as their palette commands.
         // Park the matching command so the host's `apply_command_action` opens
@@ -3581,7 +3650,10 @@ enum ArmedSubmit {
     Stay,
     /// Resolved: break the drive loop, move the session's head to `target`,
     /// and run `prompt` as the branch's first turn.
-    Branch { target: HeadTarget, prompt: String },
+    Branch {
+        target: HeadTarget,
+        prompt: PreparedPrompt,
+    },
 }
 
 /// Decide what an armed-anchor submit does. Called at the drive-loop submit
@@ -3625,7 +3697,10 @@ async fn submit_with_armed_anchor(
     let Some(message_id) = message_id else {
         // No anchor: the caller gates on `is_some`, so this is unreachable in
         // practice. Treat it as a plain submit rather than panicking.
-        handle_submit(world, text).await;
+        handle_editor_submit(world, shell, text).await;
+        return ArmedSubmit::Stay;
+    };
+    let Some(prompt) = prepare_editor_prompt(world, shell, &text).await else {
         return ArmedSubmit::Stay;
     };
     // The anchor names the message, and the host moves the head to its
@@ -3634,7 +3709,7 @@ async fn submit_with_armed_anchor(
     // does not have, and would race an append besides.
     ArmedSubmit::Branch {
         target: HeadTarget::Before(message_id),
-        prompt: text,
+        prompt,
     }
 }
 
@@ -5929,6 +6004,8 @@ impl Widget for SessionViews {
 
 /// Stable application root, widget callbacks and shared chrome.
 struct Shell {
+    /// Shares the lifetime of cross-session editor recall. Only paths are kept.
+    attachments: RefCell<ImageAttachments>,
     views: Rc<RefCell<SessionViews>>,
     history: vaxis::vxfw::EditorHistory,
     /// The keymap controller wrapping the base layout. Drawn (and thereby
@@ -6417,6 +6494,7 @@ impl Shell {
             KeymapController::new(build_keymap(), Rc::clone(&keymap_ctx), layout, on_action);
 
         let shell = Shell {
+            attachments: RefCell::new(ImageAttachments::default()),
             views,
             history: vaxis::vxfw::EditorHistory::default(),
             keymap,
@@ -6660,7 +6738,25 @@ impl Shell {
         Rc::clone(&self.views.borrow().active)
     }
 
+    fn attach_image(&self, path: PathBuf) {
+        let marker = self.attachments.borrow_mut().attach(path);
+        // Recall is shared across session editors, so every live editor must
+        // recognize the same labels. Newly created editors register in wire_view.
+        let views = self.views.borrow();
+        for view in std::iter::once(&views.active).chain(views.parked.values()) {
+            view.editor.borrow_mut().register_atomic_token(&marker);
+        }
+        views
+            .active
+            .editor
+            .borrow_mut()
+            .insert_atomic_token(&marker);
+    }
+
     fn wire_view(&self, view: &SessionView) {
+        for marker in self.attachments.borrow().markers() {
+            view.editor.borrow_mut().register_atomic_token(marker);
+        }
         view.editor.borrow_mut().set_history(self.history.clone());
         let overlays = Rc::clone(&self.overlays);
         // Weak because the callback belongs to the editor it returns focus to.
@@ -6988,6 +7084,18 @@ impl Widget for Shell {
             || matches!(event, Event::Mouse(_)) && self.overlays.borrow().top().is_some()
         {
             self.view().transcript.borrow_mut().cancel_agent_click();
+        }
+        if let Event::Paste(text) = event
+            && !self.overlays.borrow().is_open()
+            && !view.transcript.borrow().in_focus_mode()
+            && let Ok(cwd) = std::env::current_dir()
+            && let Some(paths) = aj_app::composer::dropped_images(text, &cwd)
+        {
+            for path in paths {
+                self.attach_image(path);
+            }
+            ctx.consume_and_redraw();
+            return;
         }
         // Host-posted app events target the focused widget, but they're
         // meant for the Shell chrome. The Shell is the root of every focus
@@ -14136,20 +14244,294 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The clipboard-paste insertion drops the tempfile path at the editor
-    /// cursor as a bare reference (no `@` prefix, no attachment) and reports
-    /// the editor changed. We test this against a bare editor because the
-    /// real clipboard read is environment-dependent and cannot run headless.
-    #[test]
-    fn insert_pasted_image_path_inserts_bare_path() {
-        let editor = TextArea::new();
-        // Seed an in-progress draft so the assertion proves the path lands at
-        // the cursor without clobbering existing text. A whole-buffer set_text
-        // would drop the draft and fail here.
-        editor.borrow_mut().set_text("draft ");
-        let path = PathBuf::from("/tmp/aj-clipboard-test.png");
-        assert!(insert_pasted_image_path(&editor, &path));
-        assert_eq!(editor.borrow().text(), "draft /tmp/aj-clipboard-test.png");
+    #[tokio::test]
+    async fn image_drop_renders_a_removable_attachment_and_keeps_plain_pastes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dropped image.png");
+        std::fs::write(
+            &path,
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, PNG_2X2_B64)
+                .unwrap(),
+        )
+        .unwrap();
+        let (mut app, _writer, shell, root) = init_app().await;
+        shell.borrow().view().editor.borrow_mut().set_text("Look: ");
+        app.handle_input(Event::Paste(format!("'{}'", path.display())));
+        let editor = Rc::clone(&shell.borrow().view().editor);
+        let attached_draft = editor.borrow().text();
+        assert!(attached_draft.starts_with("Look: [Image #"));
+        assert!(!attached_draft.contains("dropped image.png"));
+        app.render(&root).unwrap();
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        assert!(
+            rows.iter().any(|row| row.contains(&attached_draft)),
+            "{rows:?}"
+        );
+        app.handle_input(Event::KeyPress(Key {
+            codepoint: Key::BACKSPACE,
+            ..Default::default()
+        }));
+        assert_eq!(editor.borrow().text(), "Look: ");
+        app.handle_input(Event::Paste("ordinary text".into()));
+        assert_eq!(editor.borrow().text(), "Look: ordinary text");
+        // Undo the text paste and token deletion. The path remains available.
+        for _ in 0..2 {
+            app.handle_input(Event::KeyPress(Key {
+                codepoint: u32::from('-'),
+                mods: Modifiers::CTRL,
+                ..Default::default()
+            }));
+        }
+        assert_eq!(editor.borrow().text(), attached_draft);
+        assert!(
+            shell
+                .borrow()
+                .attachments
+                .borrow()
+                .contains_images(&editor.borrow().expanded_text())
+        );
+    }
+
+    #[tokio::test]
+    async fn image_preparation_failure_keeps_the_draft_and_sends_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let path = dir.path().join("missing.png");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("Explain ");
+        shell.borrow().attach_image(path);
+        let text = shell.borrow().view().editor.borrow().expanded_text();
+        shell.borrow().view().editor.borrow_mut().clear();
+        handle_editor_submit(&mut world, &shell, text.clone()).await;
+        assert_eq!(shell.borrow().view().editor.borrow().text(), text);
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|line| line.contains("Could not attach") && line.contains("missing.png"))
+        );
+        assert!(!world.client().working());
+        assert!(
+            !world
+                .chat
+                .borrow()
+                .transcript(AgentId::Main)
+                .unwrap()
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::User(_)))
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn image_draft_survives_busy_submit_and_steer_refusals() {
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let path = dir.path().join("image.png");
+        std::fs::write(
+            &path,
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, PNG_2X2_B64)
+                .unwrap(),
+        )
+        .unwrap();
+        handle_submit(&mut world, "go".into()).await;
+        fold_ready_frames(&mut world);
+        assert!(view_busy(&world, AgentId::Main));
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("Explain ");
+        shell.borrow().attach_image(path);
+        let draft = shell.borrow().view().editor.borrow().expanded_text();
+        handle_steer(&mut world, &shell).await;
+        assert_eq!(shell.borrow().view().editor.borrow().text(), draft);
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|line| line.contains("cannot be steered"))
+        );
+        shell.borrow().view().editor.borrow_mut().clear();
+        handle_editor_submit(&mut world, &shell, draft.clone()).await;
+        assert_eq!(shell.borrow().view().editor.borrow().text(), draft);
+        assert!(world.chat.borrow().transcript(AgentId::Main).unwrap().entries().iter().any(|entry| matches!(&entry.kind, EntryKind::Notice(notice) if notice.text.contains("attachments cannot be queued"))));
+        cancel_viewed_turn(&mut world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn image_branch_prompt_uses_prepared_bytes_after_the_file_disappears() {
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        install_unpaced_demo(&world, "streaming-text");
+        run_prompt(&mut world, "seed").await;
+        let message_id = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .unwrap()
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::User(user) => user.message_id.clone(),
+                _ => None,
+            })
+            .unwrap();
+        arm_branch(&shell.borrow().view().branch_anchor, message_id);
+        let path = dir.path().join("image.png");
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, PNG_2X2_B64)
+            .unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        shell.borrow().attach_image(path.clone());
+        let draft = shell.borrow().view().editor.borrow().expanded_text();
+        shell.borrow().view().editor.borrow_mut().clear();
+        let ArmedSubmit::Branch { target, prompt } =
+            submit_with_armed_anchor(&mut world, &shell, draft).await
+        else {
+            panic!("valid image prompt resolves the branch");
+        };
+        std::fs::remove_file(path).unwrap();
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                target,
+                prompt: Some(prompt),
+            },
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        settle(&mut world).await;
+        let images = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .unwrap()
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::User(user) => Some(&user.content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                UserContent::Image(image) => Some(image.data.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(images, vec![PNG_2X2_B64.to_string()]);
+        assert!(shell.borrow().view().editor.borrow().text().is_empty());
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn image_submissions_deliver_bytes_through_local_and_remote_control() {
+        for mode in ["local", "remote", "gateway"] {
+            let dir = TempDir::new().unwrap();
+            let remote = if mode != "local" {
+                Some(RemoteHost::at_directory(&dir).await)
+            } else {
+                None
+            };
+            let gateway = if mode == "gateway" {
+                Some(RemoteGateway::over(&[remote.as_ref().unwrap()]).await)
+            } else {
+                None
+            };
+            let (mut world, shell) = match &remote {
+                Some(remote) => {
+                    let url = gateway
+                        .as_ref()
+                        .map_or_else(|| remote.url(), |gateway| gateway.url());
+                    connect_world_and_shell_at(&dir, &url, &["--new"]).await
+                }
+                None => {
+                    let pair = world_and_shell(&dir, "streaming-text").await;
+                    install_unpaced_demo(&pair.0, "streaming-text");
+                    pair
+                }
+            };
+            let (mut app, _writer, root) = app_over(&shell).await;
+            let path = dir.path().join("client image.png");
+            // A real, poorly compressible image whose encoded content exceeds
+            // Axum's 2 MiB default, but fits the per-image preparation budget.
+            let mut rng = 42u32;
+            image::RgbImage::from_fn(1024, 768, |_, _| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                let bytes = rng.to_le_bytes();
+                image::Rgb([bytes[0], bytes[1], bytes[2]])
+            })
+            .save(&path)
+            .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            app.handle_input(Event::Paste(format!("'{}'", path.display())));
+            app.render(&root).unwrap();
+            app.handle_input(Event::KeyPress(Key {
+                codepoint: Key::ENTER,
+                ..Default::default()
+            }));
+            let text = shell.borrow().take_submitted().unwrap();
+            assert!(
+                text.starts_with("[Image #"),
+                "image-only prompts are submittable"
+            );
+            let prepared = prepare_editor_prompt(&world, &shell, &text).await.unwrap();
+            assert!(serde_json::to_vec(&prepared.content).unwrap().len() > 2 * 1024 * 1024);
+            // Neither transport nor host can recover this file. Delivery has to
+            // use the prepared bytes, not re-read a path in the host process.
+            std::fs::remove_file(&path).unwrap();
+            submit_prepared_editor(&mut world, &shell, prepared, AgentId::Main).await;
+            settle(&mut world).await;
+            {
+                let chat = world.chat.borrow();
+                let user = chat
+                    .transcript(AgentId::Main)
+                    .unwrap()
+                    .entries()
+                    .iter()
+                    .find_map(|entry| match &entry.kind {
+                        EntryKind::User(user) => Some(user),
+                        _ => None,
+                    })
+                    .unwrap();
+                let images: Vec<_> = user
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserContent::Image(image) => Some(image),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].mime_type, "image/png");
+                assert_eq!(
+                    base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &images[0].data
+                    )
+                    .unwrap(),
+                    bytes
+                );
+            }
+            assert!(shell.borrow().view().editor.borrow().text().is_empty());
+            if let Some(gateway) = gateway {
+                gateway.shutdown().await;
+            }
+            match remote {
+                Some(remote) => remote.shutdown().await,
+                None => shut_down(&world).await,
+            }
+        }
     }
 
     // ---- Overlay substrate ----
@@ -22182,7 +22564,7 @@ mod tests {
                     panic!("the branch gesture names the message, not a head");
                 };
                 assert_eq!(named, anchored, "the anchor's own message travels");
-                assert_eq!(prompt, "edited prompt");
+                assert_eq!(prompt.draft, "edited prompt");
                 assert!(
                     shell.borrow().view().branch_anchor.borrow().is_some(),
                     "submission alone does not consume the draft"
@@ -23487,7 +23869,7 @@ mod tests {
             &mut world,
             FocusRequest::Branch {
                 target: HeadTarget::Entry("does-not-exist".to_string()),
-                prompt: Some("edited prompt".to_string()),
+                prompt: Some("edited prompt".to_string().into()),
             },
         )
         .await;
@@ -23666,7 +24048,7 @@ mod tests {
             &mut world,
             FocusRequest::Branch {
                 target: HeadTarget::Entry(head),
-                prompt: Some("branch turn".to_string()),
+                prompt: Some("branch turn".to_string().into()),
             },
         )
         .await;
@@ -30624,7 +31006,7 @@ mod tests {
             &mut world,
             FocusRequest::Branch {
                 target: HeadTarget::Before(message),
-                prompt: Some(prompt.to_string()),
+                prompt: Some(prompt.to_string().into()),
             },
         )
         .await;

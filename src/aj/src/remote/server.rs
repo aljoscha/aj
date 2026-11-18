@@ -237,6 +237,9 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/archive", post(archive))
         .route("/v1/sessions/{id}/head", post(head))
         .fallback(unknown_endpoint)
+        .layer(axum::extract::DefaultBodyLimit::max(
+            super::REQUEST_BODY_LIMIT,
+        ))
         // Outside the routes rather than per handler, so an unauthorized
         // peer cannot even probe which endpoints exist.
         .layer(middleware::from_fn_with_state(

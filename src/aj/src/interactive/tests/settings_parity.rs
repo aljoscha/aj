@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 use std::sync::Mutex;
 
 fn skill(root: &Path, name: &str) {

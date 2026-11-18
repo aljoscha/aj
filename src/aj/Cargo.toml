@@ -45,6 +45,7 @@ unicode-segmentation = { workspace = true }
 vaxis = { path = "../vaxis/" }
 
 [dev-dependencies]
+image = { workspace = true }
 aj-agent = { path = "../aj-agent/", features = ["test-support"] }
 aj-app = { path = "../aj-app/", features = ["test-support"] }
 aj-models = { path = "../aj-models/", features = ["test-support"] }

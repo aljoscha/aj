@@ -117,8 +117,11 @@ requires `--print`.
 - **Sub-agents.** AJ can spawn sub-agents and run shell commands or sub-agents
   in the background. Open the agent view (`Alt+A`) to switch between them and
   follow or stop background work.
-- **Images.** @-mention an image (or any file) in your message, or paste one
-  from the clipboard with `Ctrl+V`, and AJ can read it.
+- **Images.** Paste an image with `Ctrl+V` or drop image files into the
+  terminal. Each becomes a removable `[Image #ID]` attachment, sent with the
+  prompt even when connected to a remote host. Quoted and escaped dropped
+  paths are supported. Image preparation errors keep your draft intact.
+  Images cannot be queued or steered while the agent is busy.
 
 ## Configuration
 

@@ -51,10 +51,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// The largest request body the proxy will carry.
 ///
-/// Axum's own default request-body limit, which is what the host applies to the
-/// very same body: the gateway must not be the stricter of the two, and it has
-/// no reason to be the more generous one either.
-const PROXY_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Match the host so a connected client can send the same image-bearing prompt
+/// directly or through a gateway.
+const PROXY_BODY_LIMIT: usize = crate::remote::REQUEST_BODY_LIMIT;
 
 /// Why a gateway could not be served.
 #[derive(Debug, thiserror::Error)]

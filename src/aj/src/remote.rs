@@ -32,6 +32,10 @@ pub(crate) use client::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents};
 pub(crate) use identity::{IdentityError, IdentityGate, IdentityMode, TailscaleWhois};
 pub(crate) use server::RemoteServer;
 
+/// Bounded JSON requests with room for several base64 image attachments.
+/// Hosts and gateways apply the same transport budget.
+pub(crate) const REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024;
+
 /// An endpoint label that cannot expose URL credentials.
 pub(crate) fn endpoint_label(raw: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(raw) else {

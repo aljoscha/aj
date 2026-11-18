@@ -178,25 +178,46 @@ fn parse_marker_tail(rest: &str) -> Option<usize> {
     }
 }
 
-/// Byte span of a paste marker that begins exactly at `col`, if any.
+/// Finds the earliest atomic span. At the same offset the longest token wins.
+/// Paste expansion deliberately uses only the paste-marker scanner.
+fn find_next_atom(
+    line: &str,
+    from: usize,
+    pastes: &HashMap<u32, String>,
+    tokens: &[String],
+) -> Option<(usize, usize)> {
+    let paste = find_next_marker(line, from, pastes).map(|(s, e, _)| (s, e));
+    tokens
+        .iter()
+        .filter_map(|token| {
+            line[from..].find(token).map(|offset| {
+                let start = from + offset;
+                (start, start + token.len())
+            })
+        })
+        .chain(paste)
+        .min_by_key(|&(s, e)| (s, std::cmp::Reverse(e)))
+}
+
+/// Byte span of an atomic token that begins exactly at `col`, if any.
 fn marker_starting_at(
     line: &str,
     col: usize,
     pastes: &HashMap<u32, String>,
+    tokens: &[String],
 ) -> Option<(usize, usize)> {
-    find_next_marker(line, col, pastes)
-        .filter(|(s, _, _)| *s == col)
-        .map(|(s, e, _)| (s, e))
+    find_next_atom(line, col, pastes, tokens).filter(|(s, _)| *s == col)
 }
 
-/// Byte span of a paste marker that ends exactly at `col`, if any.
+/// Byte span of an atomic token that ends exactly at `col`, if any.
 fn marker_ending_at(
     line: &str,
     col: usize,
     pastes: &HashMap<u32, String>,
+    tokens: &[String],
 ) -> Option<(usize, usize)> {
     let mut i = 0;
-    while let Some((s, e, _id)) = find_next_marker(line, i, pastes) {
+    while let Some((s, e)) = find_next_atom(line, i, pastes, tokens) {
         if e == col {
             return Some((s, e));
         }
@@ -554,6 +575,8 @@ pub struct TextArea {
 
     // -- Editing state --
     kill_ring: KillRing,
+    // Yank-pop reverses the inserted range, not the atom-snapped cursor.
+    yank_end: (usize, usize),
     undo_stack: UndoStack<EditorSnapshot>,
     last_action: LastAction,
     word_classifier: Box<dyn WordClassifier>,
@@ -571,6 +594,8 @@ pub struct TextArea {
     // history navigation are harmless: markers validate against the map, and an
     // id with no matching token is simply not treated as atomic.
     pastes: HashMap<u32, String>,
+    // Lifetime registry, like paste bookkeeping, is not part of undo state.
+    atomic_tokens: Vec<String>,
     /// Monotonic id source for paste markers. Never rewinds except on submit,
     /// which clears the whole paste state.
     paste_counter: u32,
@@ -700,10 +725,12 @@ impl TextArea {
             preferred_visual_col: None,
             snapped_from_cursor_col: None,
             kill_ring: KillRing::new(),
+            yank_end: (0, 0),
             undo_stack: UndoStack::new(),
             last_action: LastAction::None,
             word_classifier: Box::new(EmacsWords),
             pastes: HashMap::new(),
+            atomic_tokens: Vec::new(),
             paste_counter: 0,
             jump_mode: None,
             history: EditorHistory::default(),
@@ -847,8 +874,57 @@ impl TextArea {
                 self.cursor_col += ch.len_utf8();
             }
         }
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, true);
         self.reset_sticky_state();
         self.last_action = LastAction::None;
+    }
+
+    /// Registers an exact literal token as one editing and wrapping unit.
+    ///
+    /// Registration survives clear, set_text, undo, and submission. It does not
+    /// replace text or affect paste expansion. Overlapping matches use the
+    /// earliest start, then the longest match at that start. Like paste
+    /// markers, tokens wider than the layout split visually, but remain one
+    /// editing unit. The registry belongs to this editor, not shared history.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the token is empty or contains control characters (including
+    /// newlines and tabs), which cannot be stored literally by this editor.
+    pub fn register_atomic_token(&mut self, token: &str) {
+        assert!(
+            !token.is_empty() && !token.chars().any(char::is_control),
+            "atomic tokens must be nonempty single-line text without controls"
+        );
+        if !self
+            .atomic_tokens
+            .iter()
+            .any(|registered| registered == token)
+        {
+            self.atomic_tokens.push(token.to_string());
+            self.invalidate_visual_line_cache();
+            // Registration can make the existing cursor fall inside an atom.
+            for segment in self.segment_line(self.current_line()) {
+                if segment.start_index < self.cursor_col
+                    && self.cursor_col < segment.start_index + segment.text.len()
+                {
+                    self.cursor_col = segment.start_index;
+                    self.reset_sticky_state();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Registers and inserts a literal atomic token at the cursor as one undo
+    /// unit. Fires no callback, like [Self::insert_at_cursor].
+    ///
+    /// # Panics
+    ///
+    /// Panics for the same invalid input as [Self::register_atomic_token].
+    pub fn insert_atomic_token(&mut self, token: &str) {
+        self.register_atomic_token(token);
+        self.insert_at_cursor(token);
     }
 
     /// Handles a bracketed paste: normalize, strip control bytes, apply the
@@ -927,6 +1003,7 @@ impl TextArea {
             }
         }
 
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, true);
         self.reset_sticky_state();
         self.last_action = LastAction::None;
     }
@@ -1240,7 +1317,7 @@ impl TextArea {
             self.lines = snapshot.lines;
             self.invalidate_visual_line_cache();
             self.cursor_line = snapshot.cursor_line;
-            self.cursor_col = snapshot.cursor_col;
+            self.cursor_col = self.snap_literal_boundary(snapshot.cursor_col, false);
             self.reset_sticky_state();
             self.last_action = LastAction::None;
         }
@@ -1250,10 +1327,19 @@ impl TextArea {
         &self.lines[self.cursor_line]
     }
 
-    /// Grapheme-cluster byte boundaries for the current line, including `0` and
-    /// the line length.
+    /// Grapheme-cluster byte boundaries for the current line, including zero and
+    /// the line length. Registered literals replace their interior boundaries.
     fn grapheme_boundaries(&self) -> Vec<usize> {
         let line = self.current_line();
+        if !self.atomic_tokens.is_empty() {
+            let mut bounds: Vec<_> = self
+                .segment_line(line)
+                .iter()
+                .map(|segment| segment.start_index)
+                .collect();
+            bounds.push(line.len());
+            return bounds;
+        }
         let mut bounds = vec![0];
         for (i, _) in line.grapheme_indices(true) {
             if i > 0 {
@@ -1279,9 +1365,12 @@ impl TextArea {
         if self.cursor_col > 0 {
             // Atomic marker jump: when a marker ends exactly at the cursor, step
             // over the whole token in one move instead of into its text.
-            if let Some((start, _end)) =
-                marker_ending_at(self.current_line(), self.cursor_col, &self.pastes)
-            {
+            if let Some((start, _end)) = marker_ending_at(
+                self.current_line(),
+                self.cursor_col,
+                &self.pastes,
+                &self.atomic_tokens,
+            ) {
                 self.cursor_col = start;
                 return;
             }
@@ -1306,9 +1395,12 @@ impl TextArea {
         if self.cursor_col < line_len {
             // Atomic marker jump: when a marker begins exactly at the cursor,
             // step over the whole token in one move.
-            if let Some((_start, end)) =
-                marker_starting_at(self.current_line(), self.cursor_col, &self.pastes)
-            {
+            if let Some((_start, end)) = marker_starting_at(
+                self.current_line(),
+                self.cursor_col,
+                &self.pastes,
+                &self.atomic_tokens,
+            ) {
                 self.cursor_col = end;
                 return;
             }
@@ -1325,12 +1417,34 @@ impl TextArea {
         }
     }
 
+    // Edits can form a literal around the cursor. Snap only after the complete
+    // edit, forward for insertion and backward for deletion. Word motion and
+    // word kills also must not cut a registered literal in half.
+    // Keep the existing paste-marker word semantics unchanged.
+    fn snap_literal_boundary(&self, col: usize, forward: bool) -> usize {
+        if self.atomic_tokens.is_empty() {
+            return col;
+        }
+        for segment in self.segment_line(self.current_line()) {
+            let start = segment.start_index;
+            let end = start + segment.text.len();
+            if start < col
+                && col < end
+                && self.atomic_tokens.iter().any(|token| token == segment.text)
+            {
+                return if forward { end } else { start };
+            }
+        }
+        col
+    }
+
     fn word_boundary_left(&self) -> usize {
-        word_left(
+        let col = word_left(
             self.current_line(),
             self.cursor_col,
             self.word_classifier.as_ref(),
-        )
+        );
+        self.snap_literal_boundary(col, false)
     }
 
     fn word_boundary_right(&self) -> usize {
@@ -1345,10 +1459,15 @@ impl TextArea {
         // of the traversal. Word-left has no such branch, matching the
         // asymmetry of the reference editor.
         let after_sep = skip_separators(line, self.cursor_col, self.word_classifier.as_ref());
-        if let Some((_start, end)) = marker_starting_at(line, after_sep, &self.pastes) {
+        if let Some((_start, end)) =
+            marker_starting_at(line, after_sep, &self.pastes, &self.atomic_tokens)
+        {
             return end;
         }
-        skip_class(line, after_sep, self.word_classifier.as_ref())
+        self.snap_literal_boundary(
+            skip_class(line, after_sep, self.word_classifier.as_ref()),
+            true,
+        )
     }
 
     /// Moves one word left, wrapping to the end of the previous line at column
@@ -1402,7 +1521,7 @@ impl TextArea {
                 if let Some(start) = search_start
                     && let Some(rel) = current[start..].find(needle_str)
                 {
-                    self.cursor_col = start + rel;
+                    self.cursor_col = self.snap_literal_boundary(start + rel, true);
                     self.reset_sticky_state();
                     self.last_action = LastAction::None;
                     return;
@@ -1410,7 +1529,7 @@ impl TextArea {
                 for line_idx in (self.cursor_line + 1)..self.lines.len() {
                     if let Some(rel) = self.lines[line_idx].find(needle_str) {
                         self.cursor_line = line_idx;
-                        self.cursor_col = rel;
+                        self.cursor_col = self.snap_literal_boundary(rel, true);
                         self.reset_sticky_state();
                         self.last_action = LastAction::None;
                         return;
@@ -1422,7 +1541,7 @@ impl TextArea {
                 if self.cursor_col > 0
                     && let Some(rel) = current[..self.cursor_col].rfind(needle_str)
                 {
-                    self.cursor_col = rel;
+                    self.cursor_col = self.snap_literal_boundary(rel, false);
                     self.reset_sticky_state();
                     self.last_action = LastAction::None;
                     return;
@@ -1430,7 +1549,7 @@ impl TextArea {
                 for line_idx in (0..self.cursor_line).rev() {
                     if let Some(rel) = self.lines[line_idx].rfind(needle_str) {
                         self.cursor_line = line_idx;
-                        self.cursor_col = rel;
+                        self.cursor_col = self.snap_literal_boundary(rel, false);
                         self.reset_sticky_state();
                         self.last_action = LastAction::None;
                         return;
@@ -1444,7 +1563,7 @@ impl TextArea {
     // -- Wrapping --
 
     /// Atomic display segments of `line`. One grapheme per segment, except that
-    /// each valid paste-marker token is a single segment.
+    /// each valid paste marker or registered literal token is a single segment.
     ///
     /// The wrapper and the vertical-move snap consume segments as indivisible
     /// units, so emitting a whole marker as one segment is what keeps a marker
@@ -1452,7 +1571,9 @@ impl TextArea {
     fn segment_line<'a>(&self, line: &'a str) -> Vec<AtomicSegment<'a>> {
         // Fast path: no paste bookkeeping, or no marker-shaped content, means
         // the line is indistinguishable from its grapheme list.
-        if self.pastes.is_empty() || !line.contains(PASTE_MARKER_PREFIX) {
+        if self.atomic_tokens.is_empty()
+            && (self.pastes.is_empty() || !line.contains(PASTE_MARKER_PREFIX))
+        {
             return line
                 .grapheme_indices(true)
                 .map(|(i, g)| AtomicSegment {
@@ -1464,7 +1585,7 @@ impl TextArea {
 
         let mut markers: Vec<(usize, usize)> = Vec::new();
         let mut scan = 0;
-        while let Some((s, e, _id)) = find_next_marker(line, scan, &self.pastes) {
+        while let Some((s, e)) = find_next_atom(line, scan, &self.pastes, &self.atomic_tokens) {
             markers.push((s, e));
             scan = e;
         }
@@ -1478,32 +1599,29 @@ impl TextArea {
                 .collect();
         }
 
-        let mut result: Vec<AtomicSegment<'a>> = Vec::new();
-        let mut marker_idx = 0;
-        for (i, g) in line.grapheme_indices(true) {
-            // Advance past any markers that end at or before this grapheme.
-            while marker_idx < markers.len() && markers[marker_idx].1 <= i {
-                marker_idx += 1;
-            }
-            if let Some(&(ms, me)) = markers.get(marker_idx)
-                && i >= ms
-                && i < me
-            {
-                // Emit the whole marker once, at its start, then skip its
-                // interior graphemes so the token stays a single segment.
-                if i == ms {
-                    result.push(AtomicSegment {
-                        text: &line[ms..me],
-                        start_index: ms,
-                    });
+        let mut result = Vec::new();
+        let mut offset = 0;
+        for (start, end) in markers {
+            result.extend(line[offset..start].grapheme_indices(true).map(|(i, text)| {
+                AtomicSegment {
+                    text,
+                    start_index: offset + i,
                 }
-                continue;
-            }
+            }));
             result.push(AtomicSegment {
-                text: g,
-                start_index: i,
+                text: &line[start..end],
+                start_index: start,
             });
+            offset = end;
         }
+        result.extend(
+            line[offset..]
+                .grapheme_indices(true)
+                .map(|(i, text)| AtomicSegment {
+                    text,
+                    start_index: offset + i,
+                }),
+        );
         result
     }
 
@@ -1988,6 +2106,7 @@ impl TextArea {
         }
         self.lines[self.cursor_line].insert(self.cursor_col, c);
         self.cursor_col += c.len_utf8();
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, true);
         self.last_action = LastAction::TypeWord;
         self.reset_sticky_state();
         self.maybe_trigger_autocomplete_on_insert(c);
@@ -2002,6 +2121,7 @@ impl TextArea {
             let old_col = self.cursor_col;
             self.move_left();
             self.lines[self.cursor_line].drain(self.cursor_col..old_col);
+            self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
             self.maybe_retrigger_autocomplete_after_delete();
@@ -2011,6 +2131,7 @@ impl TextArea {
             self.cursor_line -= 1;
             self.cursor_col = self.lines[self.cursor_line].len();
             self.lines[self.cursor_line].push_str(&current);
+            self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
             self.maybe_retrigger_autocomplete_after_delete();
@@ -2025,9 +2146,12 @@ impl TextArea {
             self.save_undo();
             // Atomic marker delete: when a marker begins at the cursor, drain
             // the whole token in one step rather than a single grapheme of it.
-            let next = if let Some((_start, end)) =
-                marker_starting_at(self.current_line(), self.cursor_col, &self.pastes)
-            {
+            let next = if let Some((_start, end)) = marker_starting_at(
+                self.current_line(),
+                self.cursor_col,
+                &self.pastes,
+                &self.atomic_tokens,
+            ) {
                 end
             } else {
                 let bounds = self.grapheme_boundaries();
@@ -2038,6 +2162,7 @@ impl TextArea {
                     .unwrap_or(line_len)
             };
             self.lines[self.cursor_line].drain(self.cursor_col..next);
+            self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
             self.maybe_retrigger_autocomplete_after_delete();
@@ -2045,6 +2170,7 @@ impl TextArea {
             self.save_undo();
             let next = self.lines.remove(self.cursor_line + 1);
             self.lines[self.cursor_line].push_str(&next);
+            self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
             self.maybe_retrigger_autocomplete_after_delete();
@@ -2068,6 +2194,7 @@ impl TextArea {
                 self.kill_ring
                     .push("\n", false, self.last_action == LastAction::Kill);
                 self.lines[self.cursor_line].push_str(&next);
+                self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
                 self.last_action = LastAction::Kill;
             }
             return;
@@ -2078,6 +2205,7 @@ impl TextArea {
             .collect();
         self.kill_ring
             .push(&deleted, false, self.last_action == LastAction::Kill);
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
         self.last_action = LastAction::Kill;
     }
 
@@ -2094,6 +2222,7 @@ impl TextArea {
                 self.kill_ring
                     .push("\n", true, self.last_action == LastAction::Kill);
                 self.lines[self.cursor_line].push_str(&current);
+                self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
                 self.last_action = LastAction::Kill;
             }
             return;
@@ -2105,6 +2234,7 @@ impl TextArea {
         self.kill_ring
             .push(&deleted, true, self.last_action == LastAction::Kill);
         self.cursor_col = 0;
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
         self.last_action = LastAction::Kill;
     }
 
@@ -2123,6 +2253,7 @@ impl TextArea {
             self.lines[self.cursor_line].push_str(&current);
             self.kill_ring
                 .push("\n", true, self.last_action == LastAction::Kill);
+            self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
             self.last_action = LastAction::Kill;
             return;
         }
@@ -2137,6 +2268,7 @@ impl TextArea {
         self.kill_ring
             .push(&deleted, true, self.last_action == LastAction::Kill);
         self.cursor_col = target;
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
         self.last_action = LastAction::Kill;
     }
 
@@ -2153,6 +2285,7 @@ impl TextArea {
             self.lines[self.cursor_line].push_str(&next);
             self.kill_ring
                 .push("\n", false, self.last_action == LastAction::Kill);
+            self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
             self.last_action = LastAction::Kill;
             return;
         }
@@ -2166,6 +2299,7 @@ impl TextArea {
             .collect();
         self.kill_ring
             .push(&deleted, false, self.last_action == LastAction::Kill);
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, false);
         self.last_action = LastAction::Kill;
     }
 
@@ -2194,6 +2328,7 @@ impl TextArea {
             None => return,
         };
         self.save_undo();
+        (self.cursor_line, self.cursor_col) = self.yank_end;
         self.delete_yanked_text(&previous);
         self.kill_ring.rotate();
         if let Some(next) = self.kill_ring.peek().map(str::to_string) {
@@ -2215,6 +2350,8 @@ impl TextArea {
                 self.cursor_col += ch.len_utf8();
             }
         }
+        self.yank_end = (self.cursor_line, self.cursor_col);
+        self.cursor_col = self.snap_literal_boundary(self.cursor_col, true);
     }
 
     /// Removes `text` ending at the cursor, reversing the last yank so yank-pop
@@ -2768,7 +2905,7 @@ impl TextArea {
         self.lines = result.lines;
         self.invalidate_visual_line_cache();
         self.cursor_line = result.cursor_line;
-        self.cursor_col = result.cursor_col;
+        self.cursor_col = self.snap_literal_boundary(result.cursor_col, true);
         self.cancel_autocomplete();
         self.reset_sticky_state();
         self.last_action = LastAction::None;
@@ -3946,6 +4083,207 @@ mod tests {
             out.push_str(surf.read_cell(col, row).char.grapheme());
         }
         out
+    }
+
+    #[test]
+    fn literal_atom_formed_by_typing_snaps_cursor_before_backspace() {
+        let mut ed = editor();
+        ed.register_atomic_token("[Image #1]");
+        type_str(&mut ed, "[Image #]");
+        send(&mut ed, &left());
+        send(&mut ed, &char_key('1'));
+        assert_eq!(ed.text(), "[Image #1]");
+        assert_eq!(ed.cursor(), (0, 10));
+        send(&mut ed, &backspace());
+        assert_eq!(ed.text(), "");
+        send(&mut ed, &ctrl('_'));
+        assert_eq!(ed.text(), "[Image #1]");
+        assert_eq!(ed.cursor(), (0, 10));
+    }
+
+    #[test]
+    fn literal_atoms_formed_by_deletion_and_line_joins_snap_to_start() {
+        let cases = [
+            ("[item x1]", 7, backspace()),
+            ("[item x1]", 6, delete()),
+            ("[item \n1]", 7, backspace()),
+            ("[item \n1]", 6, delete()),
+            ("[item \n1]", 7, ctrl('u')),
+            ("[item \n1]", 6, ctrl('k')),
+            ("[item \n1]", 7, ctrl('w')),
+            ("[item \n1]", 6, mod_key('d', Modifiers::ALT)),
+        ];
+        for (text, steps, event) in cases {
+            let mut ed = editor();
+            ed.register_atomic_token("[item 1]");
+            ed.set_text(text);
+            ed.cursor_line = 0;
+            ed.cursor_col = 0;
+            for _ in 0..steps {
+                send(&mut ed, &right());
+            }
+            send(&mut ed, &event);
+            assert_eq!(ed.text(), "[item 1]", "{text:?}");
+            assert_eq!(ed.cursor(), (0, 0), "{text:?}");
+            send(&mut ed, &delete());
+            assert_eq!(ed.text(), "", "{text:?}");
+        }
+    }
+
+    #[test]
+    fn literal_atom_bulk_insert_and_yank_pop_keep_surrounding_text() {
+        let mut ed = editor();
+        ed.register_atomic_token("[item 1]");
+        ed.set_text("[item ]");
+        send(&mut ed, &left());
+        ed.insert_at_cursor("1");
+        assert_eq!(ed.cursor(), (0, 8));
+        send(&mut ed, &backspace());
+        assert_eq!(ed.text(), "");
+
+        ed.set_text("[item ]");
+        send(&mut ed, &left());
+        send(&mut ed, &paste("1"));
+        assert_eq!(ed.text(), "[item 1]");
+        assert_eq!(ed.cursor(), (0, 8));
+
+        ed.set_text("[item ]");
+        send(&mut ed, &left());
+        ed.kill_ring.push("2", false, false);
+        ed.kill_ring.push("1", false, false);
+        ed.yank();
+        assert_eq!(ed.text(), "[item 1]");
+        assert_eq!(ed.cursor(), (0, 8));
+        ed.yank_pop();
+        assert_eq!(ed.text(), "[item 2]");
+        assert_eq!(ed.cursor(), (0, 7));
+        ed.yank_pop();
+        assert_eq!(ed.text(), "[item 1]");
+        assert_eq!(ed.cursor(), (0, 8));
+    }
+
+    #[test]
+    fn literal_atoms_insert_move_delete_and_undo() {
+        let mut ed = editor();
+        let token = "[item α 1]";
+        ed.set_text("prefix ");
+        ed.insert_atomic_token(token);
+        assert_eq!(ed.expanded_text(), format!("prefix {token}"));
+        send(&mut ed, &left());
+        assert_eq!(ed.cursor(), (0, 7));
+        send(&mut ed, &right());
+        assert_eq!(ed.cursor(), (0, 7 + token.chars().count()));
+        send(&mut ed, &backspace());
+        assert_eq!(ed.text(), "prefix ");
+        send(&mut ed, &ctrl('_'));
+        assert_eq!(ed.text(), format!("prefix {token}"));
+        send(&mut ed, &left());
+        send(&mut ed, &delete());
+        assert_eq!(ed.text(), "prefix ");
+        send(&mut ed, &ctrl('_'));
+        send(&mut ed, &right());
+        send(&mut ed, &mod_key('b', Modifiers::ALT));
+        assert_eq!(ed.cursor(), (0, 7));
+        send(&mut ed, &mod_key('f', Modifiers::ALT));
+        assert_eq!(ed.cursor(), (0, 7 + token.chars().count()));
+        send(&mut ed, &ctrl('w'));
+        assert_eq!(ed.text(), "prefix ");
+
+        let mut ed = editor();
+        ed.insert_atomic_token(token);
+        send(&mut ed, &ctrl('_'));
+        assert_eq!(ed.text(), "");
+    }
+
+    #[test]
+    fn literal_atom_registry_survives_submit_clear_and_recall() {
+        let mut ed = editor();
+        let token = "[item 1]";
+        ed.insert_atomic_token(token);
+        let payload = "line\n".repeat(20);
+        send(&mut ed, &paste(&payload));
+        assert_eq!(ed.expanded_text(), format!("{token}{payload}"));
+        send(&mut ed, &key(Key::ENTER, Modifiers::empty()));
+        assert_eq!(
+            ed.take_submitted(),
+            Some(format!("{token}{payload}").trim().to_string())
+        );
+        assert!(ed.pastes.is_empty());
+        ed.add_to_history(token);
+        send(&mut ed, &up());
+        assert_eq!(ed.expanded_text(), token);
+        send(&mut ed, &left());
+        assert_eq!(ed.cursor(), (0, 0));
+        send(&mut ed, &delete());
+        assert_eq!(ed.text(), "");
+
+        ed.clear();
+        ed.set_text(token);
+        send(&mut ed, &backspace());
+        assert_eq!(ed.text(), "");
+        send(&mut ed, &ctrl('_'));
+        assert_eq!(ed.expanded_text(), token);
+        send(&mut ed, &left());
+        assert_eq!(ed.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn literal_atoms_render_wrap_and_snap_vertical_movement() {
+        let mut ed = editor();
+        let token = "[item 1]";
+        ed.set_text(&format!("abc {token}"));
+        // Populate the cache before registration to check invalidation.
+        let _ = ed.draw(&ctx(11, 40));
+        ed.register_atomic_token(token);
+        let surf = ed.draw(&ctx(11, 40));
+        assert_eq!(row_text(&surf, 1).trim_end(), "abc");
+        assert_eq!(row_text(&surf, 2).trim_end(), token);
+
+        let surf = ed.draw(&ctx(6, 40));
+        assert_all_vls_fit(&ed);
+        let rendered: String = (1..surf.size.height - 1)
+            .map(|row| row_text(&surf, row).trim_end().to_string())
+            .collect();
+        assert_eq!(rendered, "abc[item 1]");
+        let line = ed.text();
+        let reconstructed: String = ed
+            .wrap_line_spans(&line, ed.layout_width)
+            .iter()
+            .map(|&(s, e)| &line[s..e])
+            .collect();
+        assert_eq!(reconstructed, line);
+
+        ed.set_text(&format!("12345\n{token}"));
+        let _ = ed.draw(&ctx(30, 40));
+        send(&mut ed, &up());
+        send(&mut ed, &ctrl('a'));
+        for _ in 0..3 {
+            send(&mut ed, &right());
+        }
+        assert_eq!(ed.cursor(), (0, 3));
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (1, 0));
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('i'));
+        assert_eq!(ed.cursor(), (1, token.len()));
+        send(&mut ed, &jump_backward());
+        send(&mut ed, &char_key('i'));
+        assert_eq!(ed.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn literal_atom_registration_is_exact_and_longest_first() {
+        let mut ed = editor();
+        ed.register_atomic_token("[x]");
+        ed.register_atomic_token("[x] suffix");
+        ed.register_atomic_token("[x]");
+        ed.set_text("[x] suffix [X]");
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &right());
+        assert_eq!(ed.cursor(), (0, "[x] suffix".len()));
+        send(&mut ed, &ctrl('e'));
+        send(&mut ed, &backspace());
+        assert_eq!(ed.expanded_text(), "[x] suffix [X");
     }
 
     // -- The required per-module doctest --
