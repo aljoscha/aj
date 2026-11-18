@@ -88,8 +88,9 @@ fn temp_dir() -> PathBuf {
     env::temp_dir()
 }
 
-/// arboard returns raw RGBA pixels; we always re-encode as PNG
-/// (lossless) before handing bytes upstream.
+/// Prefer copied files to the bitmap representation, which on macOS can be
+/// the Finder file icon rather than the image. Bitmap-only copies (such as
+/// screenshots) are encoded as PNG.
 fn read_via_arboard() -> Option<(&'static str, Vec<u8>)> {
     let mut cb = match arboard::Clipboard::new() {
         Ok(cb) => cb,
@@ -98,6 +99,13 @@ fn read_via_arboard() -> Option<(&'static str, Vec<u8>)> {
             return None;
         }
     };
+    if let Ok(paths) = cb.get().file_list()
+        && !paths.is_empty()
+    {
+        // Do not fall back to an icon when the original file is unreadable
+        // or is not an image.
+        return read_copied_image(&paths);
+    }
     let img = match cb.get_image() {
         Ok(img) => img,
         Err(e) => {
@@ -116,6 +124,20 @@ fn read_via_arboard() -> Option<(&'static str, Vec<u8>)> {
         return None;
     }
     Some(("image/png", out.into_inner()))
+}
+
+fn read_copied_image(paths: &[PathBuf]) -> Option<(&'static str, Vec<u8>)> {
+    paths.iter().find_map(|path| {
+        if !path.is_file() {
+            return None;
+        }
+        let bytes = fs::read(path).ok()?;
+        let mime = aj_tools::image::detect_mime_type(&bytes)?;
+        // A recognizable header alone does not establish that this is a
+        // readable image. Keep the original encoding once validated.
+        image::load_from_memory(&bytes).ok()?;
+        Some((mime, bytes))
+    })
 }
 
 fn is_wayland() -> bool {
@@ -353,6 +375,42 @@ mod tests {
     use aj_tools::image::SUPPORTED_MIME_TYPES;
 
     use super::*;
+
+    #[test]
+    fn copied_image_preserves_original_bytes_instead_of_file_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sniff content rather than depending on the file extension.
+        let path = dir.path().join("copied image");
+        let image = DynamicImage::new_rgb8(3, 2);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut encoded, ImageFormat::Jpeg).unwrap();
+        let bytes = encoded.into_inner();
+        fs::write(&path, &bytes).unwrap();
+
+        let (mime, copied) = read_copied_image(&[path]).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(copied, bytes);
+        let decoded = image::load_from_memory(&copied).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (3, 2));
+    }
+
+    #[test]
+    fn copied_files_skip_missing_non_image_and_corrupt_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("text.jpg");
+        fs::write(&text, "not an image").unwrap();
+        let corrupt = dir.path().join("corrupt.jpg");
+        fs::write(&corrupt, [0xff, 0xd8, 0xff, 0xe0]).unwrap();
+        let mut paths = vec![dir.path().join("missing"), dir.path().into(), text, corrupt];
+        assert!(read_copied_image(&paths).is_none());
+
+        let valid = dir.path().join("valid.png");
+        DynamicImage::new_rgba8(2, 1).save(&valid).unwrap();
+        paths.push(valid.clone());
+        let (mime, bytes) = read_copied_image(&paths).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, fs::read(valid).unwrap());
+    }
 
     #[test]
     fn extension_for_mime_round_trips() {
