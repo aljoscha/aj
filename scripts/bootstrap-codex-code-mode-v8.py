@@ -12,14 +12,18 @@ ROOT = Path(__file__).resolve().parents[1]
 NAMES = {'archive': 'archive.a.gz', 'binding': 'src_binding.rs'}
 
 
-def verify(path, item):
+def matches(path, item):
     with path.open('rb') as stream:
-        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
-    if actual != item['sha256']:
+        return hashlib.file_digest(stream, 'sha256').hexdigest() == item['sha256']
+
+
+def verify(path, item):
+    if not matches(path, item):
         raise RuntimeError(f'V8 checksum mismatch: {path}')
 
 
 def bootstrap(root, target, source=None, check=False):
+    """Install the pinned pair for `target` and return the names of replaced stale files."""
     artifacts = json.loads((root / 'vendor/codex-code-mode/v8-artifacts.json').read_text())
     pair = [item for item in artifacts if item['target'] == target]
     if len(pair) != 2 or {item['kind'] for item in pair} != NAMES.keys():
@@ -28,17 +32,24 @@ def bootstrap(root, target, source=None, check=False):
     if dest.is_symlink():
         raise RuntimeError(f'Refusing symlink native directory: {dest}')
     missing = []
+    stale = []
     for item in pair:
         path = dest / NAMES[item['kind']]
-        if path.exists() or path.is_symlink() or check:
+        if check:
             verify(path, item)
-        else:
+        elif not (path.exists() or path.is_symlink()):
             missing.append(item)
+        elif not matches(path, item):
+            # The pair is a pinned download, so anything else here is a
+            # leftover from an earlier pin rather than work to preserve.
+            missing.append(item)
+            stale.append(NAMES[item['kind']])
     if not missing:
-        return
+        return []
 
-    # Verify every download before publishing. Keep existing verified files intact
-    # when completing a partial installation. Bootstrap requires a single writer.
+    # Verify every download before publishing, so a failed download leaves the
+    # installation unchanged. Files that already match the pin stay in place.
+    # Bootstrap requires a single writer.
     with tempfile.TemporaryDirectory(prefix='.v8-', dir=dest.parent) as tmp:
         staged = Path(tmp) / 'native'
         staged.mkdir()
@@ -57,6 +68,7 @@ def bootstrap(root, target, source=None, check=False):
                 (staged / name).rename(dest / name)
         else:
             staged.rename(dest)
+    return stale
 
 
 def main():
@@ -67,9 +79,14 @@ def main():
     version = subprocess.check_output(['rustc', '-vV'], text=True)
     target = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
     try:
-        bootstrap(ROOT, target, args.from_dir, args.check)
+        stale = bootstrap(ROOT, target, args.from_dir, args.check)
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f'{error}\n')
+    if stale:
+        # Rusty V8's build script copies the archive into the target directory
+        # and does not rerun when the archive changes.
+        print(f'Replaced stale {", ".join(stale)}. Run `cargo clean -p v8` for each '
+              'profile and target directory you build with so Cargo picks up the new pair.')
     print(f'Verified sandbox-enabled V8 for {target}. Ordinary cargo commands are ready.')
 
 

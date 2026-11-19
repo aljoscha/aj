@@ -91,11 +91,12 @@ this fixed native pair. Do not share its directory between host architectures.
 
 Both downloads must match the pinned Bazel SHA-256 hashes before the pair is
 published under the ignored `third-party/codex-code-mode/native/` directory.
-Failed downloads leave the installation unchanged. Existing files are verified,
-never overwritten. Rerun bootstrap to download missing files in an incomplete
-installation. Checksum mismatches still fail without changing files. An offline
-source can be supplied with `--from-dir DIR`,
-containing the upstream artifact filenames. Revalidate an installation with:
+Failed downloads leave the installation unchanged. Files that match the pin
+are kept. Missing files and files left from an earlier pin are downloaded and
+replaced, so rerunning bootstrap repairs an incomplete installation and
+upgrades one after a pin change. An offline source can be supplied with
+`--from-dir DIR`, containing the upstream artifact filenames. Revalidate an
+installation without changing it with:
 
 ```sh
 python3 scripts/bootstrap-codex-code-mode-v8.py --check
@@ -103,10 +104,11 @@ python3 scripts/bootstrap-codex-code-mode-v8.py --check
 
 **Build tradeoff:** the pinned native pair requires an explicit bootstrap rather
 than relying on Rusty V8's downloader. No dependency cache is patched and
-sandboxing is not disabled. When upgrading an existing installation, move the
-old `native/` directory aside, run bootstrap for the new pin, and retain the
-old pair until verification succeeds. Bootstrap refuses to overwrite a pair
-whose hashes do not match the new pin.
+sandboxing is not disabled. After a pin change, rerun bootstrap. Rusty V8's
+build script copies the archive into the Cargo target directory and does not
+notice when it changes, so also run `cargo clean -p v8` for each profile and
+target directory you build with. Bootstrap prints this reminder when it
+replaces a file.
 
 Cargo does not rehash the installed pair on every build. Run bootstrap in CI
 before Cargo, including when restoring cached native files. Explicit environment

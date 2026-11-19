@@ -322,14 +322,17 @@ class BootstrapContract(unittest.TestCase):
             bootstrap.bootstrap(self.root, item['target'], self.source)
         self.assertFalse(self.native.exists())
 
-    def test_corrupt_installed_pair_is_rejected_not_overwritten(self):
+    def test_stale_installed_file_is_replaced(self):
         target = self.items[0]['target']
         bootstrap.bootstrap(self.root, target, self.source)
-        (self.native / 'src_binding.rs').write_bytes(b'local change')
+        expected = tree(self.native)
+        (self.native / 'src_binding.rs').write_bytes(b'earlier pin')
         before = tree(self.native)
         with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
-            bootstrap.bootstrap(self.root, target, self.source)
+            bootstrap.bootstrap(self.root, target, check=True)
         self.assertEqual(tree(self.native), before)
+        self.assertEqual(bootstrap.bootstrap(self.root, target, self.source), ['src_binding.rs'])
+        self.assertEqual(tree(self.native), expected)
 
     def test_missing_installed_files_are_restored(self):
         target = self.items[0]['target']
@@ -348,12 +351,18 @@ class BootstrapContract(unittest.TestCase):
     def test_failed_repair_preserves_existing_files(self):
         target = self.items[0]['target']
         bootstrap.bootstrap(self.root, target, self.source)
-        (self.native / 'src_binding.rs').unlink()
         (self.source / self.items[1]['filename']).write_bytes(b'corrupt download')
-        before = tree(self.native)
-        with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
-            bootstrap.bootstrap(self.root, target, self.source)
-        self.assertEqual(tree(self.native), before)
+        for damage in ('missing', 'stale'):
+            with self.subTest(damage=damage):
+                binding = self.native / 'src_binding.rs'
+                if damage == 'missing':
+                    binding.unlink()
+                else:
+                    binding.write_bytes(b'earlier pin')
+                before = tree(self.native)
+                with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                    bootstrap.bootstrap(self.root, target, self.source)
+                self.assertEqual(tree(self.native), before)
 
     def test_unsupported_platform_has_no_fallback(self):
         with self.assertRaisesRegex(RuntimeError, 'No pinned sandbox-enabled V8 pair'):
