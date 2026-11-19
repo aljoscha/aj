@@ -34,26 +34,32 @@ pub(crate) fn compact_message(message: &mut AgentMessage) {
 }
 
 fn compact_tool_result(result: &mut ToolResultMessage) {
-    let Some(object) = result.details.as_ref().and_then(Value::as_object) else {
-        return;
-    };
-    let compacted = match object.get("kind").and_then(Value::as_str) {
-        Some("text") => compact_text(object, &result.content),
-        Some("bash") => compact_bash(object, &result.content),
-        _ => None,
-    };
-    let Some(compacted) = compacted else {
-        return;
-    };
-    let (Ok(full_len), Ok(compact_len)) = (
-        serde_json::to_vec(object).map(|bytes| bytes.len()),
-        serde_json::to_vec(&compacted).map(|bytes| bytes.len()),
-    ) else {
-        return;
-    };
-    if compact_len < full_len {
+    let compacted = result
+        .details
+        .as_ref()
+        .and_then(|details| compact_tool_details(details, &result.content));
+    if let Some(compacted) = compacted {
         result.details = Some(compacted);
     }
+}
+
+/// The smaller stored form of `details`, with what repeats `content`
+/// replaced by references into it. `None` when nothing repeats, or when the
+/// references would not be smaller.
+///
+/// [`resolve_tool_details`] against the same content gives back what
+/// `details` held. Appending to a log does this already. This entry point is
+/// for rewriting records that were stored before a rule existed.
+pub fn compact_tool_details(details: &Value, content: &[UserContent]) -> Option<Value> {
+    let object = details.as_object()?;
+    let compacted = match object.get("kind").and_then(Value::as_str) {
+        Some("text") => compact_text(object, content),
+        Some("bash") => compact_bash(object, content),
+        _ => None,
+    }?;
+    let full_len = serde_json::to_vec(object).ok()?.len();
+    let compact_len = serde_json::to_vec(&compacted).ok()?.len();
+    (compact_len < full_len).then_some(compacted)
 }
 
 /// A text body that is the content: its blocks run together or joined by a

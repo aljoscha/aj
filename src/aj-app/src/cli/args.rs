@@ -652,6 +652,18 @@ pub enum PrintFormat {
 pub enum Command {
     /// List existing conversation sessions for this project.
     ListSessions,
+    /// Rewrite stored JSONL sessions into the smaller form this build
+    /// writes: tool output stored once, edits as diffs, and one goal record
+    /// where a goal's usage was recorded every second. Reports what it would
+    /// save unless `--write` is given. A session that is open is skipped.
+    CompactSessions {
+        /// Rewrite the sessions instead of only reporting.
+        #[arg(long)]
+        write: bool,
+        /// The sessions root, or one project's directory inside it.
+        /// Defaults to `~/.aj/sessions`.
+        directory: Option<std::path::PathBuf>,
+    },
     /// Print the version: the cargo version and the git revision this
     /// binary was built from. Same output as `--version`.
     Version,

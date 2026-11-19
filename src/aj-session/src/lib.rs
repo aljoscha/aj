@@ -71,5 +71,5 @@ pub use repair::repair_interrupted_tool_uses;
 pub use replay::{Backfill, TaggedEvent, project_suffix, replay};
 pub use stats::{SessionStats, UsageBucket};
 pub use tag::{MAX_TAG_BYTES, TagError, normalize_tag};
-pub use tool_details::resolve_tool_details;
+pub use tool_details::{compact_tool_details, resolve_tool_details};
 pub use tree::{SessionTree, TreeSegment};

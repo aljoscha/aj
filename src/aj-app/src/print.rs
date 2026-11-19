@@ -174,6 +174,7 @@ async fn run_inner<W: Write + Send + 'static>(
         None => None,
         Some(Command::Continue { session_id, .. }) => Some(session_id.clone()),
         Some(Command::ListSessions)
+        | Some(Command::CompactSessions { .. })
         | Some(Command::Version)
         | Some(Command::UpdateModels)
         | Some(Command::Serve)

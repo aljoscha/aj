@@ -176,6 +176,9 @@ async fn async_main() -> Result<()> {
     match args.command {
         Some(Command::UpdateModels) => aj_app::handle_update_models_command().await,
         Some(Command::ListSessions) => aj_app::handle_list_sessions(),
+        Some(Command::CompactSessions { write, directory }) => {
+            aj_app::compact_sessions::handle_compact_sessions(directory, write)
+        }
         Some(Command::Version) => {
             println!("aj {}", aj_app::VERSION);
             Ok(())

@@ -27,6 +27,7 @@ pub mod cli;
 pub mod client;
 pub mod clipboard;
 pub mod commands;
+pub mod compact_sessions;
 pub mod compaction;
 pub mod composer;
 pub mod directory;
