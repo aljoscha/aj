@@ -75,6 +75,7 @@ jobs:
           revision=$(python3 -c 'import json; print(json.load(open("third-party/codex-code-mode/upstream.json"))["revision"])')
           git init "$RUNNER_TEMP/codex"
           git -C "$RUNNER_TEMP/codex" fetch --depth 1 https://github.com/openai/codex.git "$revision"
+          cargo fetch --locked
           cargo fetch --manifest-path vendor/codex-code-mode/Cargo.toml --locked
           python3 scripts/test-codex-code-mode.py --upstream "$RUNNER_TEMP/codex"
       - run: cargo test --manifest-path vendor/codex-code-mode/Cargo.toml --workspace --all-features --locked

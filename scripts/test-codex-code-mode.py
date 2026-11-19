@@ -87,11 +87,18 @@ class ImportContract(unittest.TestCase):
         self.run_import('--upgrade', revision, succeeds=False)
         self.assertEqual(tree(self.root), before)
 
-    def test_upgrade_and_repeat_use_recorded_full_revision(self):
+    def temporary_upstream(self, revision):
+        # CI fetches the pin without creating a branch for a clone to follow.
         repo = self.root / 'upstream'
-        subprocess.run(['git', 'clone', '--quiet', '--shared', '--no-checkout', str(UPSTREAM), str(repo)], check=True)
+        subprocess.run(['git', 'init', '--quiet', str(repo)], check=True)
+        subprocess.run(['git', '-C', str(repo), 'fetch', '--quiet', '--depth=1',
+                        str(UPSTREAM), revision], check=True)
         self.upstream = repo
+        return repo
+
+    def test_upgrade_and_repeat_use_recorded_full_revision(self):
         revision = json.loads((self.support / 'upstream.json').read_text())['revision']
+        repo = self.temporary_upstream(revision)
         env = {**os.environ, 'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
                'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
         def git(*args, data=None):
@@ -115,11 +122,9 @@ class ImportContract(unittest.TestCase):
         self.assertEqual(tree(self.vendor), before)
 
     def test_catalog_upgrade_keeps_runtime_and_reproduces(self):
-        repo = self.root / 'catalog-upstream'
-        subprocess.run(['git', 'clone', '--quiet', '--shared', '--no-checkout', str(UPSTREAM), str(repo)], check=True)
-        self.upstream = repo
         record = self.support / 'upstream.json'
         revision = json.loads(record.read_text())['revision']
+        repo = self.temporary_upstream(revision)
         env = {**os.environ, 'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
                'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
         def git(*args, data=None):
@@ -231,12 +236,8 @@ class ImportContract(unittest.TestCase):
         self.assertTrue(any(m.get('tool_mode') != 'code_mode_only' for m in models))
 
     def test_parent_can_depend_on_both_nested_workspace_crates(self):
-        override = tomllib.loads((self.vendor / 'Cargo.toml').read_text())['patch']['crates-io']['v8']
-        self.assertEqual(override, tomllib.loads((ROOT / 'Cargo.toml').read_text())['patch']['crates-io']['v8'])
         (self.root / 'Cargo.toml').write_text(
-            '[workspace]\nmembers = ["app"]\nexclude = ["vendor/codex-code-mode"]\nresolver = "3"\n'
-            '[patch.crates-io]\nv8 = { git = ' + json.dumps(override['git'])
-            + ', rev = ' + json.dumps(override['rev']) + ' }\n')
+            '[workspace]\nmembers = ["app"]\nexclude = ["vendor/codex-code-mode"]\nresolver = "3"\n')
         app = self.root / 'app'
         (app / 'src').mkdir(parents=True)
         (app / 'src/lib.rs').write_text('')
@@ -250,7 +251,10 @@ class ImportContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         metadata = json.loads(result.stdout)
         v8 = next(p for p in metadata['packages'] if p['name'] == 'v8')
-        self.assertIn(override['rev'], v8['source'])
+        parent_lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
+        parent_v8, = (p for p in parent_lock['package'] if p['name'] == 'v8')
+        self.assertEqual(v8['source'], 'registry+https://github.com/rust-lang/crates.io-index')
+        self.assertEqual((v8['source'], v8['version']), (parent_v8['source'], parent_v8['version']))
         self.assertFalse((self.vendor / 'code-mode-runtime/src/ui').exists())
         imported = [p for p in metadata['packages'] if p['name'].startswith('codex-code-mode-')]
         self.assertEqual(len(imported), 2)
