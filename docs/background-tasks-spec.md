@@ -1,822 +1,382 @@
-# Background tasks — spec
+# Background tasks
+
+The model can run `bash` commands and sub-agents in the background. The tool
+call returns at once with a task ID. The work continues on a detached driver.
+The model observes it with `task_output` and `task_stop`, and receives a
+task notification in its transcript when the task ends. A background `bash`
+command is a process of its own that outlives `aj` and is found again by the
+next host that opens the session (section 7). A task notification that arrives
+while the owning agent is idle wakes it: the host starts a turn so the agent
+reacts without polling and without waiting for the user.
+
+The user sees background work in the footer and the agent picker, with live
+output in the transcript.
+
+Code Mode cells use the same registry and task IDs. See
+[Code Mode](code-mode.md).
+
+## 1. Contract
+
+1. **A `run_in_background` parameter** on `bash` and `agent` selects the mode.
+   There are no separate background tools.
+2. **Two tools** make up the rest of the model-facing surface: `task_output`
+   and `task_stop`. There is no list tool and no multi-task wait. IDs arrive
+   in started results and in task notifications.
+3. **One ID space** covers bash tasks, background agent runs and Code Mode
+   cells. IDs are minted per session from 1 and shown as `#1`, `#2`. The
+   session stores the highest ID it minted, so a restart does not use one
+   twice. An agent-backed task also names its `Sub(n)` ID.
+4. **The original tool result is the "started" result.** It returns at once. A
+   command that dies right after launch surfaces through its task
+   notification.
+5. **A task notification is always delivered**, even when the model already
+   read the output. It is a typed transcript message that the model sees as a
+   user message wrapped in `<task-notification>`. The tag marks it as injected
+   by the harness, so the model does not take it for a reply from the user. It
+   is stored like any other message.
+6. **A task notification wakes an idle owner** (section 4).
+7. **Reads are stateless.** `task_output` returns the status and the current
+   rolling tail. Repeated calls return overlapping content. The output file is
+   the full output, and the model reads it in slices with `read_file` and
+   `offset` / `limit`.
+8. **Tasks hang off a session-level cancellation root**, not the turn token. A
+   task outlives the turn that started it. A background `bash` command also
+   outlives the session and the process: only `task_stop`, the user's kill and
+   its own exit end it. A background agent run and a Code Mode cell end with
+   the session.
+9. **Task events are not stored.** `TaskStart`, `TaskOutput` and `TaskEnd`
+   carry the `call_id` of the launching tool call, so a frontend updates that
+   call's cell in place.
+10. **Sub-agents may start background bash tasks.** Background agent spawns
+    are for the main agent only, because the `agent` tool is filtered out of a
+    sub-agent's tools.
+11. **A task belongs to the agent that started it.** The notification goes to
+    that agent, and only that agent can read or stop the task with the tools
+    (section 2.3).
+12. **One registry per session** holds the tasks of the main agent and every
+    sub-agent. It knows nothing of processes or of SQLite: a tool supplies the
+    output source, and the session supplies the store that records running
+    work.
+
+## 2. Tools
+
+### 2.1 `bash` with `run_in_background: true`
+
+The command runs detached from the `aj` process, under a shell wrapper in a
+session and process group of its own. The wrapper writes the command's output
+to one file and its exit status to another. A foreground command uses the
+same runner, and ends with the host (section 2.4).
+
+- **Record first.** The wrapper runs nothing until the host tells it to, and
+  the host does so only once the task record is saved
+  ([principles](principles.md), rule 5). A refused record fails the call, and
+  a host that dies first leaves a wrapper that exits. Either way no command
+  runs without a record.
+- **Files.** Output and exit files are named `aj-bash-XXXXXX.log` and
+  `.exit` ([session storage](session-storage.md) says where). The exit file
+  is removed once the task's end is saved.
+- **One stream.** Stdout and stderr share the output file in the order the
+  command wrote them. Tails, byte totals and truncation markers are of the
+  combined stream and are reported as stdout. `STDERR:` does not appear.
+- **Exit status** is the shell's: a command killed by signal `N` ends with
+  exit code `128 + N`. If the wrapper itself is killed outright, the process
+  that started it writes the status it reaped. No other process can, and then
+  the task is lost: its process is gone and left no exit status (section 7).
+- **Watching.** The driver reads the output file as it grows and emits
+  throttled `TaskOutput`. While the file does not grow the driver looks at it
+  less often, down to once a second, so output that resumes after a quiet
+  spell shows within a second. It learns of the end from the wrapper it
+  reaps. For a task it did not start it waits on a descriptor of the
+  wrapper's process on Linux, and elsewhere looks at the exit file and the
+  pid once a second. A pid is the task only with the recorded start time, so
+  a reused pid is not mistaken for it.
+- **Kill.** `SIGTERM` to the process group, then `SIGKILL` after 2 seconds to
+  whatever is left. Nothing is signalled unless the wrapper is still the
+  recorded process.
+- **Descendants.** The task ends when the command does. A process the command
+  left behind keeps running and is not stopped. A double-forking daemon
+  escapes the process group and therefore a kill.
+- `timeout` is ignored. The task runs until it exits or is stopped.
+- **Without a task record** (print mode, or a registry with no store) the task
+  cannot be found again, so shutdown kills it, and so does its driver being
+  dropped.
 
-Let the model run `bash` commands and sub-agents **in the background**:
-the tool call returns immediately with a task id (and, for bash, the
-path output is being written to), the work continues on a detached
-task, and the model observes it through two `task_*` tools
-(`task_output` to read or wait, `task_stop` to kill) plus automatic
-completion notices injected into its transcript. When a task finishes
-while the owning agent is idle, the notice **wakes** it — a turn is
-triggered so the agent reacts to the result without polling and
-without waiting for the user. The user observes background work
-through the existing footer / agent-picker surfaces, extended to
-cover bash tasks, with live output in the transcript.
-
-This builds directly on the retention + concurrency foundation from
-`docs/subagent-steering-spec.md` (§7 there sketches background spawn as
-"an additive mode on top"; this is that mode) and reuses the sub-agent
-rendering machinery.
-
-This document is the implementation contract. It is split into stages
-at the end for orchestration.
-
----
-
-## 1. Background: what happens today
-
-### 1.1 Both tools block the turn
-
-- `bash` (`src/aj-tools/src/tools/bash.rs`): spawns `bash -c` in a
-  fresh process group, drains stdout/stderr through two reader tasks
-  into per-stream rolling tails (`StreamState`) teed into a spill file
-  (`SpillState`), and `select!`s on cancellation / timeout / child
-  exit. `execute` does not return until one of those fires and the
-  capture pipes have closed, which a bounded drain takes care of when
-  something the command started still holds them. Progress
-  snapshots go through `ToolContext::emit_update`, which is a no-op in
-  production (lib.rs:1857 — sync trait method vs async bus).
-- `agent` (`src/aj-tools/src/tools/agent.rs`): delegates to
-  `ToolContext::spawn_agent`, which retains the child in the shared
-  `SubAgentRegistry`, locks the handle, and runs `run_single_turn` to
-  completion before returning `SpawnedAgent { agent_id, report }`. The
-  parent is suspended at that `.await` for the child's whole run.
-
-### 1.2 The pieces background execution needs already exist
-
-- **Retention**: `SubAgentRegistry` (lib.rs:1518) keeps live
-  `SharedAgent` handles past the spawning tool call; the binary
-  resolves them to drive continuations.
-- **Concurrent turns**: the binary's `turns: JoinSet` +
-  `turn_cancels: HashMap<AgentId, CancellationToken>` already run
-  multiple agents' turns concurrently, serialized per agent.
-- **Event routing**: sub-agents share the parent's bus tagged with
-  `Sub(n)`; the pump's `running_agents` set drives the per-view
-  spinner, the footer aggregate, and per-box status. Detached tasks
-  can emit on the bus without the `emit_update` sync problem — they
-  run on their own tokio tasks and can `.await` the emit.
-- **Output buffering**: bash's rolling tail + spill file is exactly
-  the shape a background job's output buffer needs; it only lacks a
-  way to read it after the originating call returned.
-- **Incremental file reads**: `read_file` supports line-based
-  `offset` / `limit` and tells the caller the next offset to continue
-  from — reading a growing spill file in slices works today.
-
-### 1.3 What's missing
-
-- Nothing survives a tool call except sub-agent handles: there is no
-  job registry, no task ids, no way to read a process's output after
-  the originating call returned.
-- No mechanism injects content into an agent's transcript between
-  turns or between tool batches — the `QueueUpdate` event exists but
-  nothing emits it.
-- Every `tool_use` must get its `tool_result` in the same batch, so a
-  background task's *final* outcome cannot ride the original tool
-  result; it has to arrive later through another channel.
-
----
-
-## 2. Goals / non-goals
-
-**Goals**
-
-1. `bash` and `agent` accept `run_in_background: true`; the call
-   returns immediately with a task id while the work continues
-   detached. Background bash results carry the spill path so the full
-   output is always one `read_file` away.
-2. The model can read output and/or block until the task finishes
-   (`task_output`, with a `block` flag) and kill a task (`task_stop`).
-3. When a task finishes, a **completion notice** is injected into the
-   owning agent's transcript at the next natural point (before the
-   next inference step, or at the start of the next turn) so the model
-   never has to busy-poll and cannot forget a task.
-4. **Auto-wake**: a notice arriving while the owning agent is idle
-   triggers a turn on that agent (main *and* sub-agents alike) — the
-   agent reads the result and keeps working. Waking without polling is
-   what makes backgrounding genuine parallelism rather than deferred
-   reads.
-5. Background tasks survive turn end but **not process exit**: they
-   are killed on shutdown.
-6. The user sees background bash tasks in the footer and the alt+a
-   picker, with live output in the transcript (the same treatment
-   sub-agents already get).
-
-**Non-goals (this iteration)**
-
-- **Detach-from-process**: no nohup-style tasks that outlive aj. Exit
-  kills everything.
-- **Resurrecting tasks when resuming a session**: tasks are process-scoped.
-  Persisted launch results and notices stand alone in the transcript.
-- **Live transcript reads of a running background agent** through
-  `task_output`: a running agent holds its own `TokioMutex`, so the
-  tool reports status only until the report lands. The TUI observes
-  running agents through events, as today.
-- Implementing batch-parallel tool execution (the unread
-  `ExecutionMode` deviation in `execute_turn`). Backgrounding
-  sidesteps most of the need; the deviation stays on record.
-
----
-
-## 3. Locked decisions
-
-1. **A `run_in_background` parameter on the existing tools**, not new
-   `bash_background` / `agent_background` tools. The decision is made
-   at call time; near-duplicate tool descriptions would just burn
-   context.
-2. **A minimal, conventional model-facing surface.** Two tools
-   (`task_output`, `task_stop`), the parameter name
-   `run_in_background`, path-first output retrieval, and tagged
-   notices follow the conventions frontier coding models have strong
-   priors for. Strong priors mean less tool-description budget and
-   fewer misuses; everything else (listing, multi-task waits,
-   incremental reads) is covered by ids in results/notices, auto-wake,
-   and `read_file` on the spill path.
-3. **One unified task id space** for bash tasks and background agent
-   spawns, minted per session (`#1`, `#2`, …). One concept — "things
-   running in the background" — one set of `task_*` tools. Agent-backed
-   tasks additionally reference their `Sub(n)` id in metadata.
-4. **The original tool result is the "started" result**, returned
-   immediately — there is no launch window. A command that dies 50ms
-   in surfaces through its completion notice at the next drain point,
-   which is one inference step later than an inline result once the
-   current tool batch returns (see §4.6 for the bound);
-   in exchange there is exactly one result shape, no watch channel,
-   and no notice-suppression logic. For bash the started result
-   carries the spill path; the real outcome arrives later via
-   `task_output` / the completion notice.
-5. **Completion notices are injected user-role messages wrapped in a
-   `<task-notification>` tag**, drained at two points: the top of
-   `prompt()` and after each tool batch in `execute_turn` (i.e.
-   immediately before every inference step). The tag marks the
-   message as harness-injected so the model does not mistake it for a
-   user reply (e.g. a notice landing while the model is waiting for
-   the user to answer a question is not the answer). Notices are
-   **always delivered** — even when the model already read everything
-   via `task_output`, a duplicated tail costs a few tokens and keeps
-   the lifecycle unconditional: task ends → notice queued → notice
-   drained. They are persisted like any other message so resumed
-   transcripts read coherently.
-6. **Notices wake idle owners.** The binary reacts to `TaskEnd` (and
-   to turn completion with notices still queued) by driving a wake
-   turn on the owner through the same per-agent turn machinery user
-   prompts use. A wake turn is an ordinary turn: gated per-agent,
-   cancellable per-view, visible in spinner/footer. Sub-agent wakes
-   run in the sub-agent's own chat; the user inspects what they came
-   up with by switching to that view (steering-spec semantics).
-7. **Stateless reads, path-first retrieval.** `task_output` returns
-   the task's status plus the current rolling tail — repeated calls
-   return overlapping content; there are no per-task cursors. The
-   spill file (always persisted for background tasks) is the canonical
-   full output; the model consumes long or fast-moving output
-   incrementally with `read_file` and its `offset` / `limit`
-   parameters, tracking its own position.
-8. **Tasks hang off a session-level cancellation root**, not the
-   per-turn token. The registry owns the root; the binary cancels it
-   on shutdown. `task_stop`, the task picker, and a cancel aimed at a
-   detached sub-agent cancel per-task child tokens.
-9. **Task lifecycle events** (`TaskStart` / `TaskOutput` / `TaskEnd`)
-   are new bus variants, transient like `ToolExecutionUpdate` (not
-   persisted). They carry the originating `call_id` so the TUI updates
-   the existing bash tool cell in place — no new box type for live
-   output.
-10. **Sub-agents may start background bash tasks** (they inherit the
-    toolset). Ownership and notices are scoped to the spawning agent,
-    and the `task_*` tools authorize against the same ownership
-    (§4.4). Background *agent* spawns remain main-only because the
-    `agent` tool stays filtered out of sub-agent toolsets.
-
----
-
-## 4. Design
-
-### 4.1 Task registry (`aj-agent`)
-
-A cheaply-cloneable shared registry, sibling of `SubAgentRegistry`:
-
-```rust
-pub type TaskId = usize;
-
-#[derive(Clone, Copy, ...)]
-pub enum TaskStatus {
-    Running,
-    /// Process exited (code is `None` when signal-killed), or the
-    /// agent-backed run completed/failed.
-    Exited(Option<i32>),
-    /// Killed via `task_stop`, the TUI, or shutdown.
-    Killed,
-}
-
-pub enum TaskKind {
-    Bash { command: String },
-    Agent { agent_id: usize, task: String },
-}
-
-pub struct TaskEntry {
-    pub id: TaskId,
-    pub owner: AgentId,
-    pub kind: TaskKind,
-    pub label: String,          // display label (command / description)
-    pub status: TaskStatus,
-    pub started_at: Instant,
-    cancel: CancellationToken,  // child of the registry root
-    output: Arc<dyn TaskOutputSource>,
-}
-
-#[derive(Clone, Default)]
-pub struct TaskRegistry {
-    inner: Arc<StdMutex<RegistryInner>>,  // entries + notices + next id
-    root_cancel: CancellationToken,
-}
-```
-
-Key operations (all lock-only, never held across `.await`):
-
-- `register(owner, kind, label, output) -> StartedTask` — mints the
-  id, inserts the entry as `Running`, returns the id plus a child
-  cancel token for the driver.
-- `read(id) -> TaskRead` — status + the current output snapshot. See
-  §4.4.
-- `kill(id)` — cancels the entry's token; the driver flips status.
-- `snapshot() -> Vec<TaskSummary>` — for the picker and the footer.
-- `push_notice(notice)` / `drain_notices(owner) -> Vec<TaskNotice>` /
-  `has_notices(owner) -> bool` — per-owner completion-notice queue
-  (§4.6); `has_notices` is what the binary's wake triggers poll
-  (§4.7).
-- `shutdown()` — cancels `root_cancel`; callers then await driver
-  quiescence (§4.8).
-
-Output is type-erased behind a small trait so `aj-agent` stays free of
-process details while `aj-tools` keeps the buffering implementation:
-
-```rust
-pub trait TaskOutputSource: Send + Sync {
-    /// Snapshot of the rolling output tail per stream, exact byte
-    /// totals, and the spill path. Stateless: repeated calls return
-    /// overlapping content; the *caller* applies display truncation.
-    fn snapshot(&self) -> TaskRead;
-}
-```
-
-Wiring mirrors `SubAgentRegistry`: the binary creates one
-`TaskRegistry`, injects it on the main agent
-(`set_task_registry`), and the agent threads a clone through
-`SessionContextWrapper` into every tool call and every spawned
-sub-agent (so sub-agent-owned bash tasks land in the same map the
-binary observes). Print mode and tests that never inject one get a
-default registry whose tasks die with the process — same pattern,
-same caveats as `SubAgentRegistry`.
-
-### 4.2 `ToolContext` additions
-
-```rust
-pub trait ToolContext: Send {
-    // ... existing methods ...
-
-    /// Shared task registry handle (for the task_* tools).
-    fn task_registry(&self) -> TaskRegistry;
-
-    /// Register a background task and get the plumbing its detached
-    /// driver needs: the task id, a cancel token (child of the
-    /// registry root, NOT of the per-turn token), and an event sink.
-    fn start_background_task(
-        &mut self,
-        kind: TaskKind,
-        label: String,
-        output: Arc<dyn TaskOutputSource>,
-    ) -> StartedTask;
-}
-
-pub struct StartedTask {
-    pub id: TaskId,
-    pub cancel: CancellationToken,
-    pub events: TaskEventSink,
-}
-```
-
-`TaskEventSink` is how a detached driver reaches the bus and the
-notice queue without holding the whole agent:
-
-```rust
-pub struct TaskEventSink { /* bus clone, owner, task_id, call_id */ }
-
-impl TaskEventSink {
-    /// Emit `TaskOutput` (drivers self-throttle, ~10/s).
-    pub async fn output(&self, partial: ToolDetails);
-    /// Queue the notice and record the terminal status together,
-    /// then emit `TaskEnd`.
-    pub async fn finished(&self, status: TaskStatus, notice: TaskNotice);
-}
-```
-
-The sink captures the `call_id` of the originating tool call so
-`TaskStart` / `TaskOutput` / `TaskEnd` correlate with the transcript
-cell (§4.9). Because drivers are plain tokio tasks, emits are properly
-`.await`ed — the `emit_update` sync/async impasse does not apply here.
-Bus listener errors are logged and swallowed by the sink: a task
-finishing outside any turn has no turn to abort, and persistence never
-subscribes to task events anyway.
-
-NOTE: `start_background_task` allocates ids from the registry, not
-from `SessionState`, so detached drivers never need the `&mut
-SessionState` borrow that makes foreground tools block today.
-
-### 4.3 `bash` background mode
-
-`BashInput` gains:
-
-```rust
-/// Run the command in the background. The call returns immediately
-/// with a task id and the path the output is written to, which you
-/// can read with read_file (supports offset/limit). `timeout` is
-/// ignored in background mode: the task runs until it exits or is
-/// stopped, and you are notified when it completes.
-#[serde(default)]
-pub run_in_background: bool,
-```
-
-Execution in background mode:
-
-1. Spawn the child and reader tasks exactly as today (`process_group`,
-   `StreamState`, spill file). The spill file is **always persisted**
-   for background tasks — it is the canonical full output, named in
-   the started result and the completion notice, and must stay
-   reachable for `read_file` and the TUI.
-2. Call `start_background_task` and emit `TaskStart`; move child +
-   states + sink into a detached driver task that `select!`s on the
-   task cancel token vs `child.wait()`, emits throttled `TaskOutput`
-   snapshots, kills the process group on cancellation, and ends with
-   `events.finished(status, notice)`.
-3. Return the started result immediately. Wire content:
-
-   ```
-   Started background task #3: cargo build --release
-   Output is being written to <spill path>, read it with read_file
-   (supports offset/limit). You will be notified when it completes.
-   ```
-
-`ToolDetails::Bash` gains `task_id: Option<TaskId>` (serde-defaulted
-`None`, preserving the persisted shape) so renderers can badge the
-cell and correlate task events. Foreground behavior, including
-`execution_mode() == Sequential`, is unchanged.
-
-The tool description steers usage (models follow these patterns well
-when they are spelled out):
-
-- For "wait until X is ready", background a command that *exits when
-  the condition holds* (`until grep -q "Ready" dev.log; do sleep 0.5;
-  done`) — one task, one notice — instead of polling in the
-  foreground.
-- You do not need to wait for a background task, the completion
-  notice reaches you once it finishes. Never wait by sleeping in the
-  foreground: no notice can arrive while a foreground command runs, so
-  sleeping only delays the report.
-- Double-forking daemons escape the process group and our kill —
-  prefer supervising the process in the foreground of a background
-  task over `nohup`-style detachment.
-
-Only the `task_*` tools' own descriptions name them. `bash` and `agent`
-describe the ids and notices they produce without naming a tool, so
-disabling a `task_*` tool cannot leave the model holding a dangling
-reference.
-
-### 4.4 `task_output`, `task_stop` (`aj-tools`)
-
-Both are thin wrappers over the registry; default
-`ExecutionMode::Parallel`.
-
-- **`task_output { id, block: bool = true, timeout: u64 = 30 }`** —
-  with `block`, resolves when the task reaches a terminal status or
-  the timeout fires, whichever is first (immediately if already
-  terminal); with `block: false`, an immediate status check. Must
-  `select!` on `ctx.cancellation()` so Ctrl+C cancels the wait (not
-  the task). A timeout is **not** an error (`is_error: false`) — it's
-  a normal "still running, here's where things stand" report, so the
-  model doesn't misread patience as failure.
-
-  The result is the task's status plus the current rolling tail, run
-  through `truncate_tail` with the standard bash budgets and marker
-  phrasing, plus the spill path. Stateless: repeated calls return
-  overlapping content; incremental consumption goes through
-  `read_file` on the spill path. Details: `ToolDetails::Bash` with
-  `task_id` set, `exit_code` populated once terminal. For agent
-  tasks: status while running, the final report once done
-  (`ToolDetails::Text`). Unknown id → `is_error` outcome naming the id
-  as unknown.
-- **`task_stop { id }`** — cancels the task token, awaits the terminal
-  status (bounded), returns the final status and output tail. Stopping
-  an agent-backed task cancels the child's run token; the sub-agent's
-  handle stays in `SubAgentRegistry` (it's re-promptable, per the
-  steering spec).
-
-**Authorization.** Ids are session-wide, so an agent can name a task it
-never started. Both tools resolve an id only for the agent that owns
-it. Nobody reaches across, in either direction: a sub-agent cannot
-touch its parent's or a sibling's work, and a parent cannot interfere
-with a running sub-agent's. The rule needs no notion of an agent tree,
-so it survives any change to the shape of one.
-
-A task therefore becomes unreachable through these tools once its owner
-finishes, which is accepted rather than worked around. Reparenting to
-the spawner or killing the task at owner exit would both buy back
-agent-level reach at the cost of machinery and of a lifetime rule that
-has to be explained. Three things already cover the gap: the output
-stays readable in the owner's transcript, where the completion notice
-also lands, the task picker lists and kills tasks regardless of owner,
-and `shutdown_background_tasks` kills whatever is still running when
-the session ends, including at the end of a `--print` run.
-
-A refused id is its own outcome, distinct from an unknown one:
-`Background task #{id} belongs to another agent.`, `is_error: true`.
-Existence is not hidden — spill files are readable, `ps` shows sibling
-commands, and the monotonic id space leaks the count anyway — and
-claiming an id the caller was just handed doesn't exist reads as a bug.
-Both error outcomes append the caller's *own* live ids, which is a
-helpful-response concern rather than a secrecy one.
-
-### 4.5 `agent` background mode
-
-`AgentInput` gains the same `run_in_background: bool` (default
-`false`). `ToolContext::spawn_agent` grows a mode so the wrapper can
-implement both shapes (signature change; the trait has few
-implementors):
-
-```rust
-fn spawn_agent(&mut self, task: String, mode: SpawnMode)
-    -> ... Future<Output = anyhow::Result<SpawnResult>>;
-
-pub enum SpawnMode { Blocking, Background }
-pub enum SpawnResult {
-    Completed(SpawnedAgent),                       // Blocking
-    Started { agent_id: usize, task_id: TaskId },  // Background
-}
-```
-
-Background path inside `SessionContextWrapper::spawn_agent`: build,
-configure, and retain the sub-agent exactly as today (same
-`SubAgentStart` emit, same registry insert), then instead of locking
-and running inline:
-
-1. `start_background_task(TaskKind::Agent { .. })` — the task cancel
-   token becomes the child's run cancellation (so `task_stop`, the
-   task picker, a cancel aimed at that detached sub-agent, and shutdown
-   reach the run. The parent's turn token explicitly does **not**,
-   because outliving the parent's turn is the point).
-2. `tokio::spawn` a driver that locks the `SharedAgent`, runs
-   `run_single_turn(task)`, then emits `SubAgentEnd` (unchanged
-   contract: emitted regardless of success) and
-   `events.finished(status, notice)` with the report (or error) as the
-   notice body.
-3. Return `Started`. The tool result is
-   `ToolDetails::Text { summary: "agent 2 started in background (task #5)" }`
-   with matching wire content plus the "you will be notified" hint.
-   The rich rendering needs no new variant — `SubAgentStart` already
-   creates the box, and the report reaches the transcript via the
-   notice.
-
-The pump's gating from the steering spec applies untouched: the
-background run emits `AgentStart(Sub n)` / `AgentEnd(Sub n)`, so the
-sub-agent shows as running in the picker, user submits to it are
-gated, and the footer counts it.
-
-### 4.6 Completion notices
-
-`TaskNotice` carries owner, task id, kind, label, terminal status, and
-a pre-rendered body (for bash: exit status, the final output tail
-truncated with the standard budgets and markers, and the spill path;
-for agents: the report verbatim, no file path).
-
-Drain points, both holding `&mut self` on the owning agent:
-
-1. **Top of `run_top_level_turn_inner`**, before the prompt append —
-   notices that arrived while the agent was idle land *before* the
-   user's new message, in arrival order.
-2. **In `execute_turn` after a tool batch completes**, before the
-   `continue` that triggers the next inference — notices that arrived
-   mid-run reach the model at the first *legal* opportunity.
-
-A notice is a user-role message, and the provider requires the user
-message following an assistant message with `tool_use` blocks to lead
-with the matching `tool_result` blocks. So a notice can never be
-inserted between a tool batch's dispatch and its results, and the
-earliest legal delivery is after the batch's last result. Delivery
-latency is therefore bounded by the running tool batch, and since a
-foreground tool call may run arbitrarily long, it is not bounded in
-wall-clock time. This is why the tool descriptions tell the model that
-a background task needs no waiting and that sleeping in the foreground
-only delays the notice.
-
-Each drained notice becomes one user-role wire message:
+The started result:
 
 ```
-<task-notification>Background task #3 finished: cargo build --release
-— exit code 0
+Started background task #3: cargo build --release
+Output is being written to <output path>, read it with read_file
+(supports offset/limit). You will be notified when it completes.
+```
+
+### 2.2 `agent` with `run_in_background: true`
+
+The sub-agent is built, announced with `SubAgentStart` and retained as in a
+blocking spawn. Then:
+
+1. A task of kind `Agent` is registered. Its cancel token is the run's
+   cancellation. `task_stop`, the picker's kill, a cancel aimed at that
+   sub-agent and shutdown reach the run. Cancelling the parent's turn does
+   not. Before the run starts, the notification its parent gets if the host
+   ends first is saved (section 7). A refused save fails the call.
+2. A detached driver runs the sub-agent's turn, saves the task
+   notification with the report or the error as its body, emits `SubAgentEnd`,
+   and finishes the task. A run that completed has exit code 0 and one that
+   failed has code 1. A run that shutdown stops gets neither the event nor a
+   task notification (section 5).
+3. The tool result reads `agent 2 started in background (task #5)` followed by
+   the "you will be notified" hint.
+
+The run emits `AgentStart(Sub n)` and `AgentEnd(Sub n)`, so the sub-agent
+shows as running and the footer counts it.
+
+### 2.3 `task_output` and `task_stop`
+
+Both may overlap a sequential tool call, so a read or a stop is never
+blocked by the work it controls.
+
+**`task_output { id, block = true, timeout = 30 }`**. With `block`, the call
+returns when the task reaches a terminal status or the timeout passes. A
+timeout is not an error. It is a normal "still running" report. Cancelling
+the turn cancels the wait, not the task. With `block: false` the call reports
+at once.
+
+For a bash task the result is the status, the rolling tail with the standard
+bash truncation budgets and markers, and the output path. For an agent task
+it is the status while the run is live and the final report once it is done.
+
+**`task_stop { id }`** cancels the task's token, waits up to 5 seconds for a
+terminal status and returns the final status and output tail. Stopping a
+finished task is not an error. Stopping an agent task cancels the run. The
+sub-agent stays retained and can still be prompted.
+
+**Authorization.** IDs are session-wide, so an agent can name a task it did
+not start. Both tools act only for the agent that owns the task, whether the
+caller is a parent, a child or a sibling. A task therefore becomes
+unreachable through the tools once its owner finishes. Its output stays
+readable in the owner's transcript, and the picker lists and kills tasks of
+any owner.
+
+The two refusals are error results: `No background task with id {id}.` and
+`Background task #{id} belongs to another agent.` Existence is not hidden.
+Both append the caller's own live task IDs so the model can correct itself.
+
+### 2.4 `bash` in the foreground
+
+A foreground call runs its command through the same wrapper and files, and
+waits for it. What differs from a background task:
+
+- **No task and no task record.** The command takes no task ID, has no registry
+  entry and no task events, and brings no task notification. Nothing is
+  written to the session store for it. The call's tool result is its account:
+  the output tail with the standard budgets and markers, and `Command failed
+  with exit code: N` for a nonzero status. Live output reaches the UI as
+  `ToolExecutionUpdate` snapshots.
+- **It ends with the host.** The host holds the write end of the wrapper's
+  stdin pipe for as long as the call lives. A watcher in the wrapper reads
+  that pipe and sends `SIGKILL` to the command's process group when it closes.
+  The system closes it when the host process ends, however it ends, so no
+  cleanup code has to run ([principles](principles.md), rule 5). The watcher
+  ignores `SIGTERM`, so a polite stop does not disarm it.
+- **Files.** They are removed as soon as the result is built. The output file
+  stays when the result names it: as the full output of a truncated tail, or
+  because a process the command left behind is still running and may write to
+  it, which the result says.
+- **Timeout.** `timeout` stops the command: `SIGTERM` to the process group,
+  then `SIGKILL` after 2 seconds.
+- **Cancel.** The agent drops a cancelled call's future. The drop stops the
+  command the same way, and the call gets the `bash: cancelled by user`
+  result. The pipe stays open through the 2 seconds. If the runtime ends
+  before they are over, the pipe closes and the group is killed at once.
+- **Descendants.** As for a task, a process the command left behind after it
+  ended keeps running, and so does one that left the process group.
+
+## 3. Task notifications
+
+For bash the notification body is the exit status, the final output tail and the
+output path. For an agent it is the report.
+
+```
+<task-notification>
+Background task #3 finished: cargo build --release — exit code 0
 <output tail, if any>
-Full output: <spill path></task-notification>
+Full output: <output path>
+</task-notification>
 ```
 
-appended to the transcript with the same `MessageStart` / `MessageEnd`
-emission the prompt path uses (lib.rs:651-675), so it renders and
-persists like any other message. Injecting user-role messages adjacent
-to tool results is the same wire shape the failed-turn re-prompt path
-already produces; providers accept consecutive user-role messages.
-There are three call sites for the drain, not two: the two prompt tops
-(`run_top_level_turn_inner` and `run_single_turn_inner`) each call it
-explicitly, and `execute_turn` covers the post-batch point for both
-paths. So a sub-agent that backgrounded a command hears about it inside
-its own run or at the start of its next continuation.
+A bash task whose process is gone without an exit status is reported lost,
+with the output its file holds:
 
-Notices arriving while the owner is idle (or surviving past a turn's
-end) do not wait for the user — they wake the owner (§4.7).
-
-### 4.7 Auto-wake
-
-The agent runtime cannot start its own turns — the binary owns turn
-driving (per-agent `turns: JoinSet` + `turn_cancels` gating from the
-steering spec). So wake is split between a new entry point on `Agent`
-and two triggers in the binary.
-
-**`Agent::wake(cancel) -> Result<WakeOutcome, TurnError>`** — drains
-the owner's notice queue; if nothing was drained (a concurrent prompt
-or wake already consumed it) it returns `WakeOutcome::Empty` without
-emitting any event. Otherwise it appends the drained notice messages
-(same `MessageStart`/`MessageEnd` emission as §4.6), brackets the run
-with `AgentStart`/`AgentEnd` like every other top-level run, and
-drives `execute_turn`. This is `continue_run` minus the
-ends-in-user-message precondition — the drained notices *are* the
-user-role messages that make the transcript valid for inference.
-
-**Binary triggers**, both funneling into the same spawn path user
-submits use (resolve handle → gate → insert `turn_cancels` → spawn
-onto `turns`):
-
-1. **On `TaskEnd`**: if the owner is idle (`!turn_cancels.contains` &&
-   `!pump.is_running(owner)`), spawn a wake turn on it. If the owner
-   is busy, do nothing — the mid-run drain point or trigger 2 picks
-   the notice up.
-2. **On turn completion** (the `JoinSet` arm): if
-   `registry.has_notices(id)` for the agent that just finished, spawn
-   a wake turn on it. This closes the race where a task finishes
-   after the last mid-run drain point but before the turn ends.
-3. **On `AgentEnd` with notices queued**: a sub-agent's initial run is
-   nested inside the parent's turn rather than driven through the
-   `JoinSet`, so trigger 2 never observes it ending. The bus arm
-   catches that run's `AgentEnd` and wakes the owner if
-   `registry.has_notices(owner)`.
-
-Because wake turns ride the normal machinery, everything composes
-without special cases: per-agent single-turn gating (a user submit
-and a wake can't overlap), Ctrl+C on the viewed agent cancels its
-wake turn, the editor disables while the viewed agent is woken, and a
-wake turn that itself backgrounds more tasks just continues the
-cycle. `WakeOutcome::Empty` makes the triggers idempotent — both may
-fire for the same notice and the second wake is a cheap no-op (the
-binary skips spawning when the gate is closed anyway).
-
-Sub-agent wakes need a live handle; owners always have one because
-task ownership is only acquired by a live run in this process
-(resumed, handle-less sub-agents cannot have started tasks).
-
-Wake turns apply the current run-config and count usage like any
-other turn. In print mode there is no trigger loop: the run ends when
-the main turn (and any blocking `task_output`s the model issued)
-complete, and remaining tasks are killed at exit. The tool
-descriptions say nothing about this. Which frontend is driving is a
-harness concern, and guidance the model can only act on in one mode
-is guidance it will misapply in the other.
-
-### 4.8 Cancellation & lifecycle
-
-Token hierarchy:
-
-- `TaskRegistry.root_cancel` — session-scoped, cancelled by the binary
-  on shutdown.
-- per-task child tokens — cancelled by `task_stop`, the picker's kill
-  action, a cancel aimed at a detached sub-agent, or the root.
-- The per-turn token never reaches task drivers. Cancelling a turn
-  cancels an in-flight blocking `task_output` (it selects on the turn
-  token) but not the tasks themselves.
-
-Shutdown: the binary calls `registry.shutdown()` before exit, then
-awaits driver quiescence with a short bounded grace (drivers respond
-promptly: `kill -9 -- -<pgid>` + reap, or a cancelled child run). The
-Ctrl+C quit-arming flow from the steering spec §4.5 extends naturally:
-"N agents / M tasks still running — press Ctrl+C again to quit". If aj
-is killed outright the process-group children leak — same class of
-limitation as today's foreground bash, recorded as known.
-
-Double-forking daemons escape the process group and our kill — known
-limitation, called out in the bash tool description so the model
-prefers proper foreground supervision (`run_in_background: true` on
-the supervisor) over `nohup`-style detachment.
-
-### 4.9 TUI
-
-- **Pump**: track `tasks: BTreeMap<TaskId, TaskInfo>` from `TaskStart`
-  / `TaskEnd` (`TaskInfo`: kind, label, owner, call_id, status).
-  Agent-backed tasks are *not* double-counted: the footer's agent
-  count already covers them via `running_agents`, so the task
-  indicator counts only `TaskKind::Bash` entries.
-- **Footer**: generalize `AgentActivity` / `render_agent_activity` to
-  `"2 agents, 1 task (alt+a)"` (each part shown only when nonzero).
-- **Picker**: the alt+a picker grows task entries beneath the agent
-  entries — status glyph, label (command tail), runtime. Selecting a
-  bash-task entry jumps the chat view to the owning agent's
-  transcript (the chat renders into terminal scrollback, so there is
-  no viewport to position on the cell; the live-tailing cell sits at
-  or near the bottom of the switched-to view). A kill action on the
-  selected task (`ctrl+k`) fires `registry.kill(id)`.
-- **Live output**: `TaskOutput { call_id, partial }` updates the
-  existing bash tool cell for the originating call in place — the cell
-  keeps live-tailing after `ToolExecutionEnd`, then freezes on
-  `TaskEnd` with a final status badge. No new box type; the
-  `ToolDetails::Bash.task_id` badge marks the cell as a background
-  task. (The full scrollback is always one keypress away via the spill
-  path shown in the cell.)
-- **Persistence/resume**: task events are transient. A resumed
-  transcript shows the persisted launch cell (started snapshot + task
-  id badge) and any persisted notices; the registry starts empty.
-
-### 4.10 Events
-
-New `AgentEvent` variants, all carrying the owner's `agent_id` plus
-`task_id` and the originating `call_id`:
-
-```rust
-TaskStart   { agent_id, task_id, call_id, kind, label },
-TaskOutput  { agent_id, task_id, call_id, partial: ToolDetails },
-TaskEnd     { agent_id, task_id, call_id, status, label },
+```
+Background task #3 lost: cargo build --release — status unknown. Its process
+is gone and left no exit status: it was killed, or the machine restarted.
 ```
 
-Transient (persistence ignores them); fully serializable so
-`aj --format json` ships them like every other variant. `TaskOutput`
-reuses `ToolDetails::Bash` snapshots — same shape `emit_update`
-produces today, so renderers share one code path.
+The owning agent drains its task notifications at two points, in arrival
+order:
 
----
+1. **At the top of a turn**, before a new prompt is appended. Task
+   notifications that arrived while the agent was idle come before the user's
+   message.
+2. **After a tool batch**, before the next inference.
 
-## 5. Edge cases
+The tag is added only when the message is projected for the model.
 
-- **Command dies right after launch** (typo, missing binary, bound
-  port) → the started result has already returned; `TaskEnd` fires
-  and the notice lands at the next drain point, which is after the
-  tool batch in flight returns (§4.6). No special casing.
-- **Task finishes between "started" result and first read** → the
-  read reports the terminal status; the notice still arrives. A
-  duplicated tail is a few tokens — the price of an unconditional
-  notice lifecycle.
-- **Chatty process outruns the rolling tail** → `task_output` and the
-  notice show the truncated tail with the standard markers plus the
-  spill path; the full output is on disk and `read_file` slices it
-  with `offset`/`limit`. Totals stay exact because `StreamState`
-  already tracks them.
-- **Blocking `task_output` timeout** → normal (non-error) status
-  report.
-- **Blocking `task_output` cancelled by Ctrl+C** → the tool call
-  resolves as the standard cancelled outcome; the task is unaffected.
-- **Unknown / already-terminal ids** → `is_error` outcome naming the
-  id as unknown, or an immediate normal report (terminal). Both error
-  outcomes list the caller's own live ids.
-- **An id owned by another agent** → `is_error` outcome saying the
-  task belongs to another agent (§4.4). The task is left alone,
-  `task_stop` never reaches the kill.
-- **Sub-agent-owned task finishes after the sub-agent's run ended** →
-  trigger 1 wakes the sub-agent in its own chat; the user inspects the
-  result by switching views. No escalation to Main.
-- **Task finishes while the owner's turn is ending** (after the last
-  mid-run drain point) → trigger 2 catches it on turn completion.
-- **Wake races a user submit** → per-agent gating serializes them;
-  whichever runs first drains the queue, and the loser's wake is an
-  `Empty` no-op (or the prompt path's drain delivers the notices
-  before the user's message).
-- **Turn aborts mid-batch with notices pending** → the drain point is
-  skipped with the rest of the loop; trigger 2 fires on the aborted
-  turn's completion, so the notices still wake the owner. If the user
-  cancelled the owner turn deliberately and also wants its detached
-  tasks gone, that's `task_stop` / the picker's kill. Cancelling an
-  owner turn does not imply killing its detached children. Cancelling
-  the detached sub-agent itself reaches its agent task.
-- **User quits with notices queued** → the TUI already showed
-  `TaskEnd`; shutdown kills the task tree; queued notices die with the
-  process (they are only persisted once drained into a transcript).
-- **Print mode** → works (registry defaults), but tasks pending when
-  the run ends are killed at exit and a notice queued after the final
-  turn is never drained. The tool descriptions stay silent on it, per
-  §4.7: the model cannot tell which frontend is driving, so mode-specific
-  advice would be misapplied in the other one.
-- **Notice content vs. context budget** → notice bodies use the same
-  per-stream budgets as bash results; a misbehaving firehose costs at
-  most one bash-result's worth of context per notice.
+A task notification cannot be delivered between a tool call and its result,
+because the provider requires the results to follow the call. The earliest
+delivery is after the batch's last result. A foreground tool call can run for
+any length of time, so the delay has no wall-clock bound. This is why the tool
+descriptions tell the model not to sleep in the foreground.
 
----
+Task notification bodies use the same budgets as bash results.
 
-## 6. Touch list
+## 4. Wake
 
-- `src/aj-agent/src/tool.rs`: `TaskId`, `TaskStatus`, `TaskKind`,
-  `TaskOutputSource`, `TaskRead`, `StartedTask`, `TaskEventSink`,
-  `SpawnMode`/`SpawnResult`; `ToolContext` methods;
-  `ToolDetails::Bash.task_id`.
-- `src/aj-agent/src/lib.rs`: `TaskRegistry` + notice queue;
-  `Agent::set_task_registry`; wrapper plumbing; background path in
-  `spawn_agent`; drain points in `run_top_level_turn_inner` /
-  `execute_turn`; `Agent::wake` + `WakeOutcome`; usage folding at
-  drain.
-- `src/aj-agent/src/events.rs`: `TaskStart` / `TaskOutput` / `TaskEnd`.
-- `src/aj-tools/src/tools/bash.rs`: `run_in_background` input, driver
-  extraction (the run loop becomes shared between foreground and
-  detached modes), `TaskOutputSource` impl over `StreamState`
-  (always-persisted spill), tool-description guidance.
-- `src/aj-tools/src/tools/agent.rs`: `run_in_background` input,
-  started outcome.
-- `src/aj-tools/src/tools/`: new `task.rs` with `task_output` and
-  `task_stop`.
-- `src/aj/src/modes/interactive.rs`: registry injection; wake
-  triggers (on `TaskEnd` in the bus arm, on turn completion in the
-  `JoinSet` arm); shutdown ordering (`registry.shutdown()` + grace
-  before `turns.shutdown()`); Ctrl+C arming text.
-- `src/aj/src/modes/interactive/event_pump.rs` + `components/footer.rs`
-  + `components/agent_picker.rs` + chat-view cell updates: §4.9.
+An agent cannot start its own turns. The host does, with the wake that also
+starts the turn for a user prompt ([queued messages](message-queue-spec.md),
+section 2). A wake on an agent with no task notification and no queued message
+does nothing and emits nothing. Otherwise it drains them and runs a turn.
 
----
+The host starts a wake turn on an idle agent at three points:
 
-## 7. Resolved decisions
+1. **On `TaskEnd`**, for the task's owner.
+2. **When a driven turn completes** and the agent has a task notification or a
+   queued message. This covers a task that ends after the turn's last drain
+   point, and a turn that aborted with task notifications pending. A turn that
+   failed with a fatal error is the exception: the next wake could fail the
+   same way, so the work waits for `continue` or the next prompt.
+3. **On `AgentEnd`** with a task notification or a queued message. A
+   sub-agent's initial run is nested in its parent's turn, so point 2 never
+   sees it end.
 
-1. **Sub-agent notices stay in the sub-agent's chat** and wake the
-   sub-agent there — no escalation to Main. The user inspects the
-   woken sub-agent's output by switching to its view; if its
-   conclusions matter to Main, the user (or a future report-to-parent
-   action) carries them over.
-2. **Auto-wake is in scope** (§4.7). Waking without polling is the
-   point of backgrounding; without it a notice can rot until the next
-   user prompt.
-3. **No dedicated full-screen task view this iteration.** The inline
-   live cell plus the always-persisted spill file is the v1
-   observation surface; we revisit after test-driving (a `ChatView`
-   active-id generalization to `Agent|Task` is the sketched path if
-   the inline cell proves too cramped).
-4. **No `task_list` tool.** Ids arrive in started results and notices,
-   an error outcome lists the caller's own live ids, and the alt+a
-   picker covers the human side. A list tool would mostly duplicate
-   what the model already holds in context. Note the listing is
-   caller-scoped, so it is a correction aid for the caller's own
-   tasks, not a session-wide inventory.
-5. **No multi-task wait.** Blocking `task_output` takes one id;
-   auto-wake covers "react to whichever finishes first", and print
-   mode waits serially. An any-of wait is the first thing to add back
-   if serial waiting proves painful in practice.
+A busy owner is left alone. Its running turn drains the notification after the
+next tool batch, or point 2 picks it up. Several triggers may fire for one
+notification. The losers are no-ops.
 
----
+A wake turn is an ordinary turn. It is serialized with the agent's other
+turns, the user can cancel it, and it shows in the spinner and footer. A
+sub-agent is woken in its own view, also after its run ended. Nothing is
+passed on to the main agent.
 
-## 8. Staged implementation plan
+A failed compaction holds automatic wakes of the main agent. See
+[compaction](compaction-spec.md), section 5.
 
-**Stage A — registry + protocol (aj-agent).** `TaskRegistry`, ids,
-statuses, notice queue, `ToolContext` additions, `Task*` events,
-`ToolDetails::Bash.task_id`, drain points (drain logic testable with a
-scripted provider: queue a notice, assert the injected
-`<task-notification>` user message and its
-`MessageStart`/`MessageEnd` pair). No tool uses it yet.
+Print mode has no wake loop. It ends with the main turn, a task
+notification that arrives after the final turn is never delivered, and tasks
+it started that still run are killed at exit. Print mode that resumes a
+session settles it as a host does and delivers the main agent's pending input and task
+notifications with its prompt. It does not watch the recorded tasks an earlier
+host left running: they stay recorded for the next host.
 
-**Stage B — background bash + output/stop + wake.** Extract the bash
-driver, implement `TaskOutputSource` over `StreamState`
-(always-persisted spill), the two `task_*` tools, `Agent::wake`, and
-the binary's two wake triggers. End-to-end: start, read, block, stop,
-notice-on-completion, idle owner wakes and reacts.
+## 5. Cancellation and shutdown
 
-**Stage C — background agent spawn.** `SpawnMode` plumbing, detached
-run driver, usage folding at drain, started outcome. Verify the
-steering-spec gating (submit-to-running-sub refused) holds for
-background initial runs, and that wake works for sub-agent owners in
-their own chats.
+A task's token is cancelled by `task_stop`, by the picker's kill, by a
+cancel aimed at a detached sub-agent, or through the session's root, which
+shutdown cancels. The turn token does not reach task drivers. Cancelling a
+turn cancels a blocking `task_output` and leaves the task running.
 
-**Stage D — TUI.** Pump task tracking, footer aggregate, picker
-entries + kill action, live cell updates off `TaskOutput`, frozen
-badge off `TaskEnd`.
+Shutdown is not a cancel. It closes the session for writing, stops the
+turns where they stand, cancels the root and waits up to 5 seconds for the
+drivers. Nothing is written after the close, so what it leaves is what a
+host that died leaves:
 
-**Stage E — lifecycle polish.** Shutdown ordering + grace, Ctrl+C
-arming text, print-mode kill-at-exit, tool-description notes
-(daemons, print mode, exits-when-ready pattern), docs touch-up.
+- A recorded bash task keeps running with its row. The next open takes it
+  up (section 7).
+- A foreground bash command ends with its tool call, as it does through
+  its pipe after a host that died (section 2.4). Its call stays without a
+  result, and the next open answers it as interrupted.
+- A bash task that is not recorded is killed.
+- A Code Mode cell ends. The loss it announced stays stored, and the next
+  open delivers it (section 7).
+- An agent run is stopped without a `SubAgentEnd`, a `TaskEnd` or a
+  task notification. The next open closes it as interrupted
+  ([sub-agent steering](subagent-steering-spec.md), section 4).
 
----
+A user's cancel (Ctrl+C on a turn, `task_stop`, the picker's kill) is not a
+shutdown. It writes its results as before: the aborted message, the
+cancelled tool results, the `killed` task notification.
 
-## 9. Testing
+The quit hint counts running work
+([sub-agent steering](subagent-steering-spec.md), section 3.3). The bash
+tasks among it keep running after the quit.
 
-- **aj-agent**: registry insert/read/kill/snapshot; notice drain at
-  both injection points (idle → prompt-start; mid-run → post-batch)
-  with the `<task-notification>` body shape and persistence-shaped
-  `MessageEnd`s; notice delivered even after an explicit terminal
-  read; `Agent::wake` drains-then-runs with full event bracketing and
-  returns `Empty` (no events) on an empty queue; task ids monotonic;
-  shutdown cancels all task tokens.
-- **aj-tools**: started result carries id + spill path; `task_output`
-  stateless reads (two reads → overlapping tails), truncation markers,
-  unknown id, block-until-terminal, timeout-not-error, turn-cancel;
-  `task_stop` kills the process group (no surviving grandchildren);
-  background ignores `timeout`; spill file readable via `read_file`
-  with `offset` while the task runs.
-- **agent tool**: background spawn returns started; report arrives as
-  a notice; `SubAgentEnd` still emitted; usage folded at drain;
-  stopping the task cancels the child's run.
-- **aj (pump/UI/wake)**: footer counts agents + bash tasks separately;
-  cell live-updates off `TaskOutput` and freezes on `TaskEnd`; picker
-  shows and kills tasks; resume renders persisted launch cells without
-  a registry; `TaskEnd` with an idle owner spawns a wake turn; a busy
-  owner defers to the turn-completion trigger; wake vs. user-submit
-  gating; Ctrl+C cancels a viewed wake turn.
+## 6. Frontend
+
+- **Footer.** `2 agents, 1 task (Alt+A)`, each part shown only when nonzero.
+  An agent-backed task counts as an agent, not as a task. A second part
+  counts task notifications pending for the viewed agent.
+- **Picker.** The agent picker lists tasks below the agents. Confirming a
+  task row opens a viewer with the command, a live status line and the
+  scrollable output. `ctrl+k` kills the selected running task in both.
+- **Live output.** `TaskOutput` updates the bash cell of the launching call
+  in place. The cell keeps tailing after `ToolExecutionEnd` and freezes on
+  `TaskEnd` with a status badge.
+- Frontends read tasks from the chat model, which is built from task events
+  and from the task table a `caught_up` frame carries. They do not read the
+  registry, so a remote client behaves the same.
+
+## 7. What an open does with recorded tasks
+
+Opening a session answers the tool calls the last host left without a
+result, then takes up its tasks. It does both for the main agent and for
+each sub-agent the selected branch shows, as that agent. It starts no turn.
+Every step leaves state the next open finishes from. One function does
+this for every open ([session storage](session-storage.md), "What an open
+settles").
+
+A `bash` call without a result that a task row names launched that task,
+and the host ended before it reported the launch. It is answered
+`The command is still running, as background task #3: ...`. Every other call
+without a result gets the generic "interrupted" result. That includes a
+foreground `bash` call, whose command ended with the host.
+
+**A task**, by its row:
+
+| The row's command | The task |
+|---|---|
+| left an exit file | finished unwatched: its notification is saved, the row removed |
+| is alive with the recorded start time | runs in the registry again under its ID, as if started by this host |
+| neither | is lost: a task notification saying so is saved, the row removed |
+
+A task notification saved at the open is delivered once, at the next turn's
+drain point or by the `continue` action.
+
+An open reads the end of a task's output file, as much as a rolling tail
+holds, so its cost does not depend on what the command has written. The byte
+total is the file's length. The lines before that part are not counted, so
+the truncation marker of such a task's notification counts bytes:
+`[Showing last 48.0KB of 2048.0MB of stdout. Full output at <path>]`.
+
+A save of a task's end that fails changes nothing, for every kind of task.
+The driver tries three more times over 7 seconds, then lets go of the task
+and leaves what the store holds for the next open: a bash task's row, or
+the loss an agent run or a cell announced. Nothing is delivered from
+memory.
+
+**Agent runs and Code Mode cells** live in the host's memory and end with it.
+Neither has a row. Each announces its loss instead: when a background agent
+run starts, and when a cell yields and becomes a task, a task notification
+that says the work was lost is saved among its owner's pending work, before
+the tool call is answered. A refused save fails the spawn, and ends the cell.
+The task's notification is saved under the same ID and replaces the
+announcement, so the store holds one notification for the task at any time:
+the loss until the task's end is saved, the completion from then on. The next
+open delivers whichever it finds, once, with the owner's other pending work.
+
+For an agent run the announcement says the run was interrupted and can be
+continued by sending the sub-agent a message. The next open also closes the
+run ([sub-agent steering](subagent-steering-spec.md), section 4). For a
+cell it says the cell was lost and its state is gone:
+
+```
+Code Mode cell <id> was lost: the session ended while it was open. Its
+state is gone, with any result that was not collected. Tool calls it had
+made may or may not have run.
+```
+
+A cell that never yielded belongs to its `exec` call, which the open
+answers as interrupted.
+
+A head switch is refused while any task runs or a task notification is
+undelivered ([remote control](remote-control-spec.md), section 4), so a switch
+takes up and settles nothing.

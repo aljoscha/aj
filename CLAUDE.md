@@ -14,9 +14,9 @@ The workspace is split into focused crates under `src/`:
   and background task registry.
 - `aj-wire` owns remote-control models and compatibility codecs. It contains no
   HTTP or other I/O types.
-- `aj-session` owns the on-disk session format, conversation log, and replay.
-  User-facing surfaces say "session". A `ConversationLog` contains threads and
-  branches internally, so both terms are intentional.
+- `aj-session` owns the on-disk session format, the session log, and replay.
+  A `SessionLog` holds threads, and a branch is a thread plus the ones it
+  continues from. `docs/principles.md` defines the words.
 - `aj-tools` owns builtin tool implementations.
 - `aj-app` owns frontend-independent application behavior, session composition,
   the turn driver, state reduction, print mode, and settings. It has no TUI
@@ -26,9 +26,10 @@ The workspace is split into focused crates under `src/`:
 - `aj` owns the binary, interactive UI, and wiring between `aj-app` and vaxis.
 - `anthropic-sdk` and `openai-sdk` are thin clients used by provider adapters.
 
-Frontends subscribe to the typed `AgentEvent` bus. Persistence is another
-subscriber owned with the `ConversationLog` by `aj_app::session::SessionCore`.
-The lower-level agent runtime does not own the log.
+Frontends subscribe to the typed `AgentEvent` bus. The bus commits an event
+through the session's `Journal` before it publishes it, so no subscriber sees
+state that is not stored. `aj_app::session::SessionCore` owns the journal and
+the `SessionLog`. The lower-level agent runtime does not own the log.
 
 Keep behavior at its natural boundary. A library exposes a typed error when a
 caller branches on failure. Render-only seams use the named opaque `BoxError`.
@@ -62,6 +63,12 @@ adapters.
 Clients try a feature and show a clear notice if the server lacks it, rather
 than hiding or disabling features up front. We keep every deployment current,
 so that is enough.
+
+## Principles
+
+`docs/principles.md` states what state is durable, who owns it and what a
+client sees. Read it before changing how state is stored, recovered or shown.
+A change that breaks one of its rules changes that page first.
 
 ## Runtime contracts
 

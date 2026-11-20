@@ -64,7 +64,7 @@ A handful of keys worth knowing:
 
 ## Sessions
 
-Conversations are saved as resumable sessions, scoped to the project directory
+Sessions are saved and can be resumed, scoped to the project directory
 you run `aj` in:
 
 ```bash
@@ -72,9 +72,20 @@ aj list-sessions       # list this project's sessions
 aj version             # print the cargo version and git revision of this build
 aj continue            # resume the most recent session that is not archived
 aj continue <id>       # resume a specific session, archived or not
+aj migrate-session <id> # explicitly import a closed JSONL session into SQLite
+aj migrate-session --all --dry-run # check imports across every project
+aj migrate-session --all # import all legacy JSONL sessions, retaining sources
+aj export-session <id> <dir> # write a session as JSONL for interchange
+aj import-session <file.jsonl> # import a JSONL session into SQLite
+aj doctor # check the SQLite session store's integrity
 ```
 
 You can also resume a session or start a fresh one from the command palette.
+
+Sessions share a global SQLite store with project-scoped access. An existing
+JSONL session is imported when it is resumed or explicitly migrated. The import
+preserves its identities and leaves the original files
+untouched. See [session storage](docs/session-storage.md) for guarantees and limits.
 
 The resume picker and prompt-history search (`Ctrl+R`) match case-insensitive
 literal terms. `editor footer` requires both substrings, in any order, and
@@ -85,7 +96,7 @@ Other pickers, including the command palette, use fuzzy matching.
 
 Press `Tab` to focus the transcript and move through earlier user messages.
 Press `b` on a focused message to edit it and continue from that point,
-creating a new branch while preserving the existing conversation. Open
+creating a new branch while preserving the existing branch. Open
 **session tree** from the command palette to view the branches in the current
 session and switch between them.
 
@@ -143,9 +154,9 @@ compaction check, even during a running turn. A compaction already underway
 keeps its settings. Compaction uses the usual compaction flow and the same
 run stays active. If compaction fails, the original history is preserved and
 continuation stops, including overflow recovery, with no automatic retry after
-the failure. Queued messages and task notices wait until you explicitly start
-work again. The failure remains in the transcript after
-reconnecting or reopening the session, without becoming model input.
+the failure. Queued messages and task notifications wait until you explicitly
+start work again. The failure remains in the transcript after reconnecting or
+reopening the session, without becoming model input.
 Post-turn threshold triggering is unchanged: interactive mode
 checks the threshold, while print mode does not.
 

@@ -1,570 +1,221 @@
-# Sub-agent steering — spec
-
-Turn the sub-agent view from **observe-only** into a fully interactive
-view: when the user switches the chat view to a sub-agent and submits a
-prompt, the prompt goes to *that* sub-agent, and its turn runs
-concurrently with whatever the main agent (or other sub-agents) are
-doing. The sub-agent view becomes the main view in every respect except
-which agent it is wired to.
-
-The sub-agent rendering, picker, footer and box machinery this builds
-on were designed observe-only; steering is added on top of them
-unchanged.
-
-This document is the implementation contract. It is split into stages
-at the end for orchestration.
-
----
-
-## 1. Background: what happens today
-
-### 1.1 Sub-agents are ephemeral
-
-`SessionContextWrapper::spawn_agent` (`src/aj-agent/src/lib.rs`) builds
-a fresh `Agent` on the stack, shares the parent's bus + a child
-cancellation token, runs it to completion via `run_single_turn`, emits
-`SubAgentEnd`, and returns `SpawnedAgent { agent_id,
-report }`. The `Agent` is a local: once `spawn_agent` returns it is
-**dropped**. Nothing — not `SessionState`, not the parent, not the
-binary — retains a handle. The only survivors are the report string
-(handed to the parent model as the `agent` tool result) and the
-persisted sub-thread on disk.
-
-The whole sub-agent run happens *inside* the parent's tool call:
-`execute_turn` → `execute_tool` → `spawn_agent().await`. While it runs,
-the parent agent is suspended at that `.await`, and the binary's spawned
-turn task holds the main agent's `TokioMutex` the entire time.
-
-### 1.2 The binary drives exactly one turn at a time
-
-`src/aj/src/modes/interactive.rs`:
-
-- One `agent: Arc<TokioMutex<Agent>>` (the main agent).
-- `running_task: Option<JoinHandle<Result<(), TurnError>>>` holds the
-  single in-flight turn; `current_turn_cancel: Option<CancellationToken>`
-  is the binary's clone of that turn's cancel token.
-- The submit handler (interactive.rs:1232-1337) ignores submits while
-  `running_task.is_some()`, otherwise spawns a task that locks the agent
-  and calls `a.prompt(text, turn_cancel)`. It **always** targets the
-  main agent — `pump.active_view(...)` is never consulted.
-- The editor's submit is disabled globally while a turn runs
-  (`set_editor_submit_enabled(false)`).
-- Ctrl+C (interactive.rs:809-822) cancels the single turn if one runs,
-  else exits.
-- The `select!` (interactive.rs:664-720) awaits the single
-  `running_task` via a `task_done` future that pends forever when no
-  task is running.
-
-### 1.3 The pump already tracks "who is running", with caveats
-
-`src/aj/src/modes/interactive/event_pump.rs`:
-
-- `running_agents: HashSet<AgentId>` is driven by `AgentStart` /
-  `AgentEnd` and gates the single global loader/spinner (start on
-  empty→nonempty, stop on nonempty→empty).
-- `running_sub_agents: usize` is driven by `SubAgentStart` /
-  `SubAgentEnd` and gates the footer `N agent(s) (alt+a)` indicator.
-- Two heuristics exist purely because today sub-agents only ever run
-  *inside* the main turn: `AgentStart{Main}` clears the running set
-  (resync), and `AgentEnd{Main}` is treated as the authoritative "all
-  activity stopped" and zeroes both `running_agents` and
-  `running_sub_agents`.
-
-Those two heuristics are **wrong** once a sub-agent can run
-independently of the main turn (a main turn can start or end while a
-sub-agent's own turn is still running).
-
-### 1.4 Persistence already chains continuations
-
-`src/aj-session/src/listener.rs`: for `AgentId::Sub(n)` the listener
-anchors a `MessageEnd` on `latest_leaf(subagent(n))` if that thread has
-entries, falling back to the `SubAgentStart` anchor only for the *first*
-write. A re-prompt emits no new `SubAgentStart`, so its messages chain
-onto the existing sub-thread leaf automatically — exactly the "keep
-adding to the same on-disk sub-thread" behavior we want. No listener
-change is required for continuation.
-
-### 1.5 Concurrency model already in place
-
-`EventBus::emit` (`src/aj-agent/src/bus.rs`) snapshots the listener list
-under a short lock, releases it, then awaits each listener. Concurrent
-emits from two agent tasks run their listener futures concurrently; the
-persistence listener serializes real writes behind the log's
-`TokioMutex`, and the channel-forward listener does a lock-free
-`mpsc::send`. The binary consumes that single mpsc on its main loop, so
-**all** UI/pump mutation stays single-threaded and serialized; the only
-true concurrency is between agent turn tasks on distinct `Agent`
-mutexes. This is the property that makes concurrent turns tractable.
-
----
-
-## 2. Goals / non-goals
-
-**Goals**
-
-1. Submitting in the sub-agent view sends the prompt to that sub-agent
-   and runs its turn.
-2. Main and sub-agent turns (and multiple sub-agent turns) run
-   **concurrently**; each agent still runs at most one turn at a time.
-3. Continuations append to the sub-agent's existing on-disk sub-thread.
-4. The working **spinner is scoped to the viewed agent** — it shows the
-   activity of whichever agent the chat view is on, not global activity.
-5. The architecture is a clean foundation for the future
-   **background-spawn** flow (main spawns a sub-agent, keeps going, and
-   is later notified of the result).
-
-**Non-goals (this iteration)**
-
-- **Option A semantics**: a sub-agent continuation is an independent
-  conversation. The parent model is **not** automatically updated with
-  anything the sub-agent produces after its original `agent` tool call
-  returned. (A future "send report to parent" action is out of scope.)
-- **Re-prompting resumed sub-agents**: only sub-agents spawned in the
-  *current process* are re-promptable (they have a live handle).
-  Sub-agents reconstructed when resuming a session render but are not
-  re-promptable until we add transcript rehydration (§8, open question).
-- **Non-blocking spawn**: the initial `agent` tool call still blocks the
-  parent and returns the first report inline (unchanged contract). Only
-  *user-initiated continuations* are concurrent. Background spawn is
-  designed-for but not built (§7).
-- Nested sub-agents (still one level; the `agent` tool stays filtered
-  out of sub-agent toolsets).
-
----
-
-## 3. Locked decisions
-
-1. **Option A.** Continuations are side conversations; the parent model
-   is untouched. The editor marker stays `agent N` (already shipped) —
-   it now means "you are talking to agent N", which is accurate.
-2. **Per-agent single turn, cross-agent concurrent.** Each `Agent` has
-   its own `TokioMutex`; a turn locks only its own agent. Two turns on
-   the same agent can never overlap (one transcript, `&mut self`).
-3. **Retain sub-agents in a shared registry.** Sub-agents become
-   long-lived `Arc<TokioMutex<Agent>>` held in a registry shared between
-   the main `Agent` (which inserts on spawn) and the binary (which
-   resolves them to drive continuations).
-4. **The pump's running set becomes the single source of truth** for
-   "what is running", driven by `AgentStart`/`AgentEnd` per `AgentId`.
-   The per-view spinner, the aggregate footer count, and per-box status
-   all derive from it. The Main-authoritative-clear and
-   AgentStart{Main}-clear heuristics are removed.
-5. **UI stays single-threaded.** Concurrency lives only in agent turn
-   tasks; everything reaches the UI through the existing serialized
-   mpsc event channel.
-
----
-
-## 4. Design
-
-### 4.1 Sub-agent registry (`aj-agent`)
-
-Introduce a small, cheaply-cloneable shared registry in `aj-agent`:
-
-```rust
-/// A live, re-promptable agent handle.
-pub type SharedAgent = Arc<tokio::sync::Mutex<Agent>>;
-
-/// Registry of retained sub-agents, keyed by their `Sub(n)` index.
-/// Cloneable; all clones share one map. The inner `std::sync::Mutex`
-/// is held only to get/insert a handle (never across `.await`).
-#[derive(Clone, Default)]
-pub struct SubAgentRegistry {
-    inner: Arc<std::sync::Mutex<BTreeMap<usize, SharedAgent>>>,
-}
-
-impl SubAgentRegistry {
-    pub fn insert(&self, n: usize, agent: SharedAgent);
-    pub fn get(&self, n: usize) -> Option<SharedAgent>;
-    pub fn ids(&self) -> Vec<usize>;
-}
-```
-
-Wiring:
-
-- `Agent` gains a `sub_agent_registry: SubAgentRegistry` field
-  (default-empty) plus `set_sub_agent_registry(&mut self, reg)`. Only
-  the main agent ever needs one set; sub-agents can't spawn (the `agent`
-  tool is filtered out), so they never read it.
-- `SessionContextWrapper` (built in `Agent::execute_tool`,
-  lib.rs:1479-1496) gets a `sub_agent_registry: SubAgentRegistry` field,
-  cloned from `self.sub_agent_registry`.
-- `spawn_agent` (lib.rs:1625-1735): after building `sub_agent` and
-  setting its id/bus/cancellation as today, **retain then run**:
-
-  ```rust
-  let shared: SharedAgent = Arc::new(TokioMutex::new(sub_agent));
-  self.sub_agent_registry.insert(agent_id, Arc::clone(&shared));
-  let result = shared.lock().await.run_single_turn(task).await;
-  // ... emit SubAgentEnd, return SpawnedAgent as today.
-  ```
-
-  The handle stays in the registry after the initial run. The parent's
-  tool result is still the first report — the `agent` tool contract is
-  unchanged.
-
-Notes:
-- The registry is injected by the **binary** so the binary and the main
-  agent share one map. Callers that never set one (print mode, tests)
-  get the default-empty registry; sub-agents are simply retained for the
-  lifetime of the main `Agent` and dropped with it — harmless for
-  one-shot runs.
-- Flat keyspace: `Sub(n)` is global per session and sub-agents don't
-  nest, so a `BTreeMap<usize, _>` suffices.
-
-### 4.2 Resolving and driving any agent (binary)
-
-Replace the single-turn machinery in `InteractiveMode::run` with a
-per-agent one:
-
-- Keep `agent: Arc<TokioMutex<Agent>>` for the main agent. Add the
-  shared `registry: SubAgentRegistry` (the same instance set on the main
-  agent). A small resolver:
-
-  ```rust
-  fn resolve_agent(
-      id: AgentId,
-      main: &Arc<TokioMutex<Agent>>,
-      registry: &SubAgentRegistry,
-  ) -> Option<SharedAgent> {
-      match id {
-          AgentId::Main => Some(Arc::clone(main)),
-          AgentId::Sub(n) => registry.get(n),
-      }
-  }
-  ```
-
-- Replace `running_task` / `current_turn_cancel` with:
-  - `turns: JoinSet<(AgentId, Result<(), TurnError>)>` — the set of
-    in-flight turn tasks. `JoinSet` keeps panic detection (`join_next`
-    yields `Err(JoinError)`), gives completion-as-they-finish, and
-    `abort_all` on shutdown.
-  - `turn_cancels: HashMap<AgentId, CancellationToken>` — the binary's
-    clone of each in-flight turn's cancel token. Its key set is exactly
-    "agents the binary is currently driving".
-
-- The `select!` arm that awaited `task_done` now awaits the `JoinSet`:
-
-  ```rust
-  joined = join_next_or_pending(&mut turns) => {
-      match joined {
-          Ok((id, result)) => {
-              turn_cancels.remove(&id);
-              pump.mark_idle(&mut tui, id);     // reconcile (idempotent)
-              // Main-turn completion bounds every *nested* initial
-              // spawn it started: those sub-agents are done (or their
-              // run was dropped on cancel). Drain any still marked
-              // running that the binary is NOT independently driving
-              // (∉ turn_cancels) so a leaked sub-agent can't pin the
-              // footer/spinner. Independent continuations are in
-              // turn_cancels and survive. This is the concurrency-safe
-              // replacement for the old "Main AgentEnd drains all subs".
-              if id == AgentId::Main {
-                  for sub in pump.running_agents() {
-                      if matches!(sub, AgentId::Sub(_)) && !turn_cancels.contains_key(&sub) {
-                          pump.mark_idle(&mut tui, sub);
-                      }
-                  }
-              }
-              sync_editor_enabled(&mut tui, &pump, &turn_cancels, active_view);
-              match result {
-                  Ok(()) => {}
-                  Err(TurnError::Aborted) => notice "turn cancelled" (scoped to id),
-                  Err(TurnError::Recoverable(e)) => Error event for id,
-                  Err(TurnError::Fatal(e)) => { run_result = Err(e); break; }
-              }
-          }
-          Err(join_err) => { run_result = Err(panicked); break; }
-      }
-  }
-  ```
-
-  `join_next_or_pending` pends forever when the set is empty (mirrors the
-  current `task_done` helper). The Main-completion drain above is where
-  the old CPU-pegging leak fix (a dropped `AgentEnd(Sub n)` leaving the
-  loader's animation pump alive) now lives — concurrency-safe because it
-  only drains sub-agents the binary isn't driving.
-
-### 4.3 Submit routing
-
-`handle_submit` in `src/aj/src/interactive.rs` sends editor text through
-`Control` as `Command::Prompt`, targeting the viewed agent. The host starts
-a turn if that agent is idle or queues the text as a follow-up if it is
-busy. A target without a live handle produces a notice. Message events
-carry the target's id so rendering and persistence route to that agent.
-
-Palette actions are dispatched separately from submitted text. Their scope
-depends on the action. Model and thinking selectors use
-`editing_target`: the viewed agent normally, or Main's pending branch draft
-when a branch anchor is armed. Session actions such as compaction keep
-their session scope. The catalog lives in `src/aj-app/src/commands.rs`.
-
-### 4.4 Editor submission while busy
-
-The editor remains available while the viewed agent is busy. Submitted text
-appears in that agent's pending-message box and is delivered as a follow-up
-when its turn ends. See `message-queue-spec.md` for steering and queue
-editing gestures.
-
-### 4.5 Cancellation (Ctrl+C)
-
-Ctrl+C acts on **the agent you are viewing** — consistent with the
-per-view spinner, editor-enable, and submit routing. Generalize the
-Ctrl+C arm (interactive.rs:809-822). Priority order:
-
-1. Overlay up → close (unchanged).
-2. Login dialog up → cancel login (unchanged).
-3. **Viewed agent has a running turn** → cancel just that turn. If the
-   binary is driving it (`turn_cancels` contains the active view), fire
-   that token. If instead the viewed agent is a sub-agent running its
-   *initial* spawn (running per `pump.is_running` but not in
-   `turn_cancels`), route by ownership. A detached run is owned by its
-   background agent task, so cancel that task's token. A foreground spawn
-   is owned by the main turn, so fire `turn_cancels[Main]` and let the child
-   token cascade.
-4. **Viewed agent idle, but some other agent is running** → do **not**
-   cancel anything. Show `N agent(s) still running — press Ctrl+C again
-   to quit` and arm a transient `quit_armed` flag. A second Ctrl+C while
-   still in this state exits; shutdown's `turns.abort_all()` tears the
-   background turns down then. `quit_armed` is cleared on any other input
-   event or state change. (Background sub-agents are thus never
-   cancelled by a Ctrl+C aimed at a different view — to cancel one, switch
-   to its view and Ctrl+C there.)
-5. **Viewed agent idle, nothing running anywhere** → exit immediately
-   (today's behavior).
-
-`Ctrl+D` exits unconditionally (unchanged). On shutdown, `turns
-.abort_all()` replaces the single `running_task.abort()`.
-
-### 4.6 Per-view spinner, footer, and status (pump)
-
-Make `running_agents: HashSet<AgentId>` the single source of truth for
-"what is running", driven by `AgentStart`/`AgentEnd` per `AgentId`, and
-derive three things from it.
-
-`AgentStart{id}` inserts `id`; `AgentEnd{id}` removes it. **Drop** the
-two heuristics in `handle` that only held under the old nested model:
-the `AgentStart{Main}` resync-clear and the `AgentEnd{Main}`
-authoritative drain. Under concurrency a main turn can legitimately
-start or end while a sub-agent turn runs, so neither may touch other
-agents' entries.
-
-**Spinner — scoped to the viewed agent.** The single `Loader` in the
-`Status` slot (idx 2, between Chat and Editor) reflects *the agent
-currently being viewed*, not global activity: active iff `active_view ∈
-running_agents`. Replace the old empty↔nonempty start/stop calls with a
-single recompute:
-
-```rust
-fn sync_loader(&self, tui: &mut Tui) {
-    let active = self.active_view(tui);          // reads ChatView::active()
-    let should_run = self.running_agents.contains(&active);
-    self.with_loader(tui, |l| match (should_run, l.is_active()) {
-        (true, false) => l.start(),
-        (false, true) => l.stop(),
-        _ => {}                                   // no-op: don't reset the animation
-    });
-}
-```
-
-Call `sync_loader` after every `AgentStart`/`AgentEnd` and from
-`set_active_view` (so switching views immediately reflects the new
-agent's state). The `(_, _) => {}` arm matters: `Loader::start` resets
-the frame clock, so we only call it on a genuine idle→running edge to
-avoid animation jitter on unrelated events.
-
-This per-view scoping also subsumes the deleted `AgentEnd{Main}`
-heuristic for the spinner: when viewing Main the spinner is on iff Main
-is running, so a leaked sub-agent entry can no longer pin the Main
-view's spinner.
-
-**Footer — aggregate.** The `N agent(s) (alt+a)` indicator stays an
-aggregate so the user still sees background activity while viewing an
-idle agent. Derive it from the set: `running = running_agents.iter()
-.filter(|a| matches!(a, Sub(_))).count()`; show when `> 0`. Delete the
-separate `running_sub_agents` counter and its `SubAgentStart`/
-`SubAgentEnd` increments. (The initial spawn already emits
-`AgentStart(Sub n)` inside `run_single_turn`, so the count covers both
-initial runs and continuations.)
-
-**Per-box status.** Drive `SubAgentBox` status from `AgentStart(Sub n)`
-→ `Running` and `AgentEnd(Sub n)` → `Done` — this is what flips a
-re-prompted box back to `Running` then `Done`, since continuations emit
-no `SubAgentStart`/`SubAgentEnd`. `SubAgentStart` still creates the box
-+ persistence anchor + initial `Running`; `SubAgentEnd` still carries
-the report.
-
-Add three accessors/mutators:
-- `pub fn is_running(&self, id: AgentId) -> bool` — membership in the set.
-- `pub fn running_agents(&self) -> Vec<AgentId>` — snapshot, so the
-  binary can reconcile leaked nested subs on Main-turn completion (§4.2).
-- `pub fn mark_idle(&mut self, tui, id)` — removes `id` from the set,
-  sets a `Sub(n)` box to `Done`, then `sync_loader` + `sync_agent_indicator`.
-  Idempotent w.r.t. the `AgentEnd` the pump already processed.
-
-The pump keeps `running_agents` as the **literal** truth from
-`AgentStart`/`AgentEnd`; it does not itself special-case Main. Leak
-protection (a dropped `AgentEnd(Sub n)` from a cancelled initial spawn)
-is the binary's job via the Main-completion drain in §4.2 — the binary
-is the only place that knows which running subs are independent
-continuations (in `turn_cancels`) versus nested initial spawns. For the
-spinner specifically, per-view scoping already prevents a leaked sub
-from pinning the Main view.
-
-### 4.7 Persistence
-
-No listener change for continuations (§1.4): a re-prompt chains onto
-`latest_leaf(subagent(n))`. Add a test (§9) that re-prompting a
-sub-agent appends to its existing sub-thread (the new user message's
-parent is the prior sub-thread leaf, not the parent-anchor).
-
----
+# Sub-agent steering
+
+A sub-agent's view is interactive. When the chat view shows a sub-agent, a
+submitted prompt goes to that sub-agent and its turn runs concurrently with
+the main agent and with other sub-agents. The view behaves like the main view
+in every respect except which agent it is wired to.
+
+## 1. Contract
+
+1. **Each agent runs at most one turn at a time. Different agents run
+   concurrently.**
+2. **Sub-agents are retained.** A sub-agent outlives the tool call that
+   spawned it, in both spawn modes, and the process that ran it. The host
+   resolves it by its `Sub(n)` ID to drive later turns. IDs are minted once
+   per session and never reused.
+3. **A continuation appends to the sub-agent's stored thread.** It
+   starts no new sub-agent run.
+4. **The parent hears from a sub-agent once.** A blocking `agent` call
+   returns one report, and a background spawn delivers one task notification.
+   Turns the sub-agent runs after that are a side exchange with the user.
+   Nothing they produce reaches the parent model.
+5. **One set of running agents drives all status display.** `AgentStart`
+   adds an agent and `AgentEnd` removes it. The spinner, the footer count and
+   the box status derive from it.
+6. **The UI is single-threaded.** Concurrency lives in the agent turn tasks.
+   Everything reaches a frontend through one ordered event stream.
+7. **A sub-agent is its stored thread.** Any sub-agent whose run the
+   selected branch shows can be prompted, by whoever can switch to it,
+   whichever process spawned it. See section 4.
+8. **Sub-agents do not nest.** The `agent` tool is filtered out of a
+   sub-agent's tools.
+9. **An agent is busy** when the host drives a turn on it or when it is in
+   the running set. The first covers the gap between starting a turn and its
+   `AgentStart`. The second covers a foreground sub-agent's initial run,
+   which is nested in the main turn and not driven by the host.
+
+## 2. Foreground assignments
+
+A blocking spawn creates a foreground assignment: the parent's tool call
+waits for one terminal report from the child.
+
+- The assignment outlives an interrupted turn. If the child's initial turn is
+  cancelled, the parent keeps waiting, and the user can continue the child
+  with ordinary prompts. The first turn that ends without being cancelled
+  delivers the report, or the error, to the parent.
+- Killing the assignment ends it. The parent's tool call fails with
+  `sub-agent assignment cancelled by user`.
+- Dropping the parent's tool call, as when the parent's turn is cancelled,
+  ends the assignment and any continuation of the child the host is driving.
+
+`AgentStart` and `AgentEnd` carry `assignment_pending`, so a frontend knows
+whether the parent still waits.
+
+A background spawn has no assignment. Its run belongs to a background task.
+See [background tasks](background-tasks-spec.md).
+
+## 3. Frontend behaviour
+
+### 3.1 Submit routing
+
+A submitted prompt is addressed to the viewed agent. The host saves it as
+that agent's pending input, in the sub-agent's own thread, before it
+answers. If the agent is idle the host then starts a turn that takes it, and
+if it is busy the text waits as a follow-up
+([queued messages](message-queue-spec.md), section 2). Message events carry
+the target's ID, so rendering and storage route to that agent.
+
+Palette actions are not submitted text, and their scope depends on the
+action. Model and thinking selectors act on the viewed agent, or on the main
+agent's pending branch draft when a branch anchor is armed. Session actions
+such as compaction keep their session scope.
+
+### 3.2 Editor while busy
+
+The editor stays available while the viewed agent is busy. Submitted text
+appears in that agent's pending-message box. See
+[queued messages](message-queue-spec.md) for steering and queue editing.
+
+### 3.3 Ctrl+C
+
+Ctrl+C acts on the viewed agent.
+
+1. An overlay is open: close it.
+2. The viewed agent is busy: pull its queued message back into the editor,
+   then cancel that agent. The host routes the cancel to
+   whatever owns the turn:
+   - a turn the host drives: that turn's token.
+   - a foreground sub-agent in its initial run: only that turn is
+     interrupted. The assignment stays, and the parent keeps waiting.
+   - a detached background sub-agent: its background task is killed.
+3. The viewed agent is idle: the first Ctrl+C arms the quit sequence and
+   shows a hint, and a second Ctrl+C quits. When other agents or tasks are
+   running the hint names them: `N agents / M tasks still running`. Nothing
+   is cancelled by arming. A turn that starts while the sequence is armed
+   disarms it.
+
+An agent in another view is never cancelled by Ctrl+C. To cancel it, switch
+to its view. The agent picker's `ctrl+k` kills a running or pending sub-agent
+assignment outright.
+
+### 3.4 Spinner, footer and box status
+
+**Spinner.** The spinner shows the viewed agent's activity: it runs when the
+viewed agent is in the running set or is compacting. Switching views updates
+it at once.
+
+**Footer.** The footer counts running sub-agents across all views, so the
+user sees background activity while viewing an idle agent.
+
+**Box.** The box in the parent's transcript stands for the delegated run.
+`SubAgentStart` creates it as `Running`, and `SubAgentEnd` concludes it with
+the report. That end is stored, so a reopened or re-attached view shows the
+same conclusion. Until it arrives, `AgentStart(Sub n)` and `AgentEnd(Sub n)`
+flip the box between `Running` and `Done`, except while its assignment is
+pending. After `SubAgentEnd` nothing changes the box. The sub-agent's own
+view and the footer count still show it busy.
+
+## 4. Reopened sessions and head switches
+
+The live agent of a sub-agent exists in one process. Its thread is in
+the session, and a host that holds no live agent for a sub-agent builds one
+from that thread when a prompt, a steer or a settings change names
+it. So a sub-agent is prompted after a reopen as before it.
+
+**What is rebuilt.** The transcript is the run's model context. The model,
+thinking effort, speed and verbosity are the spawn record's with the changes
+recorded since, and a model the host cannot resolve falls back to the
+current one of the tool that spawned it. The system prompt, the session
+environment, the task registry and the queues are the session's. The cache
+key is `<session>:sub:<n>`. The tools and the prompt suffix are the ones the
+spawning tool (`agent` or `oracle`) gives a new sub-agent under the
+configuration at the time it is built. They are derived once, then, not
+each turn as the main agent's are, and again only for a sub-agent whose
+model the user changes.
+
+**What is not.** The todo list. What the parent held only in memory when it
+spawned the sub-agent: `image_block` and `disabled_tools` are read from the
+current configuration instead. The foreground assignment: the parent's tool
+call was answered or its turn is over, so the rebuilt sub-agent reports to
+nobody. Live Code Mode cells, as for the main agent.
+
+**At an open.** Each sub-agent of the selected branch that has a recorded
+command, pending work or an interrupted turn an earlier process left is
+built at once and gets what the main agent gets: its
+unanswered tool calls are answered, its recorded tasks taken up, its pending
+input and undelivered task notifications put back. No turn starts.
+Every other sub-agent is built when it is first used.
+
+**An interrupted turn.** What the host does with a turn its last host left
+unfinished is one policy, the same for every agent: the turn waits for the
+user's `continue`. That holds for the main agent and for a sub-agent whose
+turn after its run was cut short, a continuation the user had started. Such
+a sub-agent's turn stays stored as running, the first client of the open
+gets a notice naming it, and `continue` resumes it together with the main
+agent's. A message to the sub-agent continues it as well.
+
+A sub-agent's run, its first turn, is the exception, in both spawn modes.
+`continue` does not resume it. It is closed as described next, and its
+parent is told once that it can be continued by sending the sub-agent a
+message. Resuming it would mean keeping the run open across hosts with its
+report still owed to the parent, which a rebuilt sub-agent has no channel
+for today.
+
+A sub-agent that cannot be restored or closed this way, because its stored
+run cannot be read for example, does not fail the open. It is skipped and
+left as stored, a warning is logged, and the first client of the open gets
+one notice naming it. Only an error that means the host can no longer
+write the session fails the open: a failed append, or a write refused
+because another writer has changed the session.
+
+**A run cut short.** A run whose turn was left running and that has no
+`SubAgentEnd` was abandoned: its host died, shut down, released the session
+or stopped after a storage failure. A host that stops does not end the run
+itself, so there is one outcome. The next open appends its one
+`SubAgentEnd`, concluded as failed with a report that says it was
+interrupted, answers its unanswered tool calls and stores its turn as not
+running. The parent of a foreground run has its `agent` call answered with
+the same news, tied to the sub-agent by the `call_id` the spawn record
+stores. The parent of a background run gets one task notification that says
+the run was interrupted and can be continued by sending the sub-agent a
+message. That notification was saved when the run started
+([background tasks](background-tasks-spec.md), section 7), so the open
+finds it among the parent's pending work and saves it only if it is
+missing.
+
+A background run saves its task notification before its `SubAgentEnd`. A
+host that ends between the two leaves the report as the parent's one
+task notification, and the next open records the run's end as finished
+without adding another.
+
+A run without a `SubAgentEnd` whose turn is not running was dropped with its
+parent's cancelled turn, and is concluded from its last message.
+
+A run the user or its parent stops while the session lives (`task_stop`,
+the picker's kill, a cancel aimed at the sub-agent) records its own
+`SubAgentEnd`, concluded as failed with `turn aborted`, and gives its
+parent a `killed` task notification.
+
+Per contract 4, a prompt to a sub-agent whose box is closed writes no second
+spawn or end and sends nothing to the parent.
+
+**Head switches.** A switch drops every live sub-agent. One the new branch
+shows is built again when it is next used, and one it does not show is
+refused with `sub-agent N has no run on this branch`. A sub-agent spawned
+before a fork point is shown by both branches and is the same thread
+on both.
 
 ## 5. Edge cases
 
-- **Submit to a busy agent.** Gated in §4.3 (both `turn_cancels` and
-  `pump.is_running`). Same "ignore second submit" behavior as today,
-  now per-agent.
-- **Start race** (submit accepted, `AgentStart` not yet emitted). The
-  `turn_cancels` key is inserted synchronously at spawn, so the gate and
-  `sync_editor_enabled` see the agent as busy immediately, before the
-  bus catches up.
-- **Continuation after a replyless failed turn.** If a turn fails before
-  producing a retained assistant message, the agent's in-memory
-  transcript ends on a `User` message (the errored assistant is emitted
-  as a `MessageEnd` for persistence but is *not* pushed to the
-  transcript; only `Aborted` partials are pushed — lib.rs:909-937 vs the
-  `return` at :1001). Re-prompting then appends another `User` message.
-  A sub-agent is a full `Agent` reusing the identical
-  `prompt` → transcript → `transcript_to_messages` → provider path, so
-  this behaves **exactly** as re-prompting the main agent after a failed
-  turn does today (which works in practice). No sub-agent-specific
-  handling. If we ever want to harden consecutive same-role user turns
-  on the wire, that belongs in `transform_messages` for every agent —
-  out of scope here.
-- **Sub-agent with no live handle** (resumed session). `resolve_agent`
-  returns `None`; surface a notice and keep the view read-only.
-- **Main ends while viewing Main with a sub continuation running.** The
-  spinner stops (you are viewing Main, now idle); the footer still shows
-  the running sub; switching to that sub shows its spinner. Correct
-  under per-view scoping (§4.6).
-- **Quit with background turns running.** `turns.abort_all()` on
-  shutdown.
-
----
-
-## 6. Touch list
-
-- `src/aj-agent/src/lib.rs`: `SubAgentRegistry` + `SharedAgent`;
-  `Agent.sub_agent_registry` + setter; `SessionContextWrapper`
-  registry field; retain-then-run in `spawn_agent`.
-- `src/aj/src/modes/interactive.rs`: registry injection on the main
-  agent; `turns: JoinSet` + `turn_cancels` replacing
-  `running_task`/`current_turn_cancel`; `resolve_agent`,
-  `join_next_or_pending`, `sync_editor_enabled`; submit routing;
-  generalized Ctrl+C; shutdown `abort_all`.
-- `src/aj/src/modes/interactive/event_pump.rs`: drop `running_sub_agents`
-  and the two heuristics; derive the aggregate footer from
-  `running_agents`; per-view spinner via `sync_loader` (called on
-  `AgentStart`/`AgentEnd` and from `set_active_view`); `is_running` +
-  `mark_idle`; status from `AgentStart`/`AgentEnd(Sub n)`.
-- No change to `agent_picker.rs`, `subagent_box.rs` rendering,
-  `footer.rs` API, `listener.rs`, or the wire transform.
-
----
-
-## 7. Forward compatibility: background spawn
-
-The future flow — main spawns a sub-agent, **keeps going**, and is later
-notified of the result — drops out of this design as a localized change,
-*not* a rewrite:
-
-- Sub-agents are already retained, individually addressable, bus-shared,
-  and driven by the same per-agent turn machinery.
-- Background spawn = a non-blocking spawn mode in `spawn_agent`: insert
-  the sub-agent into the registry, spawn its initial run as a turn task
-  (the binary's `turns`/`turn_cancels` machinery, or an agent-internal
-  task), and return a "started" tool result to the parent immediately
-  instead of blocking on the report.
-- Notification = on completion, emit an event the binary surfaces (the
-  existing `SubAgentEnd` already carries the report); a later iteration
-  can optionally feed that back into the parent as a new user/tool
-  message to "wake" it. That parent-feedback step is the only genuinely
-  new mechanism, and Option A deliberately leaves the parent untouched
-  until we build it.
-
-So this iteration's retention + concurrency is the foundation; background
-spawn is an additive mode on top.
-
----
-
-## 8. Resolved decisions
-
-1. **Ctrl+C is per-view** (§4.5): it cancels the *viewed* agent's turn if
-   one is running, otherwise — if other agents are still running — arms a
-   `press Ctrl+C again to quit` guard (without cancelling them), and
-   otherwise exits. Background sub-agents are never cancelled by a Ctrl+C
-   aimed at another view.
-2. **Resumed sub-agents are observe-only** this iteration (no live
-   handle; no rehydration). Re-prompting them is future work.
-3. **Replyless failed-turn continuation** (§5): **no special handling**.
-   A sub-agent re-prompt shares the main agent's `prompt`/transcript/
-   wire path, so it behaves identically to re-prompting the main agent
-   after a failed turn — which works today. Any future hardening of
-   consecutive same-role user turns belongs in the shared wire transform.
-
----
-
-## 9. Staged implementation plan
-
-**Stage A — retention (aj-agent).** Add `SharedAgent`,
-`SubAgentRegistry`, the `Agent` field + setter, the
-`SessionContextWrapper` field, and retain-then-run in `spawn_agent`.
-No behavior change yet (registry unused by the binary). Unit test:
-after a spawn, the registry holds the sub-agent and its transcript ends
-on the report.
-
-**Stage B — pump concurrency + per-view spinner.** Make
-`running_agents` authoritative: remove `running_sub_agents` and the Main
-heuristics, derive the aggregate footer from the set, add `sync_loader`
-(per-view spinner), `is_running` + `mark_idle`, and drive box status
-from `AgentStart`/`AgentEnd(Sub n)`. Adapt the existing pump tests (the
-"Main AgentEnd authoritative" / "AgentStart{Main} resync" tests change
-meaning) and add: concurrent overlap (main + sub running together);
-footer count tracks the set; the spinner follows the viewed agent and
-toggles on `set_active_view`.
-
-**Stage C — per-agent drive loop (binary).** Replace
-`running_task`/`current_turn_cancel` with `turns: JoinSet` +
-`turn_cancels`; add `resolve_agent`, `join_next_or_pending`,
-`sync_editor_enabled`; inject the registry on the main agent. No new
-user-facing path yet — main still submits to main, but through the new
-machinery. Verify no regression to a single main turn (cancel, errors,
-panic, shutdown).
-
-**Stage D — submit routing + editability + Ctrl+C.** Route submit to
-`pump.active_view`, gate per-agent, wire `sync_editor_enabled` at the
-four recompute points, and generalize Ctrl+C. This is the stage that
-turns on the feature.
-
-**Stage E — polish + tests.** Resumed-sub notice; end-to-end test that
-submitting in a sub-view runs the sub-agent's turn concurrently with a
-main turn and persists onto the existing sub-thread.
-
----
-
-## 10. Testing
-
-- **aj-agent**: registry retention after spawn; transcript shape.
-- **aj-session**: re-prompt chains onto the existing sub-thread leaf
-  (parent of the continuation's first user message is the prior
-  sub-thread leaf, not the original parent anchor).
-- **event_pump**: aggregate footer count derives from the running set;
-  the spinner follows the viewed agent (on iff `active_view` is running)
-  and toggles across `set_active_view`; box status flips
-  `Running`→`Done`→`Running`→`Done` across a continuation;
-  `is_running`/`mark_idle` behavior.
-- **interactive (integration)**: submit in a sub-view drives that
-  sub-agent; concurrent main + sub turns both render and persist;
-  per-agent submit gating; Ctrl+C scoping; resumed-sub and failed-init
-  guards.
+- **Prompt to a busy agent.** The text is queued as a follow-up. No second
+  turn starts.
+- **Prompt to an idle agent with a restored message.** The prompt joins the
+  pending message and one turn delivers both as one message.
+- **Continuation after a turn that failed without a reply.** The agent's
+  transcript then ends on a user message, and the next prompt appends
+  another, as for the main agent.
+- **Main ends while a sub-agent continuation runs.** In the main view the
+  spinner stops. The footer still counts the sub-agent, and its own view
+  shows its spinner.
+- **Quit with turns running.** See
+  [background tasks](background-tasks-spec.md), section 5.

@@ -4,7 +4,7 @@
 
 A session environment is an overlay on the environment inherited by its tool
 processes. It can be supplied at creation and deliberately edited afterwards.
-The overlay belongs to the current conversation branch, like recorded inference
+The overlay belongs to the current branch, like recorded inference
 settings. It is not an installation-wide default or an immutable identity.
 
 The `env` command in the command palette opens **Session environment**, using
@@ -36,20 +36,20 @@ values.
 
 ## Branch and execution semantics
 
-Each `EnvChange` states the complete resulting map. The last record on the
-selected user-thread ancestry wins, without merging earlier maps. An empty map
-clears all session overrides. Absence of a record means no overlay.
+Each `EnvChange` states the complete resulting map. The last entry on the
+selected main-thread ancestry wins, without merging earlier maps. An empty map
+clears all session overrides. Absence of an entry means no overlay.
 
 A branch inherits the map at the point it forks. Changes made afterwards on one
 branch do not change its siblings. Selecting an earlier head, including the
 system-prompt root before the environment seed, restores the map at that point.
-Compaction does not remove state records from the ancestry used for extraction.
+Compaction does not remove state entries from the ancestry used for extraction.
 Resuming or materializing the log restores the environment of the selected
 branch, not the launching process's `--env` values. Head selection follows the
 session log's existing persistence rules.
 
-Edits are refused while agents or background commands are running, using the
-same idle requirement as head switching. An accepted edit installs the map for
+Edits are refused while any agent or background task is running. An
+accepted edit installs the map for
 subsequent tool invocations by the main agent and its sub-agents, including
 parked sub-agents used again. Separate sessions do not share the map. No edit
 can change the environment of a process that has already been spawned.
@@ -73,33 +73,19 @@ The frozen system prompt's workspace `<env>` block is unrelated to this map.
 Keys are exact and case-sensitive on supported Unix execution hosts. A key must
 be non-empty and contain neither `=` nor NUL. Values may be empty and must not
 contain NUL. The same validation applies at create, edit, and log-resume
-boundaries. Invalid recorded maps are refused before tail repair can modify the
-file.
+boundaries. An invalid recorded map refuses the session when it is read,
+before a reopen or an import writes anything.
 
 The log retains the `env_change` discriminator and full string-to-string map.
-New environment records are user-thread state entries parented at the current
-head. They are non-punctuation, like inference-setting records. A fresh session
-with only seeds leaves no conversation file. A confirmed edit to an established
-log flushes the state entry before reporting success. An unchanged value or
-removal of an absent key appends nothing.
+New environment entries are main-thread state entries parented at the current
+head. Like inference-setting entries they do not start a session: a fresh
+session with only seeds stores nothing. An edit to a stored session is
+committed before success is reported. An unchanged value or removal of an
+absent key appends nothing.
 
-The first message saves the buffered creation records through the ordinary log
-writer, without replacing an existing log. An interrupted save may leave an
-empty file or a partial creation prefix. Reopening uses ordinary log recovery
-and restores only the records that reached disk, including any environment map.
-Writes are not synchronized to disk against power loss.
-
-### Existing logs
-
-An existing single root-parented Meta `EnvChange` creation record remains valid.
-It supplies that log's baseline when the selected ancestry has no user-thread
-environment record. A user-thread record overrides the entire baseline map,
-including when it is empty. Other branches without an override retain the
-baseline. No log rewrite or migration is required.
-
-Logs with no environment records remain valid. Readers that only understand
-immutable Meta environment records cannot read the new user-thread records and
-must be upgraded before using edited sessions.
+The first message stores the creation entries with itself in one transaction,
+without replacing an existing session. Reopening restores committed state,
+including the environment map. See [session storage](session-storage.md).
 
 ## Creation defaults
 
@@ -156,20 +142,9 @@ The read is requested when the editor opens, not during directory enumeration.
 Environment values do not enter directory rows or `state` frames. Live notices
 and replay name only the keys using terminal-safe quoting. User-message branch
 metadata also excludes environment values. Seeds before the
-first message and legacy Meta records project no environment notice.
+first message and legacy Meta entries project no environment notice.
 
 Session info reports the selected branch's map. Export redacts every
 `EnvChange` value in the embedded payload before JavaScript receives it, keeping
 keys and replacing values with `[redacted]`. Export never mutates the source
 log. Its state rows remain navigable and keys-only.
-
-## Verification boundaries
-
-Coverage observes whole-map replacement, absent versus empty, sibling isolation,
-root-head selection, compaction, persisted resume, and the legacy Meta baseline
-at the log API. Runtime tests observe the actual bash child after edits and head
-switches, plus inheritance by sub-agents and session isolation. Host and wire
-tests cover set/remove, no-ops, invalid and busy refusals, and local/remote and
-gateway behavior. Editor tests drive the actual palette, settings widgets, and
-drive loop, including cancellation, invalid drafts, whitespace, and empty values.
-Export and replay retain value-nondisclosure coverage at their output boundaries.

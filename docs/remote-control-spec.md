@@ -58,6 +58,13 @@ gateway fronting another gateway.
 
 ## 4. The session host
 
+The host opens and writes sessions in one SQLite database. A legacy JSONL
+session is listed from its file and imported when it is first resumed.
+Session discovery and lookups are scoped to the host's project. Explicit
+all-project prompt-history queries read across projects. See
+[session storage](session-storage.md) for the layout, commit guarantees,
+import rules, and what a reopen reads.
+
 The session host owns N live sessions and exposes one attachment
 interface used by both the local TUI (in-process, through direct
 handles) and the network server. Both reach the same command methods.
@@ -67,9 +74,9 @@ The host layer depends on no terminal, which is what `aj serve` is.
   command naming a session known on disk) and torn down on shutdown. A
   live session that is quiescent (no turn in flight, no live background
   tasks, no queued messages) and has no attached client is released
-  after an idle grace period: the driver is joined, log buffers are
-  flushed, the lock is released, and the epoch dies. The next attach or
-  command re-materializes it with a fresh epoch and a full backfill.
+  after an idle grace period: the driver is joined, the lock is
+  released, and the epoch dies. The next attach or
+  command re-materializes it with a fresh epoch and a fresh backfill.
   Only log-durable state survives a release, as on a process restart.
   Attachment is the retention signal (section 8.2). A created session
   with nothing durable on disk is exempt and stays live for the host's
@@ -77,13 +84,16 @@ The host layer depends on no terminal, which is what `aj serve` is.
 - **Single-writer safety.** Materializing a session takes an advisory
   lock (a file in the store's `locks/` directory) before anything reads
   or repairs the log, so a refused materialization has not touched the
-  file. A second process that hits the lock refuses to materialize that
+  session. A second process that hits the lock refuses to materialize that
   session: HTTP 409 `locked`, or the `error` frame of section 5.5 on an
   attach. The lock file records its holder (pid and host id) and the
   refusal names it.
 - **Sequence assignment.** Durable events are tagged with their log
   entry's append index at the append site, never inferred from log
-  length at consume time. Per session, **live** durable frames reach any
+  length at consume time. A hosted session's log has one writer. It
+  appends an entry and hands what the entry publishes to the session's
+  publisher under one lock, and the publisher learns of entries from
+  nowhere else. So per session, **live** durable frames reach any
   given stream in strictly increasing seq order, and never at or below
   the stream's backfill boundary. Backfill blocks follow projection
   order (section 5.5).
@@ -92,23 +102,58 @@ The host layer depends on no terminal, which is what `aj serve` is.
   event plus a refreshed `state` frame. A settings entry that lands
   before its thread's first message projects no notice, so its
   confirmation is published untagged.
-- **Head switching.** Refused with 409 `conflict` while a turn is
-  running or background tasks are live. On success the host clears the
-  session's pending queues, mints a new epoch, and emits `reset`.
+- **Head switching.** Refused with 409 `conflict` unless the session
+  is quiesced: no turn, no agent run, no Code Mode cell and no background
+  task of any agent runs, no message is queued, and no task notification or
+  restored pending work waits to be delivered. The refusal says what is in
+  the way and what clears it: stopping the task, the `continue` action, or
+  withdrawing the queued message. So nothing runs or waits on a branch the
+  session is not on, and a switch carries nothing over. A switch stores
+  nothing, so a host restart does not remember it unless something was done
+  after it: the session then opens on the thread last appended to. A
+  switch to an earlier entry starts the draft of a branch, which the first
+  prompt there creates ([session storage](session-storage.md)). A switch
+  happens whole or not at all. Whatever can refuse it is checked before
+  the head moves, and a refused switch leaves the session as it was. The
+  one step that can fail afterwards is the write of what the switch
+  records on the branch it lands on: the changes it was given, a paused
+  goal, the answer to a tool call left open there. If that write fails, the
+  host ends the session with a `persistence_failed` error, as after a
+  storage failure, and the client's next attach opens it on the branch the
+  store has. No client is left on a branch the host is not on. On
+  success the host drops the finished task entries of the branch it left,
+  mints a new epoch, and emits `reset`. A sub-agent the new branch does not
+  show is no longer prompted: a command that names it is refused with 409
+  `conflict`. One it shows is prompted as before
+  ([sub-agent steering](subagent-steering-spec.md), section 4).
 - **Host-level state.** The session directory (section 5.8), a
-  `QueueUpdate` on every queue mutation (enqueue as well as drain),
-  per-session `state` frames (section 5.3), and epoch/seq bookkeeping.
-- **Shutdown** (SIGTERM, or the interactive host quitting): running
-  turns are cancelled through the ordinary abort path, background tasks
-  quiesced, log buffers flushed, client streams closed. Sessions wind down
+  `QueueUpdate` on every queue mutation a client can see (a message left
+  waiting behind a running turn, a withdrawal, a drain), per-session `state`
+  frames (section 5.3), and epoch/seq bookkeeping. A prompt to an idle agent
+  is pending only until its turn takes it and is not announced as queued
+  ([queued messages](message-queue-spec.md), section 2).
+- **Shutdown** (SIGTERM, or the interactive host quitting) leaves each
+  session as a host that died at that moment leaves it. A command the
+  session is in the middle of ends first. Then the session is closed for
+  writing, its turns are stopped where they stand, background agent runs
+  and Code Mode cells end, and client streams are closed. Nothing is
+  written after the close: no aborted message, no cancelled tool result, no end of
+  a turn. A client sees its stream end, as when the host is lost.
+  Recorded `bash` commands keep running, and the next open of the session
+  settles what was left and takes them up
+  ([background tasks](background-tasks-spec.md), section 5). An idle
+  release, a storage failure and a dropped session stop the same way.
+  Sessions wind down
   concurrently. The process gives orderly teardown one 30-second grace,
   then exits nonzero with a diagnostic if cleanup is unfinished. Another
-  stop signal during teardown exits immediately. Forced exit can lose
-  buffered work and abandon subprocess cleanup. In-process session cleanup
-  retains writer locks until its tasks and persistence listeners finish,
+  stop signal during teardown exits immediately. Forced exit can abandon
+  subprocess cleanup. Every write is committed before it is acknowledged
+  and a session is closed between writes, so no exit loses an acknowledged
+  write. In-process session cleanup
+  retains writer locks until its tasks have let go,
   without its own host-wide deadline. The gateway uses the same process
   exit policy.
-- **Persistence failure.** A conversation-log write error is terminal
+- **Persistence failure.** A session-log write error is terminal
   for that materialization: the log refuses every later write. The host
   publishes one `error` frame with code `persistence_failed` on every
   stream attached to the session, detaches the session from those
@@ -126,11 +171,11 @@ The host layer depends on no terminal, which is what `aj serve` is.
   settings edits apply within a running turn, including enabling or disabling
   mid-turn compaction. A compaction already underway keeps its settings.
   Streaming responses are never interrupted.
-  Compaction uses the ordinary compaction events and keeps the same run active,
+  Compaction uses the ordinary compaction events and keeps the same turn active,
   with `working` remaining true through successful compaction and continuation.
   Failed compaction preserves the original history and stops continuation,
   including overflow recovery, without automatically retrying compaction.
-  Queued input and task notices remain pending until an explicit start, such
+  Queued input and task notifications remain pending until an explicit start, such
   as a prompt, manual compaction, or goal resume. The hold is in-memory only.
   The failure is recorded as a display-only log entry,
   so reconnect and session replay show the same transcript warning. Replaying
@@ -217,7 +262,7 @@ internally tagged with `kind`:
   the host's runtime fallback or validation. It contains no environment values,
   credentials, or live-only thinking display. Live delivery and backfill supply
   the same context, including across compaction. Older hosts may omit the field.
-- `state`: `{kind, session, epoch, opens_block?, working, turn_outcome?, settings, oracle_settings?, goal?}`.
+- `state`: `{kind, session, epoch, opens_block?, working, turn_outcome?, turn_interrupted?, settings, oracle_settings?, goal?}`.
   `opens_block: true` marks the `state` that opens an attach block
   (section 5.5), absent reads false. It is the only thing that tells a
   block's opening from an on-change `state`, so a client reads it off the
@@ -231,6 +276,11 @@ internally tagged with `kind`:
   not announce catch-up or its post-`caught_up` repair as new completion.
   Tool failures alone are not failed turns, and waiting does not imply a need
   for user action.
+  `turn_interrupted: true` says the process that ran Main's last turn ended
+  before the turn did, absent reads false. It is read from the turn state
+  stored with the thread the selected branch ends in, so it survives a
+  host restart and holds until a turn starts there. A client shows a notice for it after a block that
+  rebuilt its transcript.
   `working` says whether the session's **main agent** has a turn in
   flight, `settings` is the active `AgentSettings` (`provider`,
   `model_id`, `thinking`, `thinking_display`, `speed`, `verbosity`, `context_window`),
@@ -255,8 +305,11 @@ internally tagged with `kind`:
   attach's `state`. `working` applies on every `state` frame and
   self-heals a spinner left running by a missed `AgentEnd`. It says
   nothing about sub-agents, whose liveness comes from lifecycle events.
-- `caught_up`: `{kind, session, epoch, last_seq, tasks, queues}`. Ends
-  a backfill (section 5.5). A client must not commit a cursor, or take
+- `caught_up`: `{kind, session, epoch, last_seq, history_start, tasks,
+  queues}`. Ends a backfill (section 5.5). `history_start` is present on a
+  fresh backfill only: the log position of the first entry the block
+  covered. Above `1`, earlier history exists and the client fetches it in
+  pages (`GET .../history`, section 6). A client must not commit a cursor, or take
   the tables, from a `caught_up` it did not ask for. `tasks` is the
   session's background task table, `[{id, owner, call_id, kind, label,
   status, started_at}]` with wall-clock `started_at`, running and
@@ -295,7 +348,7 @@ types must be ignored by clients (section 5.10).
 identifies the execution cell issuing the nested call. The inner message is an
 ordinary assistant message containing a single tool call, or its ordinary
 tool-result message. Call ids match the existing `ToolExecutionStart/End`
-events, which render the activity without creating an assistant turn. These
+events, which render the activity without creating an assistant message. These
 entries are durable, non-user-editable, and never enter model context, including
 after resume or compaction. Replay regenerates tool events and retains the
 audit wrapper on `MessageEnd`, without inference usage updates. Print JSONL
@@ -311,7 +364,7 @@ Completed Code Mode scripts can emit a durable state event:
 {"type":"code_mode_store","agent_id":"main","writes":{"key":{"value":42}}}
 ```
 
-`writes` replaces the named keys on that agent's conversation branch. The event
+`writes` replaces the named keys on that agent's branch. The event
 is emitted after log persistence on the host wire and is reproduced on replay.
 Print JSONL also carries it. It is not a model message or rendered chat activity
 and does not affect usage. Clients that do not use this state can ignore it.
@@ -343,7 +396,7 @@ Every frame is in exactly one class:
   writes the spawn root, the `CompactionEnd` for a checkpoint or recorded
   failure, and the notices or `SubAgentSettings` the projection derives from
   notice-producing state entries. Durable frames carry `seq` (the
-  entry's 1-based append position, so `0` reads as nothing durable yet)
+  entry's 1-based position, so `0` reads as nothing durable yet)
   and `entry_id`. They are exactly what backfill can regenerate. Seqs
   are strictly monotone per session but **not contiguous**, so clients
   must not do gap detection: continuity comes from the stream being FIFO
@@ -369,7 +422,7 @@ Every frame is in exactly one class:
   coalesced or dropped under pressure, the newest one or a later durable
   frame supersedes. New frame kinds declare their class when introduced.
 - **Reliable-transient** frames are everything else: tool start/end,
-  sub-agent end, task start/end, notices, warnings, errors, lifecycle
+  task start/end, notices, warnings, errors, lifecycle
   brackets, usage updates, queue updates, compaction progress,
   `caught_up`, `reset`, and the `error` frame. Not replayable, and
   losing one wedges or corrupts client state, so these are delivered in
@@ -394,9 +447,7 @@ Per session the host maintains:
 - **epoch**: an opaque token minted fresh every time a session is
   materialized, and replaced whenever the linearized history changes in
   a way that is not a pure append (head switch). Epochs are never
-  persisted, so a host restart always invalidates cursors, which is
-  right: the log tail is not crash-stable (buffered non-punctuation
-  entries, torn-tail truncation). Within one epoch, "durable events
+  persisted, so a host restart always invalidates cursors. Within one epoch, "durable events
   after seq N" is well-defined.
 
 Attaching is done through the stream itself, there is no separate
@@ -416,13 +467,15 @@ carrying the failure's own code (section 5.3), and the rest are served.
 A `reset` for the session may supersede either at any point, and asks
 for a re-attach as always. An error frame ends that attachment, and
 except for `host_unreachable` the client drops its epoch and cursor with
-it, which costs only a full backfill later. For each resolvable session
+it, which costs only a fresh backfill later. For each resolvable session
 the server, atomically with respect to that session's event flow,
 registers the subscription, projects the durable suffix, and emits in
 order on the stream: a `state` frame marked `opens_block`, the backfill
-(projected events for entries after the cursor, or from the beginning
-when the cursor is absent or its
-epoch does not match), and `caught_up`. Live frames for that session
+(projected events for entries after the cursor, or the recent tail when
+the cursor is absent or its epoch does not match), and `caught_up`. The
+recent tail starts at a main-agent message a few hundred entries before
+the tip of the selected branch, or at the beginning of a shorter one. It is what a reader sees first, not
+the session's whole history. Live frames for that session
 follow. Because subscription and projection are atomic and the stream is
 FIFO, no durable event can be missed or delivered below the backfill
 boundary within a connection. Reliable-transient frames in flight at
@@ -437,7 +490,10 @@ The task table and queues on `caught_up` are read after the
 subscription is registered, and the host changes either before it
 publishes the event announcing the change. So every change is either in
 those tables or announced by a `TaskStart`, `TaskEnd` or `QueueUpdate`
-that follows `caught_up`. Applying such an event over tables that
+that follows `caught_up`. The one change without an event of its own is a
+prompt to an idle agent, which is pending until its turn takes it. A
+client that attaches in between gets it in `queues`, and the turn's drain
+announces the empty queue. Applying such an event over tables that
 already reflect it changes nothing: a task event updates a known task in
 place, and a `QueueUpdate` replaces its agent's queue.
 
@@ -462,14 +518,22 @@ Backfill projection rules, which differ from dead-log replay:
 - The host projects from the full log so server-side context (tool name
   maps, usage running totals) is complete, and emits only events for
   entries after the cursor.
-- A **running** sub-agent's bracket is never force-closed, at the cursor
-  boundary or at end of log. The real `SubAgentEnd` arrives live later.
-  A **finished** sub-agent's bracket still is, because a conclusion is
-  not persisted and the run's last assistant message is the only source
-  for it. The host tells the projection which sub-agents are running,
-  and concludes every sub-agent it knows to be idle after `caught_up`,
-  which unwedges a box whose `SubAgentEnd` fell into a disconnected
-  window even when no durable entry follows the cursor.
+- A sub-agent run's end is an entry of the log. Its `SubAgentEnd` is
+  durable, carries the entry's `seq`, and is served to a cursor below
+  it like any other entry. A sub-agent prompted again after that
+  brackets nothing: its box stays concluded.
+- A run without an end entry is running, was recorded before those
+  existed, or was dropped with its parent's cancelled turn. A run its
+  process abandoned gets an end entry from the next open, concluded as
+  failed with a report that says it was interrupted. If the host knows a
+  run without one is **running**, its bracket is left open and the real
+  `SubAgentEnd` arrives live later. Otherwise the projection closes it
+  once, after the run's last message, with an untagged `SubAgentEnd`
+  derived from that message. A run that ended at or below the cursor
+  projects no bracket.
+- The host tells the projection which sub-agents are running, states
+  each one's lifecycle after the backfill, and concludes every other
+  sub-agent the projection walked after `caught_up`.
 - A sub-agent thread open at the cursor boundary gets its
   `SubAgentStart` re-synthesized so the suffix is well-bracketed. Such
   frames carry no `seq` or `entry_id` (their spawn root is at or below
@@ -487,7 +551,7 @@ Client application rules:
   epoch: the client adopts the epoch of the block's opening `state` frame
   and applies the block under it,
   which is how a stale cursor (head switch, host restart) accepts the
-  full backfill served under the new epoch.
+  fresh backfill served under the new epoch.
 - **Epoch filter**: outside an attach block the client drops any
   session-scoped frame whose epoch differs from the session's current
   one, which keeps a stale in-flight frame from an abandoned branch out
@@ -526,10 +590,11 @@ Client application rules:
   pending-message queues with the ones the frame carries, because
   neither is replayable. This holds for every session in the attach
   set, focused or not. A client may instead discard the session's state
-  and rebuild from a full backfill, which must produce the same result.
+  and rebuild from a fresh backfill plus the history pages before it,
+  which must produce the same transcript.
 - On `reset`, the client re-attaches, offering its cursor. The server
-  serves an incremental suffix if the epoch still matches, or a full
-  backfill if not. A `reset` received mid-attach-block abandons the
+  serves an incremental suffix if the epoch still matches, or a fresh
+  backfill of the recent tail if not. A `reset` received mid-attach-block abandons the
   block: the cursor only advances at `caught_up`, which never came, so
   discarding the partial application is safe. A re-attach that fails
   because the session no longer exists fails as a session-scoped `error`
@@ -583,9 +648,16 @@ cleared. An absent field decodes as no goal for compatibility. A snapshot has
 `time_used_seconds`. Status is `active`, `paused`, `blocked`,
 `budget_limited`, `usage_limited`, or `complete`.
 
-Goal state and usage persist on the user branch. The host records usage when
-the goal's definition or status changes, when a Main turn ends, and at
-shutdown, so a crash loses at most the interrupted turn's accounting. `state`
+Goal state and usage persist on the user branch. A change of the goal's
+objective, budget or status is committed before it takes effect: before a
+`state` frame shows it, before the model is told and before pursuit follows
+it. A goal command whose commit is refused is refused, and the goal stays
+as it was. A status the host itself decides on, after a turn that failed or
+a spent budget for example, is committed the same way. If that commit is
+refused, clients get one error, the goal stays as it was except that the
+host starts no further goal turn, and the host tries again. The host
+records usage with each of these records and when a Main turn ends, so a
+crash or a shutdown mid-turn loses at most that turn's accounting. `state`
 frames carry current usage between those records. Reopening a session or
 switching heads does not automatically pursue a restored goal. Explicit
 resume is required. Cancelling Main pauses pursuit. Reconnecting to a still
@@ -597,11 +669,11 @@ hidden. The notice is not included in model input.
 The hosted Main agent can call `wait` alone to yield. In a batch with other
 tool calls, all results are returned to the next inference normally. The
 mixed-batch wait request is discarded, not deferred to a later step.
-A standalone wait ends the run with a transient `agent_end` carrying
+A standalone wait ends the turn with a transient `agent_end` carrying
 `waiting: true` (an absent field means false). The agent is idle and the goal
 remains active, but no synthetic goal turn starts until new input arrives.
-Queued input and task-completion notices, including ones already queued at
-yield, retain their ordinary wake paths. A new run clears the wait. Explicit user
+Queued input and task notifications, including ones already queued at
+yield, retain their ordinary wake paths. A new turn clears the wait. Explicit user
 goal creation, replacement, objective editing or resume also releases it.
 Running background processes alone do not suppress goal continuation. The wait
 is not persisted, and the tool is unavailable to sub-agents and print mode.
@@ -634,7 +706,7 @@ Print mode refuses goal tools without a session host.
 Disabling `update_goal` prevents starting or resuming pursuit, since the model
 must be able to conclude the objective. Active pursuit pauses before its next
 turn if that tool becomes disabled. Usage is checkpointed and best-effort: it
-counts what providers reported, and usage an interrupted run never checkpointed
+counts what providers reported, and usage an interrupted turn never checkpointed
 is not recovered.
 
 The command palette's Goal entry opens a management window over the same live
@@ -672,7 +744,7 @@ the usual fields before it. Only a goal wider than the whole footer is omitted.
 Commands are JSON POSTs. Effects are observable on the stream or the
 corresponding read. Mutations against a specific session return 202 on
 acceptance. An optional JSON body `{incomplete: <message>}` reports a change
-that applied but whose requested save or log record failed. An empty body or
+that applied but whose requested save or log entry failed. An empty body or
 absent `incomplete` means complete acceptance. The caller can report partial
 success without correlating an event-stream warning with its request.
 `POST /v1/sessions`
@@ -681,23 +753,25 @@ agent" locally take an optional `agent` field (default: the main agent).
 
 | Command | Body | Semantics |
 |---|---|---|
-| `POST /v1/sessions` | `{host?, settings?, prompt?, tag?, env?}` | Create a session in the host's working directory. `settings` and the initial string-to-string `env` overlay per section 7. `prompt` is `{text}` or `{content: [...]}`. Settings, prompt, tag and env are validated before a log exists, so a refusal leaves nothing behind. The tag and first prompt are applied afterwards under the session's own lock and are best-effort: one that does not land still answers 200 `{id}` plus an `incomplete` string carrying the host's words for what did not stick, so the client retags rather than creating a second session. A first prompt whose persistence fails does so on the stream, as `persistence_failed`, after the id was answered. A minted session is never deleted to make an error tidier. |
-| `.../{id}/prompt` | `{text}` or `{content}`, optional `agent` | Run a turn if the agent is idle, queue a follow-up if busy. |
+| `POST /v1/sessions` | `{host?, settings?, prompt?, tag?, env?}` | Create a session in the host's working directory. `settings` and the initial string-to-string `env` overlay per section 7. `prompt` is `{text}` or `{content: [...]}`. Settings, prompt, tag and env are validated before a log exists, so a refusal leaves nothing behind. The tag is part of the creation and is stored with the session's first input. The first prompt is applied afterwards under the session's own lock: one the session refuses still answers 200 `{id}` plus an `incomplete` string carrying the host's words for what did not stick, so the client prompts again rather than creating a second session. A first prompt whose save fails is one the session refuses: nothing is stored and the session is still there to prompt. A minted session is never deleted to make an error tidier. |
+| `.../{id}/prompt` | `{text}` or `{content}`, optional `agent` | The prompt is saved as the agent's pending input before the answer, and a refused save refuses the command. An idle agent then starts a turn that takes it, with any image content. Behind a running turn it waits as a follow-up, and image content is 409 `conflict` there. A prompt to an idle agent that already has a pending message joins that message. A sub-agent is named by any client of any host process that has the session. One the selected branch shows no run of is 409 `conflict`, here and for `steer` and `settings`. |
 | `.../{id}/steer` | `{text, agent?}` | Queue steering, or promote the pending follow-up when `text` is empty. |
-| `.../{id}/cancel` | `{agent?}` | Interrupt the targeted agent's current turn. A foreground child stays assigned while its parent delegation remains pending. Prompts, queued follow-ups, and task notices can start its next turn, just as for the main agent. Its final report completes the original call. A detached background child is stopped through its task, just like task kill. Cancelling a parent ends its foreground assignments, but never stops detached background work. A running mark with no owning turn, assignment, or task is 409 `conflict`. An idle or completed target is accepted. |
+| `.../{id}/cancel` | `{agent?}` | Interrupt the targeted agent's current turn. A foreground child stays assigned while its parent delegation remains pending. Prompts, queued follow-ups, and task notifications can start its next turn, just as for the main agent. Its final report completes the original call. A detached background child is stopped through its task, just like task kill. Cancelling a parent ends its foreground assignments, but never stops detached background work. A running mark with no owning turn, assignment, or task is 409 `conflict`. An idle or completed target is accepted. |
 | `.../{id}/kill-agent` | `{agent}` | Explicitly terminate a sub-agent assignment, or a running independent continuation. The main agent is not a kill target. |
-| `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
+| `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. A pending message with image content, which a restart or a failed turn can leave, is not withdrawn: 409 `conflict`. A clear discards it. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
+| `.../{id}/continue` | `{}` | Resume the main agent's interrupted turn without a new user message. A turn is interrupted when the selected branch does not end on a completed assistant message, as after a crash, a restart, a cancellation or a provider error. The model is told the turn was interrupted and that a tool call whose result was not saved may or may not have run. It also resumes each sub-agent whose own turn, one after its run, was cut short by a host that ended, the same way. A sub-agent run that was cut short is not resumed: it was closed at the open, and its parent told ([sub-agent steering](subagent-steering-spec.md), section 4). With no interrupted turn, it delivers the main agent's pending queued message and task notifications instead. 409 `conflict` while the main agent's turn is running and nothing was resumed, or when the last turn finished and nothing is pending. |
 | `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, `oracle_model`, `oracle_thinking`, `oracle_verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Oracle axes reject sub-agent targets. Persistence is main-agent only. |
 | `.../{id}/account` | `{provider, account?}` | Select an account for this session and provider from the host-local auth store. Missing or null `account` resets to Provider default, `""` pins the unnamed account, any other string pins that exact label. Does not change the provider's auth-store default. Read the result through `accounts`. |
 | `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. |
-| `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
+| `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the metadata write. |
 | `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the archived bit (section 5.8). Materializes like any command, so a rival's lock refuses it. Nothing else refuses it: a session working through a turn takes it and goes on working. |
-| `.../{id}/head` | `{entry, changes?}` or `{before: <entry_id>, changes?}` | Switch the session head. 409 `conflict` while working or tasks live. Clears queues, new epoch, `reset` frame. `before` resolves the named entry to its parent server-side, atomically with the switch. An unknown entry is 404 `unknown_entry`, an entry with no parent is refused. Exactly one target. Optional `changes` applies session-scoped overrides to its inherited baseline (see below). |
+| `.../{id}/head` | `{entry, changes?}` or `{before: <entry_id>, changes?}` | Switch the session head. 409 `conflict` unless the session is quiesced (section 4). New epoch, `reset` frame. `before` resolves the named entry to its parent server-side, atomically with the switch. An unknown entry is 404 `unknown_entry`, an entry with no parent is refused. Exactly one target. Optional `changes` applies session-scoped overrides to its inherited baseline (see below). |
 | `.../{id}/tasks/{task_id}/kill` | `{}` (absent or blank is equivalent) | Kill a background task. Any field or non-object value is refused before the task is touched. |
 
-`agent_start` marks a running turn and `agent_end` marks it idle.
-Their `assignment_pending` field is an optional boolean, defaulting to false,
+`agent_start` marks a running turn and `agent_end` marks it idle. `round_start`
+and `round_end` bracket each round inside it. A round that aborts or fails has
+no `round_end`. The `assignment_pending` field of `agent_start` and `agent_end` is an optional boolean, defaulting to false,
 that says the foreground caller still owns the assignment. It does not change
 turn activity or inhibit ordinary wakes. `sub_agent_end` carries the final
 assignment conclusion. Assigned children stay in the active agents picker
@@ -846,15 +920,17 @@ side's limitation. Neither side's values fall back to the other's.
   Code Mode observations are read from their retained in-memory snapshot.
   File paths come only from the session task registry, not the request.
   Reads use bounded allocation and blocking-pool file I/O. Running and completed
-  tasks are readable while retained by the live registry, with no persistent
-  task archive.
+  tasks are readable while retained by the live registry. A running `bash`
+  task is recorded and taken up again by the next open of the session. A
+  finished task is not kept across a release or restart.
 - `GET /v1/sessions/{id}/tree`: `{segments, head?}`, the
   segment-collapsed branch tree for the tree view and head switching.
   `head` is the current head entry id, absent only while the log has no
   head, and not derivable from the segments.
 - `GET /v1/sessions/{id}/info`: the session's aggregate log facts, encoded as
-  `SessionInfo` in `aj-wire`: identity and host-local file path, timestamps,
-  file size, message and tool counts, usage and its provider/model/account/served-speed
+  `SessionInfo` in `aj-wire`: identity, the project it is stored under, the
+  host-local path of the database that stores it, timestamps, the summed size of the session's
+  stored entries, message and tool counts, usage and its provider/model/account/served-speed
   breakdown, compaction usage, recorded settings, and session environment.
   Counts and usage span all threads and branches. Settings and environment
   reflect the active user branch. Environment values are unredacted, with
@@ -866,6 +942,28 @@ side's limitation. Neither side's values fall back to the other's.
   buckets carry their homogeneous reported mode in `usage.served_speed`, while
   mixed or unknown totals carry none. Clients label missing modes `unknown` and
   keep the requested settings distinct from the reported usage.
+- `GET /v1/sessions/{id}/history?before=N&limit=M[&agent=K]`: `HistoryPage`
+  in `aj-wire`, `{epoch, agent, start, end, frames}`. One page of one
+  agent's history before log position `before`: the main agent's, or
+  sub-agent `K`'s. History is paged per agent because each transcript is
+  read on its own. The frames are the `event` frames a backfill would have
+  carried for that agent for entries `start..end`, where `end` is `before`
+  clamped to the log and `start` is one of that agent's messages at least
+  `limit` entries earlier, or `1` when it has none. The main agent's pages
+  count the entries the selected branch shows, a sub-agent's count its own. The host caps `limit`
+  at 4000. A sub-agent's box (its start and conclusion) belongs to its
+  parent's page, and what the sub-agent did belongs to its own. A run that
+  continues past `end`, or that the host knows to be running or assigned,
+  is left open, as in a backfill.
+
+  A fresh backfill covers every agent from `history_start`, so that is
+  where each agent's history starts until a page moves it. The client
+  folds a page on its own and puts the resulting entries in front of that
+  agent's transcript, then asks again with `before = start` until `start`
+  is `1`. It drops a page whose `epoch` is not the one it is attached under
+  or whose `end` is not that agent's current start, so a late or repeated
+  answer is harmless. A page changes no cursor, usage total, task table or
+  lifecycle state. Reading and projecting run on the blocking pool.
 - `GET /v1/sessions/{id}/export`: `SessionExport` in `aj-wire`, `{html}`.
   The host renders the complete log with the ordinary HTML exporter, including
   all threads and branches and its export redaction and tool-detail resolution.
@@ -918,7 +1016,7 @@ side's limitation. Neither side's values fall back to the other's.
   bearer tokens, or credential contents travel in either request or report.
 - `GET /v1/previews?session=<id>` (repeatable): the session browser's
   `SessionPreviews` in `aj-wire`, `{previews, incomplete}`. Each preview
-  carries the full first nonempty user-thread user text block in
+  carries the full first nonempty main-thread user text block in
   `first_user_message`, falling back to the first nonempty goal objective when
   no such message exists.
   Internal context and delegated task prompts are not user input. This fallback
@@ -943,7 +1041,7 @@ side's limitation. Neither side's values fall back to the other's.
   `PromptHistory` values in `aj-wire`:
   `{prompts: [{text, project, timestamp}], incomplete: [{host, message}]}`.
   Text is the full trimmed prompt, joining user text blocks with newlines.
-  Only top-level user-thread messages contribute, across all branches and
+  Only top-level main-thread messages contribute, across all branches and
   archived sessions. Assistant, tool-result, sub-agent, and task-notification
   content is excluded. Corrupt and non-UTF-8 lines and unreadable files are
   skipped independently, as in the ordinary prompt extractor.
@@ -1005,19 +1103,25 @@ Per-session row fields in `list` frames and `GET /v1/sessions`:
   when false.
 - `last_activity`: host-clock timestamp on every row. For a live row it
   is the last durable event the host observed, and a release hands that
-  stamp to the cold row. The log's mtime stands in only where the host
-  has no answer, so a restarted host can disagree with its predecessor.
-- `last_seq`: only on live rows. A cold row never carries one: an exact
-  entry count costs a read of the whole file, and a list-observed
-  position is never a cursor anyway (section 5.5).
+  stamp to the cold row. Where the host has no answer, the time the
+  session's stored row was last updated stands in, or the file's
+  modification time for a JSONL session not yet imported. A restarted
+  host can therefore disagree with its predecessor.
+- `last_seq`: only on live rows. A cold row never carries one. A
+  list-observed position is never a cursor (section 5.5).
 - `tag`: optional user-set label, display metadata, never an id.
-  Session-scoped, so it lives in a sidecar (`meta/<session id>.tag`, one
-  line of UTF-8) that a head switch cannot move.
+  Session-scoped and independent of branch history. SQLite stores it on the
+  session's row. A session without an entry yet has no row: its label and
+  archived bit live with the host that holds it and are stored with its first
+  entry. A JSONL session not yet imported uses a sidecar
+  (`meta/<session id>.tag`, one line of UTF-8).
+  A head switch cannot move the label.
 - `archived`: user-set bit, display metadata with no lifecycle meaning:
   an archived session keeps its log, its lock, and any turn it is
-  running. Stored as a sidecar (`meta/<session id>.archived`) whose
-  existence is the whole bit. Absent reads false. Changed only by the
-  archive command, deliberately with no create-time field.
+  running. Stored on the session's SQLite row, or for a JSONL session not yet
+  imported as a sidecar (`meta/<session id>.archived`) whose existence is the
+  bit. Absent reads false.
+  Changed only by the archive command, deliberately with no create-time field.
 - `locked`: the session's advisory lock (section 4) is held by a writer
   other than the publishing host. A session live in this host is never
   `locked` on its own rows: the bit names a rival. A hint, never a gate:
@@ -1334,7 +1438,7 @@ override. There is no partial model selection or follow-main mode. Oracle
 thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 For verbosity, `default` uses the selected model's catalog default, then the
 server default, gated by `supports_verbosity`. Explicit verbosity overrides
-the catalog default. Settings and session records keep `default` unresolved
+the catalog default. Settings and session entries keep `default` unresolved
 so model changes follow their own catalog defaults, without live catalog
 discovery. Oracle uses its own model's default, not main's value.
 
@@ -1343,7 +1447,7 @@ named identifiers. `default` leaves the choice to each model's advertised
 catalog default. Explicit `standard` requests ordinary processing even if a
 provider project or catalog defaults to a premium mode. Supported choices and
 available prices travel with model metadata. A selected preference is retained
-in the session record, while each model independently resolves unsupported
+in the session's entries, while each model independently resolves unsupported
 modes to standard speed. The host reports fallback notices. Catalog support
 does not guarantee account eligibility, and a server rejection is surfaced
 rather than retried at a different price. Flex does not trigger an automatic
@@ -1357,7 +1461,7 @@ speed records remain readable but do not override the shared preference.
 
 Oracle calls use the same inputs and delivery modes as the `agent` tool. Calls
 block by default. With `run_in_background: true`, the tool returns the task id
-immediately and the report arrives as a task completion notice. Background
+immediately and the report arrives as a task notification. Background
 Oracle children use ordinary task cancellation and shutdown ownership.
 
 A creator sends only stated Oracle choices. The host resolves omitted choices
@@ -1405,6 +1509,15 @@ record preserves it for replay and reconnect. The transcript identifies Oracle
 children as `agent(oracle) N`, as does the agent switcher, where the origin is
 also searchable. An absent or empty origin remains an ordinary `agent N`, as
 does the `agent` tool.
+
+They also carry `call_id`, the id of the parent's tool call that spawned the
+sub-agent, and the spawn record preserves it. The field is optional: a peer
+or a record that predates it sends none, and a receiver treats an absent
+`call_id` as unknown. A host that reopens a session uses it to answer a
+spawning call its last process left without a result: with the sub-agent's
+report when its run ended, and otherwise with the news that the sub-agent
+was interrupted. A call whose spawn record names no `call_id` gets the
+generic interrupted result.
 
 Creation may also supply `settings.account: {name: ...}` for the initial
 provider. An absent or null outer `account` leaves the choice unchanged.
@@ -1515,9 +1628,10 @@ client and sends bytes through the existing prompt `content` field. The
 host never opens the client's path. Preparation or submission failures keep
 the draft in the editor. Hosts and gateways accept request bodies up to 32 MiB,
 including JSON and base64 overhead. Image preparation also precedes a requested
-branch change, and its bytes stay with the pending branch prompt. Follow-up and
-steering queues remain text-only, so busy-agent image submissions are refused
-without discarding the draft.
+branch change, and its bytes stay with the pending branch prompt. The host saves
+an accepted image prompt with its bytes. A client shows and takes back queued
+text only, so busy-agent image submissions are refused without discarding the
+draft.
 
 Account selection attempts the host's endpoint and shows the ordinary
 unsupported-endpoint notice if the peer lacks it. It does not fall back to
@@ -1666,14 +1780,14 @@ and does not select text or activate session rows.
 ## 9. Testing
 
 A client that connects mid-session or reconnects after drops must converge
-on the same durable-derived conversation as an uninterrupted client. This
+on the same durable-derived transcript as an uninterrupted client. This
 includes transcript content and identity, sub-agent status and reports,
 tasks, queued messages, settings, usage and lifecycle. Wall-clock timings
 and client-local view choices need not agree.
 
 Exercise that promise through the real host and HTTP client, including
 seeded disconnects and cursor-based reattachment. Keep independent expected
-conversation outcomes so two equally broken clients cannot satisfy a
+transcript outcomes so two equally broken clients cannot satisfy a
 comparison. Tests should observe stable application and peer boundaries,
 not internal indexes or incidental counts of frames and transcript rows.
 
@@ -1684,37 +1798,18 @@ artifacts, but keep every durable-backed row. Uninterrupted clients must
 agree on transient notices too. Fault scenarios must actually interrupt
 durable history and include a notice raised while the client is away.
 
-Sharp edges, each pinned by a test: attach cut between a tool's
-`ToolExecutionEnd` and its durable `MessageEnd`, reconnect while a tool
-and a sub-agent are running, attach mid-sub-run, reconnect where zero
-durable entries follow the cursor but an open sub concluded in the gap,
-head switch refused while busy, stale-epoch frames dropped, a task that
-ended while the client was away reading as ended from `caught_up` alone,
-a backgrounded session's task table and queues on re-attach, queue
-enqueue visibility on a second client, slow-client eviction and
-recovery, settings visibility for a mid-session joiner, seq
-non-contiguity, per-session attach refusal while the same
-stream's other sessions serve (through a gateway included), an
-on-change `state` never opening a block, a stalled block withholding
-the heartbeat, `host_unreachable` for a downed or hung host without
-delaying the other hosts' blocks, an incremental resume from the cursor
-kept through `host_unreachable`, every
-gateway `reset` edge (host lost, host returned, enrollment withdrawn,
-identity replaced) scoped to the attaching client's sessions,
-incompatible peers neither recorded nor routed to, the identity gate in
-`local` and `tailscale` modes, closed JSON command schemas through every
-route, and misspelled commands that neither mint nor clear, queue,
-cancel, compact, kill, or dispatch inference.
+## 10. Accepted limits
 
-## 10. Accepted limits and banked work
-
-- A full backfill projects the whole log. Deferring sub-thread
-  projection would break the "cursor = applied prefix of one seq space"
-  invariant, so the cost is paid once at first attach. A thread-scoped
-  backfill is cleanly additive as a new endpoint if a real session hurts.
+- A fresh backfill and a history page each walk the session's state
+  records and the messages the host read for their range, and emit only
+  their range. What a SQLite host reads is described in
+  [session storage](session-storage.md). A background sub-agent's nested
+  tool activity that crosses a page boundary can show as two cells.
 - `list` frames are cumulative over the whole store (about 60 KB at 400
   sessions). Debouncing bounds the rate, not the size. A row cap or
   delta encoding is the follow-up if a store gets big enough to hurt.
-- A resumed sub-agent's report text is bracket-scoped: which child's
-  report survives a resume depends on how their log lines interleaved.
-  Accepted while it misleads nobody, per-run scoping is the named fix.
+- A sub-agent run without a stored end record whose turn is not stored as
+  running, one from before end records or one dropped with its parent's
+  cancelled turn, is closed on reopen from its last message: the report is
+  its last assistant text, and the conclusion follows that message's stop
+  reason.

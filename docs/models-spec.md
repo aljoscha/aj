@@ -1,6 +1,6 @@
 # aj-models & Provider SDK Spec
 
-This document specifies the target design for `aj-models`, `anthropic-sdk`, and `openai-sdk`.
+This document specifies `aj-models`, `anthropic-sdk`, and `openai-sdk`.
 It covers the unified message types, streaming protocol, provider implementations,
 model registry, authentication (including OAuth), and cost tracking.
 
@@ -9,7 +9,7 @@ model registry, authentication (including OAuth), and cost tracking.
 - **Anthropic Messages API** (direct API key and OAuth/Claude Pro)
 - **OpenAI Responses API** — primary OpenAI surface. Used for all
   native OpenAI models (direct API key). Preserves encrypted
-  reasoning across turns.
+  reasoning across requests.
 - **OpenAI Codex Responses API** — ChatGPT Plus/Pro subscription
   surface, addressed via OAuth JWT against `chatgpt.com/backend-api`.
   Same Responses event shape as the public API; see §7.4.
@@ -316,43 +316,6 @@ fn to_wire(msgs: &[AgentMessage]) -> Vec<Message> {
 `Context { messages: Vec<Message> }`. The agent is responsible for
 the `AgentMessage → Message` projection before each call.
 
-**Persistence is a separate layer.** The on-disk thread format —
-JSONL files in `~/.aj/threads/` — lives in the `aj-session` crate,
-not in `aj-models`. `aj-session` consumes both wire `Message`s
-(from `aj-models`) and `AgentMessage`s (from `aj-agent`) and writes
-them to disk. The on-disk schema and the bus-listener model that
-drives writes are owned by `aj-session`.
-
-### 1.8 Thread Persistence (out of scope)
-
-Thread persistence is **not** part of `aj-models`. The JSONL on-disk
-format, `ConversationLog`, replay, and thread navigation all live in
-the `aj-session` crate, which is layered on top of `aj-models` and
-`aj-agent`.
-
-This is a deliberate split. `aj-models` is reusable from any
-frontend (CLI, TUI, RPC server, embedded harness) without forcing a
-particular persistence story; each frontend can drive `aj-session`,
-use a different store, or skip persistence entirely.
-
-**What lives where.**
-
-| Layer | Type | Crate | On wire? | Persisted? |
-|---|---|---|---|---|
-| Wire | `Message` (§1.2) | `aj-models` | Yes | Yes (by `aj-session`) |
-| Agent | `AgentMessage` (§1.7), `ToolDetails`, events | `aj-agent` | No | Yes (by `aj-session`) |
-| Thread file | `ConversationLog`, JSONL framing, replay | `aj-session` | No | Yes (this layer) |
-
-**Pre-existing threads.** Adoption of this spec, in combination
-with the `aj-next` cutover, is a clean break in `aj-models` terms:
-the new wire `Message` types differ from today's `MessageParam`
-shape, and any pre-existing thread files use the old shape. The
-migration walker in `aj-session`
-rewrites the agent-level fields (`UserOutput` → `ToolDetails`); a
-separate one-shot pass handles wire-message migration when the
-`aj-models` rewrite lands. Both walkers leave `.bak` files; both
-are one-way.
-
 ### 1.9 Deliberately Out of Scope
 
 Several content-block kinds present in the current in-repo SDK types
@@ -381,7 +344,7 @@ wire types in this spec:
 - `model_change` / `thinking_level_change` — record mid-thread
   config changes. Today these events are lost on replay (the
   `provider`/`api`/`model` fields on each `AssistantMessage` still
-  carry per-turn provenance, which is what `transform_messages`
+  carry per-message provenance, which is what `transform_messages`
   uses, so correctness is preserved; only the UX of "why did the
   model change here" is lost).
 - `compaction_summary` — a persisted summary produced when the
@@ -398,7 +361,7 @@ committing to add them.
 ### 1.10 Round-trip Invariants
 
 Round-trip correctness is a first-class guarantee of this abstraction.
-For any assistant turn produced by a supported provider, the round-trip
+For any assistant message produced by a supported provider, the round-trip
 
 ```
 provider SSE stream → unified AssistantMessage → provider request item
@@ -409,7 +372,7 @@ the message in a subsequent request: signatures that validate, IDs
 that pair, encrypted reasoning that decodes, content-block order that
 matches the server's pairing expectations. "Accept" is defined as: the
 provider treats the round-tripped request item as a valid prior
-assistant turn in a multi-turn conversation, not that the JSON bytes
+assistant message in a multi-turn conversation, not that the JSON bytes
 match verbatim.
 
 This invariant is the load-bearing property that makes conversation
@@ -418,7 +381,7 @@ meaningful. The transform rules in §8 are defined on top of it — §8
 says what changes when the target model differs; §1.10 says what must
 *not* change when it doesn't.
 
-**Per-provider preserved state** (a turn's multi-turn-significant
+**Per-provider preserved state** (a message's multi-turn-significant
 fields):
 
 | Provider | Preserved | Mechanism |
@@ -444,7 +407,7 @@ state):
   active auth mode, not a stored property.
 
 **Test coverage.** The invariant is enforced by the round-trip test
-suite described in §12 Phase 4. That suite is the authoritative check
+suite in `src/aj-models/tests/roundtrip`. That suite is the authoritative check
 for §1.10 compliance; changes to provider mappings (§6.2, §7.2,
 §7.3.1) that regress the invariant must be caught there before merge.
 
@@ -1432,13 +1395,13 @@ The SDK handles:
   - Text content sent as plain string (not array of content blocks)
   - **Thinking blocks are dropped on outbound requests.** The public
     Chat Completions API (`api.openai.com`) does not accept reasoning
-    content on input; prior-turn `ThinkingContent` blocks are discarded
+    content on input; earlier `ThinkingContent` blocks are discarded
     when serializing the history. (The OpenAI Responses provider in §7.3
     preserves them instead.)
   - **Consequence:** reasoning is one-way on Chat Completions. The
     provider captures `delta.reasoning_content` as `ThinkingContent`
     during streaming (so the UI can render it live), but on the next
-    turn that thinking block is dropped per the outbound rule. Multi-
+    request that thinking block is dropped per the outbound rule. Multi-
     turn reasoning continuity is not available on this API — callers
     who need it must use `openai-responses` instead.
   - Empty assistant messages (from aborted streams) are dropped
@@ -1640,7 +1603,7 @@ Both are Responses-specific concerns and do not belong in the base
 
 #### 7.3.3 Reasoning Round-Trip
 
-Prior-turn `ThinkingContent` blocks are preserved across turns, unlike
+Earlier `ThinkingContent` blocks are preserved across requests, unlike
 Chat Completions (§7.2) where they are dropped.
 
 **On output (stream → unified types):** when a `reasoning` output item
@@ -1652,13 +1615,13 @@ summary text goes into `ThinkingContent.thinking`.
 **On input (unified types → API request):** `thinking_signature` is
 deserialized back into a `ResponseReasoningItem` and inserted directly
 into the `input` array as a `reasoning` item. This preserves the
-encrypted reasoning chain across turns.
+encrypted reasoning chain across requests.
 
 **The `include` requirement.** Round-trip requires `include:
 ["reasoning.encrypted_content"]` on the request (§7.3.2). Without
 it, the server returns reasoning items without an `encrypted_content`
 field — i.e. only `id` and `summary`. Sending such an item back on
-the next turn carries no real state, so the chain-of-thought is
+the next request carries no real state, so the chain-of-thought is
 lost even if the server accepts the request. This is why the
 reasoning-enabled branch of §7.3.2 always sets `include`, and it's
 a prerequisite for the §1.10 round-trip invariant on this provider.
@@ -1982,7 +1945,7 @@ initial implementation: SSE-only. The provider does not negotiate,
 fall back to, or even acknowledge the WebSocket transport. If/when
 that changes, it'll land as its own spec section with its own
 progress tracking; until then, callers get straight POST + SSE on
-every turn.
+every request.
 
 ---
 
@@ -2087,7 +2050,7 @@ For each assistant message in the history:
 
 5. **Errored/aborted assistant messages (pass 2):** Skip entirely
    (stopReason == Error or Aborted), along with any `ToolResultMessage`s
-   that referenced their tool calls. These are incomplete turns that
+   that referenced their tool calls. These are incomplete messages that
    shouldn't be replayed. This is applied in pass 2, not pass 1,
    because skipping the assistant message must also remove its
    associated tool results.
@@ -2311,7 +2274,7 @@ callers match against is `AssistantError` from §1.3.
 
 ### 10.1 AssistantMessage error shape
 
-Recap from §1.2 and §1.3: a failed or aborted turn terminates with:
+Recap from §1.2 and §1.3: a failed or aborted response terminates with:
 - `stop_reason == Error` or `Aborted`
 - `error == Some(AssistantError { category, message, retry_after_ms, http_status })`
 - The preceding `content` vector may still hold partial output that
@@ -2513,219 +2476,3 @@ fn parse_streaming_json(partial: &str) -> serde_json::Value;
 
 Implementation: try `serde_json::from_str` first, fall back to a
 partial JSON parser that handles unclosed strings, objects, arrays.
-
----
-
-## 12. Implementation Plan
-
-All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
-`aj-models`. The plan is ordered by dependency.
-
-### Phase 1: Unified Types (aj-models)
-
-1. **Define new type module** (`aj-models::types`): Create all types from
-   §1 (TextContent, ThinkingContent, ImageContent, ToolCall, UserMessage,
-   AssistantMessage, ToolResultMessage, Message, Usage, UsageCost,
-   StopReason, ToolDefinition, Context, ThinkingLevel, CacheRetention,
-   StreamOptions, SimpleStreamOptions). All types derive Serialize,
-   Deserialize, Clone, Debug.
-
-2. **Define streaming event types** (`aj-models::streaming`): Replace the
-   current `StreamingEvent` enum with `AssistantMessageEvent` from §2.
-   Implement `AssistantMessageEventStream` as an async channel-backed
-   stream with a `result()` future.
-
-3. **Define model metadata and registry** (`aj-models::registry`): Create
-   `ModelInfo` (including the `supports_adaptive_thinking` field), `ModelCost`, `InputModality`, `ModelRegistry` from §3.
-   Implement `calculate_cost` and the capability-probe accessors from §3.3.1.
-   The registry loads its catalog from (a) the user cache at
-   `~/.aj/models.json` if present and parseable, otherwise (b) the bundled
-   seed at `src/aj-models/data/models.json` via `include_str!`. Overrides
-   from `src/aj-models/data/overrides.json` are applied on top. Emit the
-   staleness warning per §3.4.6.
-
-3b. **Build the catalog refresh command** (`aj models update`): Native
-    Rust (reqwest + serde), no Python. Fetches models.dev, filters to
-    Anthropic + OpenAI tool-capable models, fills provider-specific
-    fixed values (§3.4.3), applies overrides (§3.4.4), writes
-    `~/.aj/models.json`. On fetch failure: non-zero exit, leave the
-    existing cache intact. Run it once against a live models.dev,
-    apply manual overrides for `supports_adaptive_thinking`, and
-    commit the resulting JSON as
-    the initial seed (`src/aj-models/data/models.json`) and the
-    initial overrides file (`src/aj-models/data/overrides.json`).
-
-4. **Define provider trait** (`aj-models::provider`): Create the `Provider`
-   trait from §5.1 and the top-level `stream`/`stream_simple`/`complete`/
-   `complete_simple` functions from §5.2.
-
-### Phase 2: Anthropic Provider
-
-5. **Update `anthropic-sdk`**: Adjust the client to support both API key
-   and OAuth bearer token auth modes. Add the required beta headers.
-   Add OAuth stealth mode (Claude Code tool renaming, identity headers).
-   Keep the SDK thin — it sends HTTP requests and parses SSE.
-
-6. **Implement Anthropic provider** (`aj-models::anthropic`): Rewrite
-   as an implementation of the `Provider` trait. Implement:
-   - Message conversion (unified → Anthropic API format)
-   - Prompt caching (cache_control on system + last user message)
-   - Thinking configuration (adaptive vs budget-based)
-   - SSE → AssistantMessageEvent mapping
-   - Partial JSON parsing for tool call arguments
-   - Stop reason mapping
-   - Usage/cost tracking
-
-### Phase 3: OpenAI Provider
-
-7. **Update `openai-sdk`**: Ensure the client supports all needed fields
-   (reasoning_effort, stream_options with include_usage, developer role).
-   The SDK should remain a thin HTTP+SSE client.
-
-8. **Implement OpenAI Chat Completions provider** (`aj-models::openai`):
-   Rewrite as an implementation of the `Provider` trait. Implement:
-   - Message conversion (unified → OpenAI Chat Completions format)
-   - System prompt as developer/system role based on reasoning capability
-   - Reasoning effort mapping from ThinkingLevel
-   - SSE → AssistantMessageEvent mapping
-   - Reasoning content field detection (`delta.reasoning_content`)
-   - Tool call streaming with partial JSON parsing
-   - Usage parsing with cached token subtraction
-   - Stop reason mapping
-
-8c. **Implement OpenAI Codex Responses provider**
-    (`aj-models::openai::codex`): new module implementing the
-    `Provider` trait for `api: "openai-codex-responses"` per §7.4.
-    Reuses `aj-models::openai::responses` shared helpers
-    (`convert_responses_messages` invoked with `include_system_prompt
-    = false`, the SSE event mapper, the reasoning round-trip
-    helpers, partial JSON parsing) and only owns the Codex-specific
-    pieces:
-
-    - Request shape: `instructions` field, `store: false`,
-      `tool_choice: "auto"`, `parallel_tool_calls: true`, omit
-      `tools[*].strict`, omit `text.verbosity`, omit
-      `max_output_tokens`.
-    - Auth path: read the OAuth credential from `AuthStorage` under
-      provider id `"openai-codex"`, decode the JWT to lift
-      `chatgpt_account_id`, send `Authorization: Bearer …`,
-      `chatgpt-account-id`, `originator: aj`,
-      `User-Agent: aj/<version> (<os> <release>; <arch>)`,
-      `OpenAI-Beta: responses=experimental`.
-    - Event normalization layer that rewrites
-      `response.done` / `response.incomplete` to `response.completed`
-      and lifts `response.failed` / top-level `error` events into
-      classifier-ready terminal errors.
-    - Service-tier multiplier helper with the `gpt-5.5` priority-tier
-      exception (2.5×).
-    - Friendly 429 message for `usage_limit_reached` /
-      `usage_not_included` / `rate_limit_exceeded`, sourcing
-      `plan_type` and `resets_at` from the error body.
-    - Wire the new `api` string into `provider_for` (in
-      `aj-models::provider`) and add a Codex round-trip fixture
-      directory under `tests/roundtrip/fixtures/openai-codex/`
-      (parse / serialize / semantic round-trip mirroring step 11b).
-    - WebSocket transport is explicitly out of scope (§7.4.8); SSE only.
-
-    Catalog seeding: extend the `aj models update` refresh to
-    preserve Codex entries (§3.4.7) — bundle a hand-curated seed
-    list for `provider: "openai-codex"` covering the §7.4 model set,
-    re-emitted on every refresh so models.dev churn never deletes
-    them. `context_window: 400000`, `max_tokens: 128000`, pricing
-    per the seed.
-
-### Phase 4: Cross-Provider & Utilities
-
-9. **Message transformation** (`aj-models::transform`): Implement
-   `transform_messages` from §8 — handle cross-provider replay,
-   thinking block conversion, tool call ID normalization, orphaned
-   tool call synthetic results, errored message skipping.
-
-10. **Partial JSON parser**: Implement or integrate a partial JSON
-    parsing library for streaming tool call arguments.
-
-11. **Error classification & overflow detection** (`aj-models::errors`):
-    Implement `AssistantError` / `ErrorCategory` from §1.3, the
-    per-provider classification tables from §10.3 (called from the
-    provider SDKs when building the terminal error message), and
-    `is_context_overflow` from §10.5 (primary path via
-    `error.category`, regex fallback for `InvalidRequest` / `Unknown`).
-
-11b. **Round-trip test suite** (`src/aj-models/tests/roundtrip/`):
-    Enforces the §1.10 invariant. Fixtures live under
-    `fixtures/<api>/<scenario>.{sse,request.json}` — captured SSE
-    streams and hand-crafted golden request bodies. Three test
-    shapes per provider:
-
-    - **Parse test**: SSE fixture → unified `AssistantMessage`.
-      Structural assert (snapshot or hand-written expected). One
-      scenario per `AssistantContent` variant the provider emits —
-      text-only, thinking+text, tool_call, redacted_thinking
-      (Anthropic), reasoning+message+function_call (Responses).
-    - **Serialize test**: hand-crafted `AssistantMessage` fixture →
-      provider request item JSON. Golden-file compare.
-    - **Semantic round-trip test**: captured-and-parsed
-      `AssistantMessage` → serialize as request item → re-parse that
-      request item back to `AssistantMessage` via a new
-      `parse_assistant_request_item` helper per provider (symmetric
-      to the streaming parser; request and response share content-
-      block shapes on each provider, so this is cheap) → assert
-      field-equal to the original modulo the "deliberately not
-      preserved" list in §1.10.
-
-    Plus one **cross-provider transform test** per direction
-    (Anthropic ↔ Responses, Anthropic ↔ Completions): feed a multi-
-    turn history through `transform_messages(target=X)` and assert
-    the §8.1 rules fire correctly — signatures dropped on model
-    change, visible reasoning text demoted to plain text per rule 2,
-    tool-IDs normalized per rule 3, orphan results inserted per
-    rule 4, errored turns skipped per rule 5.
-
-### Phase 5: Authentication
-
-12. **OAuth infrastructure** (`aj-models::oauth`): Implement the
-    `OAuthProvider` trait, `OAuthCredentials`, `OAuthCallbacks` from §9.2.
-    Implement PKCE utilities (verifier generation, SHA-256 challenge).
-
-13. **Anthropic OAuth** (`aj-models::oauth::anthropic`): Implement the
-    full Anthropic OAuth flow from §9.3 — local callback server,
-    authorization URL construction, token exchange, token refresh.
-
-14. **OpenAI OAuth** (`aj-models::oauth::openai`): Implement the OpenAI
-    Codex OAuth flow from §9.4 — local callback server, authorization
-    URL construction, token exchange with form-urlencoded body, JWT
-    parsing for account ID, token refresh. The provider's `id()`
-    returns `"openai-codex"` (not `"openai"`) per §9.4 / §7.4.1, so
-    credentials are keyed under that string in `auth.json` and the
-    JWT is paired with the `openai-codex` inference provider. (If
-    this step has already shipped under id `"openai"`, step 8c
-    must include the rename and a one-time migration of any
-    pre-existing `auth.json` entries.)
-
-15. **Auth storage** (`aj-models::auth`): Implement `AuthStorage` from
-    §9.1 — JSON file persistence with file locking, credential CRUD,
-    API key resolution with priority chain, automatic OAuth token refresh.
-
-### Phase 6: Integration
-
-16. **Update `aj-agent`**: Migrate the agent loop to use the new unified
-    types and streaming protocol. Replace direct `Model` trait usage with
-    `stream_simple()` calls. Wire up auth storage for API key resolution.
-    Note that the `aj-next` plan extracts persistence into `aj-session`
-    — if that lands first, `aj-agent` no longer touches
-    `ConversationLog` directly and this step has nothing to update on
-    the persistence path. If `aj-models` lands first, `aj-agent` keeps
-    its existing `ConversationLog` calls until the `aj-session`
-    extraction runs, at which point they move to a bus listener in
-    the binary.
-
-17. **Update `aj` CLI**: Add `--provider` flag alongside existing
-    `--model_api`. Expose the `login` action in the command palette.
-    Wire up model registry for model selection and validation.
-
-18. **Remove old code**: Remove the `messages` module (replaced by
-    `types`), remove the old `Model` trait and `create_model` function,
-    remove the old `StreamingEvent` enum, remove the `openai_ng` module.
-    Remove the `async-openai` dependency. The conversation persistence
-    that today lives in `aj-models::conversation` is removed from
-    `aj-models` entirely (moved to `aj-session`).

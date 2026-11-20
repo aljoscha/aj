@@ -1,1143 +1,389 @@
-# Context Compaction Spec
+# Context compaction
 
-Status: proposed. This document specifies client-side context
-compaction for `aj`: a manual `compact` palette action, automatic
-threshold-driven compaction, and reactive recovery from a
-context-overflow error. Compaction replaces the earlier part of a
-thread with an LLM-generated structured summary while retaining selected
-original user messages and a recent tail verbatim. User requests get
-priority within a shared retention budget, so a long-running session
-keeps their exact wording alongside the recent work.
+Compaction replaces the earlier part of the main thread with an
+LLM-generated summary. Selected original user messages and a recent tail
+stay verbatim. User requests get priority within a shared retention
+budget, so a long-running session keeps their exact wording alongside the
+recent work.
 
-The design is host-orchestrated: the binary (`aj`) owns the policy and
-the end-to-end flow, the on-disk log is the source of truth for the
-compaction boundary, and the agent runtime gains two small, generic
-mechanisms (a bus-silent completion and a transcript reseed). This
-mirrors the existing split where the binary owns the `ConversationLog`
-and appends settings entries directly while the agent owns the live
-transcript and emits events.
+There are three triggers:
 
-## 1. Goals and non-goals
+- **Manual**: the `compact` palette action or the host API.
+- **Threshold**: context occupancy crosses a configured fraction of the
+  model's window.
+- **Overflow**: a turn fails with a context-overflow error. The host
+  compacts and retries once.
 
-Goals:
+The host owns the policy and the flow. The session log is the source of
+truth for the compaction boundary. The agent runtime knows nothing of
+prompts or thresholds.
 
-- Summarize-and-continue: when context grows past a threshold, replace
-  the old prefix with selected original user messages and a summary,
-  keeping a tool-safe recent suffix verbatim.
-- Three triggers: manual (the `compact` palette action or host API), automatic
-  (occupancy crosses a configured fraction of the window), and reactive
-  (a turn fails with a context-overflow error → compact and retry once).
-- Durable and resumable: a compaction is recorded in the session log so
-  resuming a compacted thread reconstructs exactly the post-compaction
-  context, and the full pre-compaction history remains on disk.
-- Iterative summaries: a second compaction folds new history into the
-  previous summary rather than summarizing a summary.
-- Available in both the interactive TUI and the headless `--print`
-  path (the reactive overflow trigger fires under `--print`).
+## 1. Scope
 
-Non-goals:
+- A compaction is a stored checkpoint. Resuming a compacted session
+  rebuilds exactly the post-compaction context, and the full
+  pre-compaction history stays stored.
+- A later compaction folds new history into the previous summary. It does
+  not summarize a summary.
+- Compaction works in the interactive TUI and under `--print`.
+- Only the main thread is compacted. A sub-agent's thread is not.
+- A provider's server-side compaction is not surfaced.
+- A forked branch that rejoins its parent is not summarized.
 
-- Surfacing a provider's *server-side* compaction (e.g. Anthropic's
-  `compaction` stop reason). The unified `StopReason`
-  (`aj-models/src/types.rs:163`) has no `Compaction` variant and this
-  spec does not add one. Client-side summarize-and-reseed is the path
-  that fits aj's abstractions.
-- Branch summarization (summarizing a forked thread that rejoins its
-  parent). The log is already a parent-linked tree, so this can be added
-  later with the same machinery; it is out of scope here.
+## 2. The checkpoint
 
-## 2. Where each piece lives (crate boundaries)
+A compaction is one `Compaction` entry on the main thread, appended
+at its current head. It changes only the projection. Every original entry
+stays stored. The entry holds:
 
-```
-aj-session::compaction   pure planning: token estimation, cut-point
-                         selection, conversation serialization, summary
-                         prompt templates, file-op extraction. Operates
-                         on `&[ConversationEntry]` / `&[Message]`. No
-                         provider, no I/O. Fully unit-testable.
-
-aj-session::log          `ConversationEntryKind::Compaction` variant,
-                         `append_compaction(...)`, and compaction-aware
-                         projection in `Conversation::agent_messages` /
-                         `messages`.
-
-aj-session::replay       replay arm mapping a `Compaction` entry onto
-                         renderer events.
-
-aj-agent                 generic mechanisms only: `Agent::complete_oneshot`
-                         (bus-silent completion), `Agent::reseed_transcript`,
-                         and the exclusive `Agent::account_usage` transition;
-                         the `CompactionStart`, `CompactionProgress`, and
-                         `CompactionEnd` events.
-
-aj-conf                  `auto_compact` + `compact_threshold` config
-                         options; `ValueKind::Number`.
-
-aj (binary)              orchestration: the `compaction` host module
-                         (`run_compaction` mechanics) and the `turn`
-                         host module (`drive_turn`, the turn-and-
-                         continuation driver that owns the post-turn
-                         policy ladder); the `compact` palette action;
-                         interactive wiring (driver tasks, terminal-
-                         outcome notices); print-mode wiring.
-```
-
-Rationale: the cut-point and summary-prompt logic operates over log
-entries (to produce a durable `EntryId` anchor) and is pure, so it lives
-in `aj-session` alongside the log it reasons about. The summarizer
-*inference* needs the agent's provider/model/auth, which are private to
-the `Agent`; rather than expose them, the agent gains one generic
-"complete this prompt out of band" method. Policy (thresholds, when to
-fire, the user-facing command) lives in the binary, which already owns
-the log handle and the config.
-
-## 3. Data model
-
-### 3.1 `ConversationEntryKind::Compaction`
-
-Add a variant to `ConversationEntryKind` (`aj-session/src/log.rs:106`):
-
-```rust
-/// A compaction checkpoint: the thread's history before
-/// `first_kept_entry_id` was summarized into `summary`. Projection
-/// (`Conversation::agent_messages` / `messages`) emits framed original
-/// user messages selected from that prefix, a synthetic summary, and
-/// everything from `first_kept_entry_id` onward verbatim. Compaction
-/// changes only the projection. All original entries stay on disk.
-Compaction {
-    /// LLM-generated structured summary that stands in for the
-    /// summarized prefix.
-    summary: String,
-    /// First entry of the recent suffix. Earlier history is represented
-    /// by `summary` and the selected original user messages.
-    first_kept_entry_id: EntryId,
-    /// Extra original user messages before the cut, in chronological
-    /// order. IDs refer to distinct stored Wire(User) messages on this
-    /// thread's ancestry. An absent field retains no extra users.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    retained_user_entry_ids: Vec<EntryId>,
-    /// Estimated context tokens before this compaction ran. Carried
-    /// for the UI ("freed ~N tokens") and telemetry; not used by
-    /// projection.
-    tokens_before: u64,
-    /// Files read / modified in the summarized range, surfaced so the
-    /// model knows what was touched without parsing the prose. `None`
-    /// when extraction found nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    details: Option<CompactionDetails>,
-    /// Priced usage summed across the successful summarizer calls.
-    #[serde(default)]
-    usage: Usage,
-},
-```
-
-`CompactionDetails` lives in `aj-session::compaction` (§4.6) and is
-serialized verbatim onto the entry.
+- `summary`: the text that stands in for the summarized prefix.
+- `first_kept_entry_id`: the first entry of the recent suffix. It must
+  exist in the log.
+- `retained_user_entry_ids`: extra original user messages before the cut,
+  in chronological order. Each must be a distinct original user message on
+  the current ancestry, strictly before the cut. An append with any other
+  ID is refused. Task notifications are not original user messages, even though
+  the model sees them in the user role. An absent field retains none.
+- `tokens_before`: estimated context tokens before the compaction. It is
+  shown in the UI and not used by projection.
+- `details`: the files read and modified in the summarized range, when
+  there are any (section 4.6).
+- `usage`: the priced usage summed across the summarizer calls.
 
 `retained_user_entry_ids` freezes the selection at compaction time. It
-contains only users before the suffix, not selected users already in it.
-Checkpoints without this field retain their summary-plus-suffix behavior.
+holds only users before the suffix, not selected users already in it.
 Resume never recomputes the selection under the current budget.
 
-### 3.2 Durability: `is_punctuation`
+The entry is committed when it is appended, like every entry of a stored
+session, so a session compacted and then abandoned reopens with the reduced
+context.
 
-A `Compaction` entry must be durable on its own — if a session is
-compacted and then abandoned before the next message, the compaction
-must still be on disk so the next resume sees the reduced context.
-Therefore `ConversationEntryKind::is_punctuation`
-(`aj-session/src/log.rs:163`) returns `true` for `Compaction`, flushing
-it (and any buffered non-punctuation entries) immediately, exactly like
-a `Message`.
+A failed compaction is stored as a `CompactionFailed` entry. It is a
+transcript error for display. It is not a checkpoint and changes neither
+the model context nor the accounting. A cancelled compaction stores
+nothing.
 
-### 3.3 Compaction-aware projection
+## 3. Projection
 
-`Conversation::agent_messages` (`aj-session/src/log.rs:301`) and
-`messages` (`:288`) are the only readers that turn the linearized entry
-chain into the message list the agent/provider consume. Both become
-compaction-aware with one shared helper. Algorithm over the linearized
-(chronological) `entries`:
+One projection turns the linearized entries of a branch into the
+message list the agent and the provider consume. It is the only place
+where compaction affects what the model sees:
 
-1. Find the index `c` of the **last** `Compaction` entry. If none, the
-   projection filters and projects `Message` entries normally.
-2. Read `first_kept_entry_id = K` and `retained_user_entry_ids` from `c`.
-   Find `K`'s index `k`. If `K` is missing in a corrupt or edited log,
-   use the marker's index `c` and log a warning. The suffix then contains
-   only messages after the marker.
-3. Resolve the selected IDs against original stored `Wire(User)` entries
-   strictly before `k` on this ancestry. If any resolve, emit historical
-   context framing (§3.4), followed by those originals in their original
-   chronological order, with all content blocks intact. Invalid references
-   cannot import other branches, task notices, or messages in the suffix.
-4. Emit the synthetic **summary message** built from `c`'s `summary`
-   (§3.4), then project every `Message` entry at index `>= k`. Skip
-   compaction markers. Selected users in the suffix stay in place and
-   are not repeated before the summary.
+1. Find the **last** `Compaction` entry `c`. Without one, project the
+   message entries as they are.
+2. Find the entry `K` that `c` names as `first_kept_entry_id`. If `K` is
+   missing, as in a corrupt or edited log, use `c` itself and log a
+   warning. The suffix then holds only the messages after the checkpoint.
+3. Resolve the retained IDs against original user messages strictly before
+   `K` on this ancestry. If any resolve, emit the historical-context
+   framing, then those originals in chronological order with all content
+   blocks intact. An invalid reference cannot import another branch, a
+   task notification or a message of the suffix.
+4. Emit the summary message, then every message entry from `K` on.
+   Checkpoints themselves are skipped. A selected user inside the suffix
+   stays in place and is not repeated before the summary.
 
-Why "last compaction wins": a second compaction's `summary` is generated
-with the previous summary as input (the update prompt, §4.5), so it
-already subsumes it, and its `first_kept_entry_id` points past the
-previous boundary. Its frozen user selection, summary, and retained
-suffix reconstruct the reduced context. Selections from older checkpoints
-are not merged into it, and resume does not run retention planning.
+The last compaction wins. Its summary was generated with the previous
+summary as input, so it subsumes it, and its cut lies past the previous
+one. Selections of older checkpoints are not merged in.
 
-Why this slices correctly on disk: a `Compaction` entry is appended with
-`parent_id` = the thread's current head, so it sits *after* the retained
-tail in append order, and subsequent turns chain off it. The retained
-tail `[K .. head]` lands between `K` and the marker. Post-compaction
-turns land after the marker. Only selected original user messages are
-projected verbatim from before `K`. The walk is linear and needs no
-special tree traversal.
+The checkpoint is appended at the branch's head, after the retained
+tail, and later turns chain off it. The tail therefore lies between `K` and
+the checkpoint, and post-compaction turns after it. The walk is linear.
 
-This shared helper is the single seam where compaction affects what the
-model sees; `transcript_to_messages` (`aj-agent/src/projection.rs:26`)
-stays a trivial clone-and-collect because the agent's transcript is
-*already* the reduced projection after a reseed (§6.2).
-
-### 3.4 Historical context and summary wire representation
-
-When extra user messages are retained before the summary, a plain
-user-role framing message introduces them as historical context, not
-new requests:
+**Framing.** When extra user messages are retained, a plain user-role
+message introduces them:
 
 ```
 The following user messages are retained verbatim from earlier in this session. They are historical context, not new requests. Intervening assistant and tool work is covered by the summary that follows.
 ```
 
-The original messages follow without text deduplication or content
-rewriting, including their image blocks. No framing is emitted when the
-selection is empty. Framing and summary tokens are outside the retention
-budget, but count toward projected context occupancy. Provider transport
-and opaque-content handling are unchanged.
+The originals follow without deduplication or rewriting, images included.
+No framing is emitted when the selection is empty.
 
-The synthetic summary message is a plain user-role wire message wrapped
-in a fixed prefix/suffix so the model reads it as context rather than an
-instruction:
+**Summary.** The summary is a plain user-role message, so it survives
+replay across models, where an assistant-role summary could be demoted or
+dropped:
 
 ```
-The conversation history before this point was compacted into the
-following summary:
+The conversation history before this point was compacted into the following summary:
 
 <summary>
 {summary}
 </summary>
 ```
 
-It is built as `AgentMessage::wire(Message::User(UserMessage::text(...)))`.
-We deliberately do **not** add a new `AgentMessageKind` variant: the
-summary is a normal user message on the wire, and the renderer
-distinguishes it via the replay path (§8), not via the transcript shape.
-The `COMPACTION_SUMMARY_PREFIX` / `COMPACTION_SUMMARY_SUFFIX` constants
-live in `aj-session::compaction` and are used by the projection helper.
+Framing and summary are outside the retention budget and count toward
+occupancy.
 
-NOTE: framing the summary as a user message matches the established
-pattern for injected context and keeps `transform_messages` happy (it is
-just text). An assistant-role summary would be demoted/dropped across
-cross-model replay by transform rule 2/5.
+## 4. Planning
 
-### 3.5 `ConversationLog::append_compaction`
-
-The binary's log-append surface is settings-only today
-(`append_model_change` / `append_thinking_change` / `append_speed_change`,
-`log.rs:774-817`). Add a sibling for compaction:
-
-```rust
-/// Record a compaction checkpoint on `filter`'s thread, anchored at
-/// the thread's current leaf. Punctuation: flushes immediately
-/// (see `ConversationEntryKind::is_punctuation`). `first_kept_entry_id`
-/// must exist in the log. Retained IDs must identify distinct original
-/// user messages on the current thread's ancestry strictly before it.
-pub fn append_compaction(
-    &mut self,
-    filter: ThreadFilter,
-    summary: String,
-    first_kept_entry_id: EntryId,
-    retained_user_entry_ids: Vec<EntryId>,
-    tokens_before: u64,
-    details: Option<CompactionDetails>,
-    usage: Usage,
-) -> Result<EntryRef, ConversationError>;
-```
-
-It anchors at `latest_leaf(filter)` (falling back to the system-prompt
-root) exactly like `append_settings_entry` (`log.rs:852`), validates
-that `first_kept_entry_id` exists, and appends a `Compaction` entry.
-Before appending, it rejects duplicate retained IDs and any ID that is
-not an original stored `Wire(User)` message on the current ancestry
-strictly before the cut. Task notices are not original user messages,
-even when their provider projection uses the user role. An empty selection
-preserves the existing append behavior.
-
-## 4. Compaction planning library (`aj-session::compaction`)
-
-A new module of pure functions. No provider, no async, no I/O — it takes
-entries/messages and returns a plan. This is where the bulk of the
-unit tests live.
+Planning is pure: it reads the linearized branch and calls no model.
+It yields nothing when there is nothing to summarize or when the last
+entry is already a checkpoint.
 
 ### 4.1 Token estimation
 
-Two sources, in priority order, matching how aj already measures
-occupancy:
+Two sources, in priority order:
 
-- **Authoritative**: the most recent assistant message's `usage`
-  (`input + cache_read + cache_write`) — the real prompt size the
-  provider reported. This is the same numerator the footer uses
-  (`footer_data.rs:113`).
-- **Heuristic fallback** for messages with no usage (or trailing
-  messages after the last assistant turn): `ceil(chars / 4)`, counting
-  text/thinking/tool-call argument characters, with a fixed 1,200-token
-  charge per image block. Retained user images keep their original blocks,
-  not placeholders.
+- **Reported**: the most recent assistant message's usage
+  (`input + cache_read + cache_write`), the prompt size the provider
+  reported. The footer uses the same number.
+- **Heuristic**, for messages without usage and for the messages after the
+  last assistant message: `ceil(chars / 4)` over text, thinking and
+  tool-call arguments, plus 1,200 tokens per image block.
 
-```rust
-/// Estimate context tokens for a single wire message (heuristic).
-pub fn estimate_message_tokens(message: &Message) -> u64;
+A retained assistant message's usage measures the prompt of its own request,
+not the reduced projection. When a checkpoint is more recent than every
+assistant message, the projection is estimated by the heuristic alone.
+`tokens_before`, `tokens_after` and the footer of a resumed session all use
+this estimate, so they describe the context the next request sends.
 
-/// Estimate the context tokens a linearized message list occupies,
-/// preferring the last assistant `usage` and estimating only the
-/// trailing messages after it.
-pub fn estimate_context_tokens(messages: &[Message]) -> ContextEstimate;
+### 4.2 Trigger
 
-/// Compaction-aware occupancy for a whole `Conversation`.
-pub fn estimate_conversation_context(conversation: &Conversation) -> ContextEstimate;
-```
+Automatic compaction fires when occupancy exceeds `compact_threshold`
+times the model's context window. Occupancy is the last assistant
+message's `input + cache_read + cache_write`. A model with no known window
+never triggers.
 
-A retained assistant message's `usage` measures the prompt for that
-turn, not the checkpoint's reduced projection. When a `Compaction` is
-the most recent entry among {compaction, assistant message},
-`estimate_conversation_context` estimates the projected messages
-(historical framing + selected users + summary + suffix) purely
-heuristically instead of anchoring on stale usage. Otherwise it defers to
-`estimate_context_tokens` over the projection. Both compaction
-`tokens_before` / `tokens_after` and resumed footer occupancy go through
-it, so the estimates describe the context sent on the next turn.
+### 4.3 Retention and cut point
 
-### 4.2 The trigger predicate
+`compact_keep_recent` is a shared approximate budget for verbatim content,
+independent of the model's window. Each plan selects afresh:
 
-```rust
-/// Whether occupancy has crossed the configured fraction of the window.
-/// `threshold` is a fraction in (0, 1]; `context_tokens` and
-/// `context_window` are absolute token counts.
-pub fn should_compact(context_tokens: u64, context_window: u64, threshold: f64) -> bool {
-    context_window > 0 && (context_tokens as f64) > (context_window as f64) * threshold
-}
-```
-
-The numerator at runtime is the footer occupancy
-(`turn_input + turn_cache_read + turn_cache_write`); the denominator is
-`agent.model_info().context_window`. Default `threshold` is `0.85`
-(§9).
-
-### 4.3 User-first retention and cut-point selection
-
-`compact_keep_recent` (default `20_000`) is a shared approximate
-verbatim-content budget, independent of the model's window size. There
-is no separate user-retention setting. Each compaction plan selects
-afresh and allocates the budget as follows:
-
-1. Reserve at most half the budget for whole original stored `Wire(User)`
-   messages. Scan newest-first across the full active ancestry, including
-   history before previous checkpoints. Select each message only if its
-   estimated cost fits the remaining reserve, otherwise skip it and keep
-   scanning. Task notices and synthetic projection messages are ineligible.
-   Equal text in distinct entries remains distinct, and the first prompt
-   has no pinned status.
-2. Subtract the actual selected token cost once from the shared budget.
-   All remaining capacity, including unused user reserve, goes to the
-   tool-safe recent suffix. Selected users encountered in the suffix cost
-   nothing more because they have already been charged.
-3. Persist only selected users strictly before the suffix in
-   `retained_user_entry_ids`, in original chronological order. Selected
-   users inside the suffix stay in place, without a second copy before
-   the summary.
+1. Reserve at most half the budget for whole original user messages. Scan
+   newest-first across the full active ancestry, including history before
+   earlier checkpoints. Select a message only if its estimated cost fits the
+   remaining reserve. Otherwise skip it and keep scanning. Task notifications
+   and synthetic projection messages are ineligible. Equal text in distinct
+   entries stays distinct, and the first prompt has no special status.
+2. Subtract the selected cost once from the budget. All that is left,
+   including unused reserve, goes to the recent suffix. A selected user inside
+   the suffix costs nothing more.
+3. Store only the selected users strictly before the suffix, in chronological
+   order.
 
 For example, a 20,000-token budget allows at most 10,000 for user
-selection. If the candidates cost 4,000, 8,000, and 3,000 newest-first,
-select the 4,000-token message, skip the 8,000-token message, and select
-the 3,000-token message. Their 7,000-token cost leaves 13,000 for other
-suffix content. A selected user inside that suffix is not charged again.
-
-User selection never truncates messages or strips image blocks. An
-oversized user message that does not fit the reserve remains represented
-only by the summary when it is outside the suffix. Summary and historical
-framing are outside this retention budget.
-
-The suffix obeys these constraints:
-
-- **Valid cut points** are user-message, task-notice, or assistant-message
-  starts. A `tool_result` is **never** a cut point: keeping a result whose
-  call was summarized away would orphan it on the wire. The transform
-  layer can synthesize results for orphaned calls, not repair orphaned
-  results.
-- **Keep-recent suffix**: walk backward from the head accumulating
-  estimated costs, excluding already-charged selected users. Exclude the
-  whole message that would exceed the remaining tail budget, then snap
-  forward to the next valid cut. Never split a message. The last indivisible
-  message or tool-call/result group is the minimum suffix and may exceed
-  the budget.
-- **Boundary start**: when a previous `Compaction` exists, the
-  summarized range starts at that compaction's `first_kept_entry_id`
-  (not the thread root) and its `summary` is fed to the update prompt
-  (§4.5). This limits suffix planning and new summary input, not user
-  selection across the full ancestry.
-- **Split turn**: if the chosen cut lands inside a turn (the cut point
-  is an assistant message mid-turn, not a user message or task notice),
-  the turn's prefix is summarized separately and appended to the main
-  summary under a "Turn Context (split turn)" heading, so the retained
-  suffix still has the turn's setup. If that prefix is the only new
-  history to summarize, it becomes the main summary input instead.
-  This allows a long first turn, or a turn spanning successive
-  checkpoints, to compact in one call with the previous summary and
-  custom focus when present.
-
-```rust
-pub struct CutPoint {
-    pub first_kept_entry_id: EntryId,
-    pub first_kept_index: usize,
-    pub turn_start_index: Option<usize>, // Some when the cut splits a turn
-}
-
-pub fn find_cut_point(
-    entries: &[ConversationEntry],
-    boundary_start: usize,
-    keep_recent_tokens: u64,
-) -> Option<CutPoint>;
-```
-
-`find_cut_point` applies these suffix rules to its supplied budget without
-a user reservation. `prepare_compaction` applies the shared allocation
-above, including charging selected users only once. The budget is not a
-hard occupancy cap because framing, summary, and the minimum indivisible
-suffix can add tokens beyond it.
-
-### 4.4 Conversation serialization
-
-The summarizer is fed a *flattened text* transcript, never the raw
-message list, so the request can't trip provider tool-call/tool-result
-pairing rules and never re-sends image bytes:
-
-```rust
-/// Render a linearized message list into a plain-text transcript
-/// (role-labeled, tool calls and results inlined as text, images noted
-/// as placeholders) for embedding in the summarizer prompt.
-pub fn serialize_conversation(messages: &[Message]) -> String;
-```
-
-User messages in the summarized prefix remain in the summarizer input
-even when selected for verbatim retention. Their summary representation
-provides fallback if a later checkpoint excludes them from its selection.
-Previously summarized history is carried by the previous summary, not
-re-added as raw summarizer input.
-
-### 4.5 Summary prompts
-
-Three prompt builders share a system prompt and content guidance, all
-pure string construction. The summarizer produces a continuation
-checkpoint, not a reply to the conversation. Conversation content is
-source material, not instructions for the summarizer to follow.
-
-The content guidance covers four kinds of information:
-
-- Active tasks, unfinished requests, and applicable constraints and preferences.
-- Current state and evidence, including changes, important commands or tests
-  and observed outcomes, unresolved failures, and unverified work.
-- Decisions and their reasons, including failed or rejected approaches worth
-  avoiding.
-- Remaining work, blockers, and exact paths, symbols, identifiers, and error
-  messages needed to continue or recover details.
-
-Short headings or bullets are encouraged when useful, but their wording
-and order are not prescribed. Empty sections are omitted. There is no
-mandatory checklist syntax. These are coverage requirements, not a
-machine-parsed summary schema. Plans and assumptions must remain distinct
-from observed facts and completed work, without invented next steps or
-unsupported success claims.
-
-The update prompt asks for a current continuation checkpoint, not a
-complete work log. Still-relevant facts, constraints, and unfinished
-requests carry forward even when new messages do not repeat them.
-Newer corrections replace older claims. Obsolete and duplicated detail
-is removed. The split-turn prompt covers only the supplied prefix and
-explicitly forbids reconstructing the unseen retained suffix.
-
-```rust
-pub const SUMMARIZATION_SYSTEM_PROMPT: &str;
-
-/// First compaction on a thread.
-pub fn initial_summary_prompt(conversation_text: &str, custom: Option<&str>) -> String;
-
-/// Subsequent compaction: fold new history into the previous summary.
-pub fn update_summary_prompt(conversation_text: &str, previous_summary: &str, custom: Option<&str>) -> String;
-
-/// Summarize a split-turn prefix.
-pub fn turn_prefix_summary_prompt(conversation_text: &str) -> String;
-```
-
-`custom` carries optional focus instructions supplied through the host API.
-
-### 4.6 File-op extraction and `CompactionDetails`
-
-```rust
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompactionDetails {
-    pub read_files: Vec<String>,
-    pub modified_files: Vec<String>,
-}
-
-/// Scan summarized messages for file operations, keyed off the builtin
-/// tool names (`read_file`, `edit_file`, `write_file`) and their `path`
-/// arguments. Carries forward a prior
-/// compaction's details so the running lists don't lose earlier files.
-pub fn extract_file_ops(messages: &[Message], previous: Option<&CompactionDetails>) -> CompactionDetails;
-```
-
-The resolved read/modified lists are appended to the summary text (so
-the model sees them) *and* stored on the entry's `details` (so the next
-compaction carries them forward). Tool names are passed in / kept as
-module constants to avoid a hard dependency on `aj-tools`.
-
-### 4.7 The plan type
-
-```rust
-/// Everything the host needs to run one compaction, computed purely
-/// from the linearized log.
-pub struct CompactionPlan {
-    pub first_kept_entry_id: EntryId,
-    /// Extra selected original users before the suffix, in chronological
-    /// order. Empty when none are retained outside the suffix.
-    pub retained_user_entry_ids: Vec<EntryId>,
-    pub messages_to_summarize: Vec<Message>,
-    pub turn_prefix_messages: Vec<Message>, // empty unless split turn
-    pub previous_summary: Option<String>,
-    pub tokens_before: u64,
-    pub file_ops: CompactionDetails,
-}
-
-/// Build a plan, or `None` when compaction is not applicable (nothing to
-/// summarize, or the last entry is already a `Compaction`).
-pub fn prepare_compaction(
-    conversation: &Conversation,
-    keep_recent_tokens: u64,
-) -> Option<CompactionPlan>;
-```
-
-`prepare_compaction` finds the previous compaction boundary, computes
-`tokens_before`, selects users across the full ancestry, chooses the
-tool-safe suffix from the remaining budget, and collects the summary
-ranges without filtering out selected users. It returns the extra
-pre-suffix IDs for the checkpoint. It does **not** call the model.
-Summary generation is the host's job (§7.1), because it needs the provider.
-
-## 5. (reserved)
-
-## 6. Agent runtime additions (`aj-agent`)
-
-The agent gains three generic mechanisms and three events. Nothing
-compaction-specific (no prompts, no thresholds) lives in `aj-agent`.
-
-### 6.1 `Agent::complete_oneshot`
-
-```rust
-/// Run a single, bus-silent completion against the agent's provider and
-/// return the complete priced assistant message. Does not touch the
-/// transcript, emits no `Message*` / `UsageUpdate` events (so persistence
-/// never sees it), and does not accumulate usage. Honors the supplied
-/// cancellation token.
-///
-/// Used for out-of-band model calls — today, generating a compaction
-/// summary. `max_tokens` caps the response; `system_prompt` and the
-/// single user `text` define the request.
-pub async fn complete_oneshot(
-    &self,
-    system_prompt: &str,
-    text: String,
-    max_tokens: u64,
-    cancel: CancellationToken,
-) -> Result<AssistantMessage, TurnError>;
-```
-
-It builds a `Context { system_prompt, messages: [user(text)], tools: [] }`
-and drives `provider.stream_simple` with the agent's `model_info` and a
-clone of `stream_options` (output capped at `max_tokens`, thinking left
-at the agent's default unless the summary budget is too small), then returns
-the finalized message with its provider usage. Because it takes `&self` and emits
-nothing, the binary can call it while holding the agent lock between
-turns without disturbing transcript or persistence.
-
-NOTE: it is bus-silent by design. We do *not* want a summarizer turn to
-produce a `MessageEnd` (which the persistence listener would write to the
-log) or a per-call `UsageUpdate`. `run_compaction` owns the calls, persists
-their aggregate on the checkpoint, and emits one aggregate accounting update
-only after that append commits.
-
-### 6.2 `Agent::reseed_transcript`
-
-`seed_session` (`lib.rs:440`) is contracted as call-once-before-first-turn
-and also sets the system prompt and sub-agent counter. Compaction needs
-to replace the transcript on a *live, shared, between-turns* agent.
-Add a focused method:
-
-```rust
-/// Replace the in-memory transcript wholesale. Contract: call only
-/// while no turn is in flight (the caller holds the agent lock and is
-/// not inside `prompt` / `wake` / `continue_run`). Used by host-driven
-/// compaction to install the reduced post-compaction projection; the
-/// durable record is the log's `Compaction` entry, from which an
-/// identical transcript is reconstructed on resume.
-pub fn reseed_transcript(&mut self, transcript: Vec<AgentMessage>);
-```
-
-The system prompt and sub-agent counter are untouched (compaction
-changes neither).
-
-### 6.3 `Agent::account_usage`
-
-Normal assistant terminals and committed compactions share one live accounting
-transition. Its public API is exclusive and typed:
-
-```rust
-pub enum UsageAccounting {
-    AssistantTerminal,
-    CommittedCompaction {
-        reason: CompactionReason,
-        tokens_before: u64,
-        tokens_after: u64,
-        summary: String,
-    },
-}
-
-pub async fn account_usage(
-    &mut self,
-    delta: &Usage,
-    accounting: UsageAccounting,
-) -> Result<(), TurnError>;
-```
-
-The transition snapshots the pre-add accumulator and folds the complete `Usage`
-under one state lock before awaiting any listener. Its `&mut self` receiver keeps
-that fold and its event delivery in one linear Agent history, so concurrent legal
-callers cannot publish duplicate or reordered cumulative snapshots. Cancellation
-or listener failure cannot erase spend that already happened. Assistant terminals
-select `AssistantTerminal` and emit `UsageUpdate`.
-
-Only a committed checkpoint selects `CommittedCompaction`, after its append
-succeeds. The Agent constructs one successful `CompactionEnd` containing the
-cumulative `TokenUsage` snapshot. The checkpoint's durable tag identifies both
-the summary and its usage. Replay regenerates this same event from the log,
-so attach filtering accepts or discards the checkpoint and its spend together.
-There is no separate transient usage update or paired-event delivery cohort.
-
-### 6.4 Compaction events
-
-Add to `AgentEvent` (`aj-agent/src/events.rs`), all carrying `agent_id`:
-
-```rust
-/// Compaction has started for this agent. Renderers show a
-/// "compacting…" indicator. Transient — not persisted.
-CompactionStart { agent_id: AgentId, reason: CompactionReason },
-
-/// Compaction finished. `tokens_before` / `tokens_after` are the
-/// estimated occupancy on either side (for a "freed ~N tokens"
-/// notice). `summary` is the generated text so the renderer can show
-/// a compaction-summary row live (resume gets it from the log via
-/// replay, §8). A committed checkpoint carries its durable tag and
-/// cumulative usage, regenerated from the `Compaction` log entry.
-/// An unsuccessful end is transient, with no usage. `error` is set when
-/// compaction failed (e.g. summarizer error) and nothing was written.
-CompactionEnd {
-    agent_id: AgentId,
-    reason: CompactionReason,
-    tokens_before: u64,
-    tokens_after: u64,
-    /// Cumulative checkpoint spend, present on a committed checkpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    usage: Option<TokenUsage>,
-    summary: Option<String>,
-    error: Option<String>,
-},
-```
-
-`CompactionReason` is `Manual | Threshold | Overflow` (serde
-`snake_case`). The host owns orchestration and emits `CompactionStart`,
-`CompactionProgress`, and unsuccessful `CompactionEnd` through the Agent's
-non-accounting `emit_event` passthrough. A successful checkpoint end, any end
-carrying usage, and `UsageUpdate` are rejected there and belong only to the exclusive
-`Agent::account_usage` transition. Components that need to observe events after
-the Agent is shared retain an `EventSubscriptions` capability, not an emitter.
-Concretely we reuse the pump path (`world.pump.handle(tui, &event)`) for the live
-indicator and add `CompactionStart`/`CompactionEnd` arms to the pump and to
-`--format json` output.
-
-NOTE: keeping these events serializable preserves the `--format json`
-contract (the locked
-`agent_event_serializes_with_internally_tagged_snake_case_shape` test in
-`aj-agent::events` gets new cases).
-
-### 6.5 `Agent::last_assistant`
-
-The host's post-turn policy (overflow recovery, threshold compaction)
-needs two facts about the turn that just ran: whether it was a context
-overflow, and how much context it occupied. Both are properties of the
-turn's terminal assistant message, which the agent produces but, for an
-error/overflow turn, deliberately does *not* push onto the transcript
-(only aborts are pushed; `lib.rs:1159-1187`). Rather than have the
-binary re-read and re-linearize the log to recover that message, the
-agent retains it:
-
-```rust
-/// The terminal assistant message of the most recent inference
-/// (success, error, or abort), or `None` before the first turn.
-/// Retained so the host can classify the turn — context overflow via
-/// `aj_models::errors::is_context_overflow`, occupancy via `usage` —
-/// without re-reading the log.
-///
-/// Reflects the most recent inference only; its value is meaningless
-/// after `reseed_transcript` until the next turn, and the host reads it
-/// solely right after driving a turn.
-pub fn last_assistant(&self) -> Option<&AssistantMessage>;
-```
-
-Set wherever the terminal assistant `MessageEnd` is emitted
-(`lib.rs:1151`), so it covers the success, error, and abort paths alike.
-This subsumes the earlier log-reading overflow detection and, by also
-exposing `usage`, lets the threshold trigger read occupancy from the
-agent rather than the UI footer (`footer_data.rs:113` derives the same
-`input + cache_read + cache_write` sum from the same `UsageUpdate`).
-
-## 7. Host orchestration (`aj`)
-
-Two host modules tie the pieces together. `aj::compaction` owns the
-compaction *mechanics* (`run_compaction`); `aj::turn` owns the turn
-*lifecycle* — driving one user-initiated turn and its automatic
-continuations (overflow recovery, queued-work delivery, threshold
-compaction) to quiescence. Both the interactive TUI and `--print` drive
-turns through `aj::turn::drive_turn`, so the post-turn policy lives in
-exactly one place instead of being duplicated across the two frontends'
-loops.
-
-### 7.1 `run_compaction` (mechanics)
-
-`run_compaction` is the shared core for all three compaction triggers.
-It assumes no turn is in flight and that the caller holds the agent
-exclusively:
-
-```rust
-/// Plan, summarize, persist, and reseed. Returns the outcome for the
-/// caller to render. Takes the agent by exclusive borrow and locks
-/// `log` around planning and persist+reseed; assumes no turn is in
-/// flight.
-pub async fn run_compaction(
-    agent: &mut Agent,
-    log: &Arc<TokioMutex<ConversationLog>>,
-    reason: CompactionReason,
-    custom_instructions: Option<&str>,
-    keep_recent_tokens: u64, // shared user-and-suffix verbatim budget
-    cancel: CancellationToken,
-) -> CompactionOutcome;
-```
-
-Steps:
-
-1. **Linearize** the user thread: lock `log`, `latest_leaf(USER)` →
-   `linearize(head, USER)` → `Conversation`. Compute occupancy
-   `tokens_before`.
-2. **Plan**: `prepare_compaction(&conversation, keep_recent_tokens)`.
-   `None` → outcome `NothingToDo` (session too small, or already
-   compacted). Release the log lock before the network call.
-3. **Summarize**: build the prompt (`update_summary_prompt` when
-   `plan.previous_summary` is set, else `initial_summary_prompt`;
-   `serialize_conversation(&plan.messages_to_summarize)` for the body;
-   `custom_instructions` threaded in). When `plan.turn_prefix_messages`
-   is non-empty, generate the turn-prefix summary in a second
-   `complete_oneshot` call and append it. Sum the priced usage of every
-   successful summarizer response and append the file-op lists.
-   `max_tokens` for the summary = `min(model.max_tokens, SUMMARY_OUTPUT_CAP)`.
-4. **Persist**: lock `log`, `append_compaction(USER, summary,
-   plan.first_kept_entry_id, plan.retained_user_entry_ids,
-   plan.tokens_before, Some(plan.file_ops),
-   Some(summarizer_usage.clone()))`.
-5. **Reseed**: re-linearize from the new head → `agent_messages()`
-   (now compaction-aware) → `reseed_transcript(...)` on the borrowed
-   agent, trimming a trailing failed assistant (below).
-6. Compute `tokens_after` (occupancy of the reseeded projection), file the
-   checkpoint's `AppendHandoff` under its owning guard while holding the log
-   lock. Keep publication under that same log guard so a concurrent append
-   cannot publish a higher sequence first. Listeners must not acquire the log
-   lock for `CompactionEnd`. Pass the terminal fields and `summarizer_usage` through
-   `Agent::account_usage(CommittedCompaction { .. })`. Accounting is folded
-   synchronously before the first listener await. The Agent emits one successful
-   `CompactionEnd` containing the cumulative usage. Persistence consumes the
-   handoff to tag that event with the committed checkpoint's identity and position.
-   Dropping the in-flight future clears an unconsumed handoff through its owner
-   guard, without clearing another append's handoff or erasing committed spend.
-7. Return `Compacted { tokens_before, tokens_after, summary }`.
-
-Cancellation (`cancel`) is selected against the `complete_oneshot`
-calls; an abort before step 4 leaves the log untouched (no partial
-compaction is ever persisted). A summarizer error returns
-`Failed { error }` and likewise writes nothing.
-
-Each summarizer response must finish normally with non-whitespace text
-and no tool calls. An empty, thinking-only, length-limited, or tool-use
-response fails compaction without changing the live transcript or
-writing a checkpoint. This applies to both calls of a split-turn
-compaction, so a valid history summary cannot mask an invalid prefix
-summary. The checks validate completion, not the factual quality or
-formatting of the model's summary.
-
-**Trailing-failed-assistant trim.** During the reseed, `run_compaction`
-drops a trailing `Error`/`Aborted` assistant message that carries no
-tool calls, so the reseeded transcript ends in a user/tool-result
-message. This is not overflow-specific: it makes the reseed faithful to
-what the wire sends, since `transform_messages` rule 5
-(`aj-models/src/transform.rs:328`) already drops such messages and their
-orphaned tool results before inference. It also leaves the transcript
-valid for `Agent::continue_run`, which the overflow path (§7.2) relies
-on. A failed assistant *with* tool calls is left untouched — its
-tool-result messages, not the assistant, are the tail — so we never
-orphan a result.
-
-### 7.2 The turn driver (`aj::turn`)
-
-The driver owns the *compaction* continuations of a turn — recovering
-from a context overflow, and compacting once occupancy crosses the
-threshold — as one post-turn ladder. Delivering queued work (task
-notices, follow-up messages) is deliberately *not* the driver's job; it
-is the host loop's, which starts a `Wake` turn when an agent goes idle
-with work pending (§7.4). That keeps wake delivery to a single site.
-
-```rust
-/// How a turn sequence begins.
-pub enum TurnStart {
-    Prompt(String),                // typed user text → Agent::prompt
-    Content(Vec<UserContent>),     // CLI launch content → prompt_with_content
-    Wake,                          // drain queues/notices → Agent::wake (started by the host)
-    Compact {                      // compact only, no turn
-        reason: CompactionReason,
-        instructions: Option<String>,
-    },
-}
-
-/// The automatic compaction continuations applied after a turn settles.
-pub struct TurnPolicy {
-    pub recover_overflow: bool,      // compact + retry once on a context-overflow failure
-    pub auto_threshold: Option<f64>, // Some(t): compact after a turn that crossed t of the window
-    pub keep_recent: u64,            // shared user-and-suffix verbatim budget
-}
-
-/// Drive one turn and its automatic compaction continuations to
-/// quiescence. `reconfigure` re-stamps the latest staged run-config
-/// onto the agent before each inference (interactive's
-/// `apply_turn_config`; a no-op in print). Returns the final result:
-/// `Ok` when the sequence settled, `Recoverable`/`Aborted` for the
-/// caller to surface, `Fatal` to bubble out.
-pub async fn drive_turn(
-    agent: &mut Agent,
-    log: &Arc<TokioMutex<ConversationLog>>,
-    policy: &TurnPolicy,
-    start: TurnStart,
-    reconfigure: impl FnMut(&mut Agent),
-    cancel: CancellationToken,
-) -> Result<(), TurnError>;
-```
-
-A `Compact` start runs `run_compaction` and returns immediately — there
-is no turn and no ladder. Otherwise the driver runs the initial action
-(a `Wake` start delivers queued work, when the host asked for one) and
-then loops:
-
-1. **Reactive overflow (once).** If the result is `Recoverable`,
-   `policy.recover_overflow` holds, and `agent.last_assistant()` is a
-   context overflow (§6.4, `is_context_overflow`): on the first
-   occurrence, `run_compaction(Overflow)` then `continue_run`, and loop.
-   On a repeat, return the error wrapped with "context overflow recovery
-   failed; reduce context or switch to a larger-context model." The
-   once-only guard is a local `bool`.
-2. **Other error / abort.** Any other `Err` — a non-overflow
-   `Recoverable`, or `Aborted` — returns unchanged for the caller to
-   surface.
-3. **Threshold compaction.** If `policy.auto_threshold` is `Some(t)`
-   and occupancy crossed `t` of the window, `run_compaction(Threshold)`
-   and return. Occupancy is `agent.last_assistant().usage`
-   (`input + cache_read + cache_write`, the footer's numerator) over
-   `agent.model_info().context_window`, via
-   `aj_session::compaction::should_compact`. Threshold compaction does
-   not re-drive: the next turn happens on the next prompt or wake.
-
-We compact first and let the host wake the agent for any queued work
-afterward, so that work runs against the freshly reduced context rather
-than growing an already-over-threshold prompt further. The cancel token
-covers the whole sequence, so one Ctrl+C stops the current inference and
-every continuation.
-
-### 7.3 Manual compaction
-
-The command catalog (`src/aj-app/src/commands.rs`) exposes `compact` in
-category `session` with `CommandAction::Compact` and description
-"Summarize earlier context to free up the window."
-
-Choosing it in the palette sends `Command::Compact { instructions: None }`
-through `Control`. The palette action takes no arguments. Typing `/` in
-an empty editor opens the command palette as a discoverability shortcut.
-
-The host API accepts optional free-form focus instructions and passes them
-through `TurnStart::Compact { reason: Manual, instructions }` to the
-compaction flow. Manual compaction targets Main and is refused while Main
-is busy. The interactive client renders that conflict with
-`session_busy_notice("compact")`.
-
-### 7.4 Interactive integration
-
-Turns run as tasks on the `turns` JoinSet so the `select!` loop stays
-responsive to input/render while a multi-second inference or summarizer
-call runs, and so Main and sub-agent continuations run concurrently. A
-single `spawn_turn(target, start, policy)` helper replaces the former
-per-step helpers (`spawn_prompt_turn`, `spawn_wake_turn`,
-`spawn_compaction_turn`, `spawn_overflow_recovery_turn`,
-`spawn_auto_turn`): it resolves the agent handle, mints the
-per-sequence cancel token into `turn_cancels` (which Ctrl+C fires), and
-spawns a task that locks the agent and calls `drive_turn` with
-`reconfigure = |a| apply_turn_config(target, a, ...)`.
-
-Policy per target:
-
-- **Main**: `recover_overflow = auto_compact`,
-  `auto_threshold = auto_compact.then_some(threshold)`.
-- **Sub-agent continuation**: `recover_overflow = false`,
-  `auto_threshold = None`. Compaction operates on the log's USER (Main)
-  thread, so it is Main-only.
-
-Because the driver owns the post-turn compaction ladder, the completion
-arm collapses to cleanup, the post-turn wake, and outcome rendering:
-drop the cancel token, reconcile pump idle state (and the Main→sub idle
-drain), spawn a `Wake` turn if the just-idled agent has queued work,
-then `match` the result — `Ok` does nothing, `Aborted` shows "Turn
-cancelled.", `Recoverable` shows the error (the driver already exhausted
-recovery and wrapped the give-up message), `Fatal` breaks the loop. The
-`compaction_agents` and `overflow_recovered` sets and the threshold
-re-check are gone — they were the externalized state the driver now
-holds internally.
-
-Delivering queued work is the loop's single responsibility, not the
-driver's: the completion-arm wake handles work left when a turn ends,
-and the two *idle* wake triggers in the bus-event arm (a background
-`TaskEnd`, and a sub's nested `AgentEnd`) handle work that arrives while
-an agent is already idle. All three funnel through one `spawn_wake_turn`
-with its idle gate; `Agent::wake` is a no-op once the queue is drained,
-so overlapping triggers are cheap. (Steering, by contrast, is urgent and
-is drained *inside* the running turn by the agent itself, a layer below
-the driver — see §6/the agent's in-loop drain.)
-
-Mid-sequence progress renders from the bus exactly as before
-(`AgentStart`/`AgentEnd`, `MessageEnd`, `CompactionStart`/
-`CompactionEnd`, `Notice`), so moving the lifecycle into one task
-changes nothing the user sees while it runs.
-
-### 7.5 Print mode
-
-Print owns the agent by value and is one-shot, so it drives the sequence
-inline (no task) and uses the returned result for its exit status:
-
-```rust
-let policy = TurnPolicy {
-    recover_overflow: config.auto_compact,
-    auto_threshold: None, // one-shot: never compact-then-exit
-    keep_recent: config.compact_keep_recent,
-};
-let result =
-    drive_turn(&mut agent, &log, &policy, TurnStart::Content(content), |_| {}, cancel).await;
-```
-
-This replaces print's bespoke overflow-detect-and-retry block. Overflow
-recovery runs before background-task teardown so the retried turn can
-still use tools. In `--format json` the `CompactionStart`/`End` pair
-still reaches the stream, because `run_compaction` emits them on the bus
-and the JSON listener is subscribed.
-
-### 7.6 `aj compact` CLI subcommand
-
-Not implemented. A headless one-shot `aj compact [session_id]` would
-build an agent for a resolved session and run a single
-`run_compaction(Manual)` without sending a turn, but it duplicates print
-mode's agent-construction path for marginal value. Compaction is reached
-through the interactive `compact` palette action, the automatic threshold
-trigger, and the reactive overflow path (including under `--print`),
-which together cover the intended use. Revisit if a scripted "compact
-this session" entry point is needed.
-
-## 8. Replay
-
-`replay` (`aj-session/src/replay.rs`) maps each persisted entry onto
-renderer events so a resumed session looks like a live one. The
-`Compaction` arm of `ReplayState::project_entry` emits one durable
-`CompactionEnd { reason: Manual, tokens_before, tokens_after, usage,
-summary: Some(summary), error: None }`. Its `tokens_after` is
-`estimate_conversation_context` of the user thread linearized up to the
-compaction (the reduced projection's occupancy). The retained tail's usage
-is stale, so this keeps a resumed footer from showing pre-compaction occupancy.
-
-The event's `TokenUsage` contains the replay accumulator before the compaction
-and the checkpoint delta, then replay advances that accumulator. Summary and usage share one durable tag
-in live delivery and replay, with no separate transient update.
-
-Crucially, replay's other arms are unaffected: the summarized prefix
-entries are still in the log and `replay` still walks them in order, so
-the *scrollback* shows the full historical conversation, while the
-*model context* (rebuilt via `agent_messages`) is the reduced
-projection. Replay is about what the user sees; projection is about what
-the model sees. They intentionally diverge after a compaction. The
-replay `Compaction` row marks the boundary in the scrollback.
-
-The checkpoint usage row is keyed directly by the event's durable compaction id,
-not by ambient reducer state or the preceding assistant. Re-serving an older
-cursor or rebuilding from a fresh epoch therefore updates that row rather than
-duplicating it or overwriting later assistant usage.
-
-## 9. Configuration
-
-Three persisted options (durable, like every other setting — no
-session-only toggle), added to `Config` (`aj-conf/src/lib.rs`),
-`Default`, and `Config::OPTIONS`:
-
-```rust
-/// Whether the agent automatically compacts context when occupancy
-/// crosses `compact_threshold`. Defaults to `true`. Also gates the
-/// reactive (overflow) recovery path.
-pub auto_compact: bool,            // default true
-
-/// Fraction of the model's context window at which auto-compaction
-/// fires (Claude-style "context left until auto-compact"). Defaults
-/// to 0.85. Clamped to (0, 1].
-pub compact_threshold: f64,        // default 0.85
-
-/// Shared approximate verbatim-content budget after compaction. At most
-/// half selects original user messages, with the remaining capacity
-/// keeping a tool-safe recent suffix. Excludes summary and framing.
-/// A fixed budget, not a fraction of the window. Defaults to 20_000.
-pub compact_keep_recent: u64,      // default 20_000
-```
-
-`auto_compact` uses `ValueKind::Bool` and `bool_item`. `compact_threshold`
-needs a numeric kind, which the schema lacks today
-(`ValueKind` is `String | Bool | Enum | StringList`, `lib.rs:565`).
-Add:
-
-```rust
-ValueKind::Number,   // Display: "number"
-```
-
-with a `display`/`apply_toml`/`to_toml` path: `apply_toml` parses a TOML
-float (accepting integers too), validates the `(0, 1]` range for
-`compact_threshold` and returns a `toml::de::Error` otherwise;
-`to_toml` emits the float only when it differs from the default
-(a `number_item(value, default)` helper mirroring `bool_item`,
-`lib.rs:696`). The drift test
-`test_options_table_matches_config_fields` covers the new fields.
-
-NOTE: `ValueKind::Number` is added properly (parsed, range-validated,
-round-tripped) rather than smuggling a number through a string — see the
-project guidance on not downgrading designs.
-
-## 10. Testing
-
-Pure planning (`aj-session::compaction`), the bulk of coverage:
-
-- Token estimation: usage-preferred vs heuristic fallback; image charge.
-- `should_compact`: boundary at exactly the threshold; zero window.
-- Suffix selection excludes a whole message that would exceed the budget
-  and snaps forward to a user, notice, or assistant start, never a
-  `tool_result`. It retains the last indivisible message or tool-call/result
-  group even when oversized, detects split turns, and honors `boundary_start`.
-- User selection is newest-first over the full active ancestry, including
-  pre-checkpoint history. It skips messages that do not fit, preserves
-  equal-text entries independently, does not pin the first prompt, and
-  excludes task notices. Images retain their blocks and 1,200-token charge.
-- Shared budgeting subtracts selected user costs once, returns unused
-  reserve to the suffix, and does not charge selected suffix users again.
-- `serialize_conversation`: tool calls/results inlined; images noted.
-- `extract_file_ops`: read/edit/write tools picked up; previous details
-  carried forward.
-- `prepare_compaction`: `None` when too small / already compacted.
-  Summary ranges include selected users, and `retained_user_entry_ids`
-  contains only pre-suffix users. Users excluded by a later selection
-  still have summary fallback.
-
-Log + projection (`aj-session::log`):
-
-- `append_compaction` flushes immediately (punctuation) and round-trips
-  through `resume`. It rejects duplicate, off-ancestry, non-user, notice,
-  and at-or-after-cut retained IDs.
-- `agent_messages` / `messages` emit framing, selected originals in
-  chronological order, summary, and suffix. Selected suffix users appear
-  only in place. Empty selections omit framing. The latest checkpoint wins,
-  and missing `first_kept_entry_id` falls back safely.
-- Resume uses the frozen IDs even under a changed retention budget.
-  Checkpoints without the field keep their summary-plus-suffix projection.
-
-Replay: a `Compaction` entry yields the summary row; the prefix entries
-still replay into scrollback.
-
-Agent (`aj-agent`): `complete_oneshot` emits no message or usage event
-and leaves the transcript untouched (scripted provider);
-`reseed_transcript` replaces the transcript. Event serialization cases
-for `CompactionStart`/`End`.
-
-Host (`aj`): a scripted end-to-end `run_compaction` over a seeded log
-(summary from the scripted provider) producing a `Compaction` entry and
-a reduced reseed; the trailing-failed-assistant trim. The
-`aj::turn::drive_turn` ladder with a scripted provider: a context
-overflow triggers one compact-and-retry that then succeeds; a second
-overflow returns the wrapped give-up error; a successful over-threshold
-turn compacts once and stops; queued work wakes before a threshold
-compaction; a sub-agent policy never compacts. `Agent::last_assistant`
-reflects the terminal message for both an overflow error and a success.
-
-Config: parse/round-trip `compact_threshold`; range rejection; drift
-test.
-
-## 11. Phasing
-
-1. **Data model + projection.** `ConversationEntryKind::Compaction`,
-   `append_compaction`, `is_punctuation`, compaction-aware
-   `agent_messages`/`messages`, replay arm. Pure, well-tested; no
-   behavior change until something writes a `Compaction` entry.
-2. **Planning library.** `aj-session::compaction` end to end (estimation,
-   cut-point, serialize, prompts, file-ops, `prepare_compaction`).
-3. **Agent mechanisms.** `complete_oneshot`, `reseed_transcript`,
-   `CompactionStart`/`End` events.
-4. **Host orchestration + manual path.** `aj::compaction::run_compaction`,
-   `compact` palette action, optional host API instructions, interactive
-   `spawn_compaction` + notice + footer accessor. End-to-end manual
-   compaction.
-5. **Auto + reactive triggers.** Threshold check in the turn-completion
-   arm; overflow detection + retry-once in interactive and print mode;
-   config (`auto_compact`, `compact_threshold`, `ValueKind::Number`).
-6. **Polish.** Live "compacting…" indicator + compaction-summary row
-   rendering; footer wording near the threshold ("context until
-   auto-compact").
-7. **Turn driver.** `Agent::last_assistant`; the `aj::turn` module
-   (`TurnStart`, `TurnPolicy`, `drive_turn`); fold the per-step spawn
-   helpers and the completion-arm policy into `spawn_turn` + `drive_turn`
-   (interactive) and one `drive_turn` call (print). A behavior-preserving
-   refactor of the phase-4/5 wiring that moves the post-turn policy to a
-   single site.
-
-## 12. Open questions / flagged tradeoffs
-
-- **In-loop proactive compaction.** This spec compacts *between*
-  top-level turns plus reactive overflow recovery — matching the
-  reference design and respecting aj's agent/log/bus split. It cannot
-  proactively compact mid-turn during a long tool-call chain; that case
-  costs one wasted overflow round-trip before recovery. Moving a
-  compaction checkpoint inside `execute_turn` would avoid the wasted
-  round-trip but pulls summarization/persistence concerns into
-  `aj-agent` and needs a new event + anchor mechanism. Deferred; revisit
-  if long single-turn overflows prove common.
-- **Retention budget.** `compact_keep_recent` (default 20_000) is a fixed,
-  shared approximate budget for original user messages and the recent
-  suffix, not a fraction of the model's window. At most half selects users,
-  and unused reserve goes to the suffix. Summary and framing are outside
-  the budget, and the minimum indivisible suffix may exceed it. The
-  existing setting controls retention without an additional knob.
-- **Summarizer model.** The summary is generated with the session's
-  active model. A cheaper/faster dedicated summarizer model could be a
-  later option; for now "one model per session" keeps auth and
-  configuration simple.
+selection. If the candidates cost 4,000, 8,000 and 3,000 newest-first, the
+4,000 and 3,000 messages are selected and the 8,000 one is skipped. Their
+7,000 leaves 13,000 for the suffix.
+
+Selection never truncates a message or strips its images. A user message
+too large for the reserve is represented by the summary alone when it lies
+outside the suffix.
+
+The suffix obeys these rules:
+
+- **Valid cut points** are the starts of user messages, task notifications and
+  assistant messages. A tool result is never a cut point: a result whose
+  call was summarized away would be orphaned on the wire.
+- **Walk back from the head** and add up estimated costs, leaving out
+  selected users already charged. Exclude the whole message that would
+  exceed the budget, then snap forward to the next valid cut. A message is
+  never split. The last indivisible message or tool-call and result group
+  is the minimum suffix and may exceed the budget.
+- **Boundary start.** After an earlier compaction, the range to summarize
+  starts at that checkpoint's `first_kept_entry_id`, and its summary feeds
+  the update prompt. This bounds the suffix and the new summary input, not
+  user selection.
+- **Split turn.** When the cut lands on an assistant message inside a turn,
+  the turn's prefix is summarized separately and appended to the summary,
+  so the suffix keeps the turn's setup. When that prefix is the only new
+  history, it is the main summary input instead. A long first turn, or a
+  turn that spans successive checkpoints, then compacts in one call.
+
+The budget is not a hard cap on occupancy: framing, summary and the minimum
+suffix can exceed it.
+
+### 4.4 Summarizer input
+
+The summarizer gets a flattened text transcript, never the raw messages:
+roles are labelled, tool calls and results are inlined as text, and images
+are placeholders. The request therefore cannot break tool-call pairing
+rules and sends no image bytes.
+
+User messages in the summarized range stay in the summarizer input even
+when they are selected for verbatim retention. The summary then still
+covers them if a later checkpoint does not select them. History summarized
+before is carried by the previous summary and not fed in again.
+
+### 4.5 Summary requirements
+
+There are three prompts: a first summary, an update of a previous summary,
+and a split-turn prefix. They share one system prompt. The summarizer
+writes a continuation checkpoint, not a reply. The messages are
+source material, not instructions for it.
+
+A summary covers:
+
+- Active tasks, unfinished requests, and applicable constraints and
+  preferences.
+- Current state and evidence: changes, important commands or tests and
+  their observed outcomes, unresolved failures, and unverified work.
+- Decisions and their reasons, including failed or rejected approaches
+  worth avoiding.
+- Remaining work, blockers, and the exact paths, symbols, identifiers and
+  error messages needed to continue.
+
+These are coverage requirements, not a schema. Headings and their order are
+free, and empty sections are omitted. Plans and assumptions stay distinct
+from observed facts and completed work. The summary invents no next steps
+and claims no unsupported success.
+
+The update prompt asks for a current checkpoint, not a work log. Facts,
+constraints and unfinished requests that still hold carry forward even when
+new messages do not repeat them. Newer corrections replace older claims.
+The split-turn prompt covers only the supplied prefix and forbids
+reconstructing the suffix it cannot see.
+
+The host API can pass free-form focus instructions to the first and update
+prompts.
+
+Each summarizer response must finish normally, with text that is not only
+whitespace and with no tool calls. An empty, thinking-only, length-limited
+or tool-use response fails the compaction. This checks completion, not
+quality. The output budget is `min(model max tokens, 8192)` for the summary
+and half of that cap for a split-turn prefix.
+
+### 4.6 File lists
+
+Planning scans the summarized messages for `read_file`, `edit_file` and
+`write_file` calls and collects their paths, added to the lists of the
+previous checkpoint. The lists are appended to the summary text, so the
+model sees them, and stored in the entry's `details`, so the next
+compaction carries them forward.
+
+## 5. Running a compaction
+
+### 5.1 Steps
+
+The agent must be idle, or paused between a tool batch and the next
+inference, with all of its message events stored. The log is locked for
+planning and again for storing, never across a summarizer call.
+
+1. **Plan.** Nothing to do ends here, before any event, so a no-op shows no
+   indicator. A manual run shows a notice.
+2. **Summarize.** Emit `CompactionStart`. Call the model outside the
+   session: the exchange touches no transcript, emits no message or
+   usage event and is not stored. A split turn takes a second call, whose
+   text is appended under `**Turn context (split turn):**`. Append the file
+   lists.
+3. **Store.** If the compaction was cancelled, stop without writing. Otherwise
+   append the checkpoint.
+4. **Reseed.** Replace the agent's transcript with the projection from the
+   new head. A trailing failed or aborted assistant message without tool
+   calls is dropped, so the transcript ends on a user message or a tool
+   result and the turn can continue from it.
+5. **Publish.** Account the summed summarizer usage once and emit one
+   successful `CompactionEnd` with `tokens_after` and the cumulative usage.
+   The event carries the checkpoint's durable position, so a client accepts
+   or discards the checkpoint and its spend together.
+
+Steps 3 to 5 are one write under the log lock, which hands the event to the
+session's publisher before it lets go. No concurrent append can be published
+at a higher position first, and once the checkpoint is appended, reseed and
+publication always finish. The agent's own listeners get the event after the
+lock is released.
+
+### 5.2 Outcomes
+
+- **Compacted**, with `tokens_before` and `tokens_after`.
+- **Nothing to do**: nothing to summarize, or already compacted.
+- **Cancelled**: the cancel fired before the append. The log is untouched
+  and nothing is stored.
+- **Failed**: the summarizer or the append failed. No checkpoint is
+  written and the live transcript is unchanged. The failure is stored for
+  display.
+
+`CompactionEnd` encodes the outcome. A summary without an error is a
+success. An error is a failure. Neither is a cancellation.
+`CompactionStart` and `CompactionProgress` (summarizing, summarizing the
+turn prefix, saving) are not stored.
+
+Usage that was spent is never lost: it is folded into the agent's
+accumulator before any listener runs, so a cancellation or a listener
+failure cannot erase it.
+
+### 5.3 Automatic compaction
+
+The turn driver runs one turn and its compaction continuations until they
+settle. The hosted session and `--print` share it. It reads the policy at
+each compaction boundary, so a settings change affects the next check. One
+cancel token covers the whole sequence.
+
+- **Overflow recovery, once.** A turn that fails with a context overflow is
+  followed by an overflow compaction, and the turn continues. A second
+  overflow in the same sequence is not retried: the driver emits a warning
+  and returns the error with guidance.
+- **After a turn.** When occupancy crossed the threshold, the driver
+  compacts and returns. It starts no further turn.
+- **During a turn.** After a completed tool batch and before the next
+  inference, the driver compacts when occupancy crossed the threshold, and
+  the turn continues on the reduced transcript.
+
+Any other error or abort is returned unchanged. A failed or cancelled
+compaction ends the sequence with an error.
+
+Pending work is not the driver's job. The host starts a wake turn when an
+agent goes idle with a task notification or a queued message pending
+([background tasks](background-tasks-spec.md), section 4). A threshold
+compaction therefore runs before the wake, and the pending work runs against
+the reduced context. After a failed compaction the host holds automatic
+wakes of the main agent until the user starts a turn.
+
+### 5.4 Policy per caller
+
+- **Main agent, hosted.** Overflow recovery and the after-turn threshold
+  follow `auto_compact`. The during-turn threshold needs `auto_compact` and
+  `auto_compact_during_turn`.
+- **Sub-agent continuation.** No compaction of any kind.
+- **Print mode.** Overflow recovery follows `auto_compact`. There is no
+  after-turn threshold, because the run is one-shot. The during-turn
+  threshold is as for the hosted main agent. Overflow recovery runs before
+  background tasks are torn down, so the retried turn can still use tools.
+  With `--format json` the compaction events reach the output stream.
+
+### 5.5 Manual compaction
+
+The `compact` palette action takes no arguments. The host API accepts
+optional focus instructions. Manual compaction targets the main agent and
+is refused while it is busy, which the interactive client shows as a
+notice. There is no `aj compact` subcommand.
+
+## 6. Replay
+
+A reopened session replays a `Compaction` entry as one successful
+`CompactionEnd`. The entry does not record the trigger, so the replayed reason
+is always manual. `tokens_after` is the estimate of the main thread up to the
+checkpoint, which keeps a reopened footer from showing pre-compaction
+occupancy. A reopen that does not hold the whole session shows an estimate for
+an older compaction. The event's usage is the replayed total before the
+checkpoint plus the checkpoint's own. A `CompactionFailed` entry replays as a
+`CompactionEnd` with its error.
+
+The summarized entries are still in the log, and replay walks them in
+order. The scrollback shows the full branch with a compaction row at
+the boundary, while the model context is the reduced projection.
+
+The checkpoint's usage row is keyed by the event's durable ID. Serving an
+older cursor again, or rebuilding from a fresh epoch, updates that row. It
+neither duplicates it nor overwrites later assistant usage.
+
+## 7. Configuration
+
+| Option | Default | Meaning |
+|---|---|---|
+| `auto_compact` | `true` | Compact when occupancy crosses `compact_threshold` after a turn. Also gates overflow recovery. |
+| `auto_compact_during_turn` | `false` | Also compact the main agent between a tool batch and the next inference. Requires `auto_compact`. |
+| `compact_threshold` | `0.85` | Fraction of the model's context window at which automatic compaction fires. Must be in `(0, 1]`. A value outside the range is rejected when the config is parsed. |
+| `compact_keep_recent` | `20_000` | Shared approximate verbatim budget in tokens. At most half selects original user messages. The rest keeps a tool-safe recent suffix. Summary and framing are outside it. |
+
+## 8. Limits
+
+- `compact_keep_recent` is a fixed budget, not a fraction of the model's
+  window. The minimum indivisible suffix may exceed it.
+- The summary is generated with the session's active model. There is no
+  separate summarizer model.
+- With `auto_compact_during_turn` off, a long tool-call chain inside one
+  turn is compacted only after it overflows, which costs one failed
+  request before recovery.

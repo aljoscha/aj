@@ -47,8 +47,9 @@ Existing JSON calls remain executable. Hooks receive the actual argument shape,
 string or object.
 See [patch compatibility](../third-party/codex-apply-patch/README.md) for scope.
 
-Tools with structured results expose those schemas. Bash returns stdout,
-stderr, exit status, truncation and background-task metadata. Text reads
+Tools with structured results expose those schemas. Bash returns the
+command's combined output as `stdout`, an always-empty `stderr`, the exit
+status, truncation and background-task metadata. Text reads
 return unnumbered text plus line and continuation metadata. Other tools
 return content blocks, including images that can be forwarded with `image()`.
 Tool failures reject the JavaScript call and can be caught with `try/catch`.
@@ -66,23 +67,32 @@ Cells can survive an answer and be collected in a later turn. Each subagent
 has its own evaluator. Running cells are not restored after process restart
 or session resume, and changing branches shuts down the live evaluator.
 
-`store()` and `load()` keep JSON values on the agent's conversation branch.
+A cell that was running when its host ended is lost, and the agent that
+started it is told once. A cell still inside its `exec` call has that call
+answered as interrupted by the next open. A cell that had yielded gets a
+task notification at the next open that says it was lost and its state is
+gone. It is saved when the cell yields, and the cell's completion replaces it
+([background tasks](background-tasks-spec.md), section 7). If it cannot be
+saved, the cell is terminated and its `exec` call fails.
+
+`store()` and `load()` keep JSON values on the agent's branch.
 Committed values survive restart, resume, compaction, and disabling Code Mode.
 Changing branches restores that branch's values. Subagent stores are separate
 from Main and from each other. This does not make archived subagents runnable
 after resume.
 
 When a script finishes, its writes are recorded as one `code_mode_store` entry
-in the conversation log, including if the script ends with an ordinary error.
-The entry is flushed before the new values or completed result become visible.
+in the session log, including if the script ends with an ordinary error.
+The entry is committed before the new values or completed result become visible.
 No `wait` collection is required to save a completed script's writes. No entry
 is added for scripts that make no writes. Values are execution state, not model
-messages, and remain outside the model context and rendered conversation.
+messages, and remain outside the model context and the rendered transcript.
 
 Cells read a snapshot of committed values plus their own pending writes.
 Concurrent commits are serialized, with later commits replacing earlier values
 for the same key. If cancellation wins before completion is accepted, pending
-writes are discarded. Once completion is accepted, shutdown waits for persistence to finish.
+writes are discarded. A session that shuts down is closed for writing first, so a
+script that completes after that commits nothing, as when the host is lost.
 Neither cancellation nor a script error rolls back filesystem changes or other
 tool side effects. A persistence failure stops execution rather than allowing
 the agent to continue with uncertain store contents. Durability has the same
@@ -101,11 +111,12 @@ on resume. Sequential resource operations remain exclusive across cells.
 Runtime control tools can observe or cancel those operations without waiting
 for their resource permits.
 
-At the next run, new nested dispatches use the effective tool catalog and
+At the next turn, new nested dispatches use the effective tool catalog and
 configuration. Calls already admitted retain their execution context.
-Interrupting a run cancels that agent's open cells. Disabling Code Mode or
+Interrupting a turn cancels that agent's open cells. Disabling Code Mode or
 switching to an ineligible model cancels them before ordinary execution resumes.
-Session shutdown owns their cancellation and waits for callbacks to settle.
+Session shutdown ends every cell and waits for its callbacks to settle. It
+writes nothing for them: the next open reports each open cell as lost.
 
 ## Builds and vendoring
 
