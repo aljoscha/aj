@@ -40,10 +40,12 @@ use serde::{Deserialize, Serialize};
 
 const DESCRIPTION: &str = r#"
 Give a sub-agent a bounded research, analysis, or implementation task and receive
-its final report. It inherits your model, system instructions, and tools except
-agent and oracle, but not your conversation history. It shares your working
-directory and can edit files and run commands. The user can steer it from its
-view, but this tool does not provide a way for you to message it mid-task.
+its final report. Each call creates a new sub-agent. It inherits your model,
+system instructions, and tools except agent and oracle, but cannot see your
+conversation or another sub-agent's report. Include any decisions and previous
+findings the assignment depends on. It shares your working directory and can
+edit files and run commands. The user can steer or continue it from its view,
+but this tool cannot message or resume an existing sub-agent.
 
 Do not use it for a known file read, an exact text search, a localized edit, or
 routine reassurance about your own work. Use direct tools for those.
