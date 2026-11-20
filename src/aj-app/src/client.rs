@@ -107,6 +107,8 @@ pub struct SessionClient {
     /// newer answer, but repeating startup warnings on every reconnect is more
     /// noise than help; explicit account actions report their own outcome.
     first_attach_credential_warning: Option<String>,
+    /// Whether the block being applied opened on an interrupted turn.
+    opening_turn_interrupted: bool,
     saw_first_attach: bool,
     needs_reattach: bool,
     /// A refusal cleared the epoch while leaving last-known chat visible. The
@@ -142,6 +144,7 @@ impl SessionClient {
             awaiting_turn_outcome: false,
             first_attach_settings: None,
             first_attach_credential_warning: None,
+            opening_turn_interrupted: false,
             saw_first_attach: false,
             needs_reattach: false,
             refusal_error: None,
@@ -207,6 +210,7 @@ impl SessionClient {
                     if self.attach != Attach::Applying {
                         self.committed = self.applied;
                         self.applied = Some(durability.seq);
+                        chat.note_log_end(durability.seq);
                     }
                 }
                 // An unknown event type is skipped before the reducer, but
@@ -253,6 +257,7 @@ impl SessionClient {
                 opens_block,
                 working,
                 turn_outcome,
+                turn_interrupted,
                 settings,
                 oracle_settings,
                 goal,
@@ -266,6 +271,7 @@ impl SessionClient {
                 // neither adopt an epoch nor quiesce.
                 if opens_block {
                     self.open_attach_block(chat, epoch);
+                    self.opening_turn_interrupted = turn_interrupted;
                 } else if !self.epoch_matches(&epoch) {
                     return Redraw(false);
                 }
@@ -311,6 +317,7 @@ impl SessionClient {
                 last_seq,
                 tasks,
                 queues,
+                history_start,
             } => {
                 // Only an opened block ends here. A `caught_up` outside one
                 // names a position whose entries the client never applied, and
@@ -339,6 +346,21 @@ impl SessionClient {
                 // idempotently.
                 chat.replace_tasks(tasks);
                 chat.replace_queue(queues);
+                // Only a block that started afresh says where it starts. One
+                // that continued from our cursor leaves the start we hold.
+                if let Some(start) = history_start {
+                    chat.set_history_start(start);
+                }
+                chat.note_log_end(last_seq);
+                // The notice is not in the log, so a transcript built afresh
+                // lacks it. One continued from a cursor still shows it.
+                if history_start.is_some() && self.opening_turn_interrupted {
+                    let event = AgentEvent::Notice {
+                        agent_id: AgentId::Main,
+                        text: crate::session_setup::TURN_INTERRUPTED_NOTICE.to_string(),
+                    };
+                    let _ = reduce(chat, &mut self.lifecycle, event, None);
+                }
                 Redraw(true)
             }
             Frame::Error {
@@ -601,6 +623,13 @@ impl SessionClient {
             );
         } else {
             match &self.epoch {
+                // A block of this epoch began and never committed. What it
+                // left is a tail from a start this block may not repeat,
+                // so appending to it could show entries twice.
+                Some(current) if *current == epoch && self.committed.is_none() => {
+                    chat.reset(&mut self.lifecycle);
+                    self.applied = None;
+                }
                 Some(current) if *current == epoch => {
                     // A re-attach into the epoch we already applied under: the
                     // suffix re-projects entries we saw only partly live, so
@@ -649,6 +678,47 @@ impl SessionClient {
 
     fn epoch_matches(&self, epoch: &str) -> bool {
         self.epoch.as_deref() == Some(epoch)
+    }
+
+    /// Put a fetched page of earlier history in front of `chat`. Returns
+    /// whether it was applied. A page from another epoch, or one that does
+    /// not end where `chat` starts, answers a question this client no
+    /// longer asks and is dropped.
+    pub fn apply_history(&self, chat: &mut ChatState, page: aj_wire::HistoryPage) -> bool {
+        // An epoch comes with the settings of the block that set it.
+        let Some(settings) = self.settings.clone() else {
+            return false;
+        };
+        if !self.epoch_matches(&page.epoch)
+            || page.end != chat.history_start(page.agent)
+            || page.start >= page.end
+        {
+            return false;
+        }
+        // The page folds into a model of its own first. It is history, so
+        // its lifecycle, footer and usage state describe the past and go
+        // with that model. Only its transcripts are kept.
+        let mut older = ChatState::new(settings);
+        // Entries fold expanded or collapsed by the view they are read in.
+        older.set_active_view(chat.active_view());
+        let mut lifecycle = AgentLifecycle::default();
+        for frame in page.frames {
+            if let Frame::Event {
+                durability,
+                event: DecodedAgentEvent::Known(known),
+                ..
+            } = frame
+            {
+                let _ = reduce(
+                    &mut older,
+                    &mut lifecycle,
+                    known.into_value(),
+                    durability.as_ref(),
+                );
+            }
+        }
+        chat.prepend_history(older, page.agent, page.start);
+        true
     }
 }
 
@@ -806,6 +876,7 @@ mod tests {
         credential_warning: Option<&str>,
     ) -> Frame {
         Frame::State {
+            turn_interrupted: false,
             session: SESSION.to_string(),
             epoch: epoch.to_string(),
             opens_block,
@@ -829,6 +900,7 @@ mod tests {
             last_seq,
             tasks,
             queues,
+            history_start: None,
         }
     }
 
@@ -998,6 +1070,7 @@ mod tests {
         oracle.model_id = "oracle-model".into();
         oracle.thinking = "high".into();
         let frame = |session: &str, epoch: &str, opens_block, oracle_settings| Frame::State {
+            turn_interrupted: false,
             session: session.into(),
             epoch: epoch.into(),
             opens_block,

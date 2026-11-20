@@ -19,10 +19,9 @@ pub struct SessionPreview {
     pub modified: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub last_message_at: DateTime<Utc>,
-    pub size_bytes: u64,
     /// All message entries, including tool results and messages on other branches.
     pub message_count: usize,
-    /// First nonempty user-thread user text, or the first nonempty goal objective
+    /// First nonempty main-thread user text, or the first nonempty goal objective
     /// when there is no user text. Trimmed, never truncated for display.
     pub first_user_message: Option<String>,
     pub tag: Option<String>,

@@ -14,6 +14,7 @@ pub fn to_wire(stats: &SessionStats) -> aj_wire::SessionInfo {
     aj_wire::SessionInfo {
         session_id: stats.session_id.clone(),
         path: stats.path.clone(),
+        project: stats.project.clone(),
         created_at: stats.created_at,
         last_activity: stats.last_activity,
         size_bytes: stats.size_bytes,
@@ -100,8 +101,8 @@ pub fn digest(stats: &SessionInfo, tag: Option<&str>) -> Vec<InfoRow> {
         InfoRow::Header("Session".to_string()),
         kv("id", &stats.session_id),
         kv("tag", tag.unwrap_or("(none)")),
-        kv("file", &stats.path.display().to_string()),
-        kv("project", &project_name(stats)),
+        kv("project", project_name(stats)),
+        kv("database", &stats.path.display().to_string()),
         InfoRow::Blank,
         InfoRow::Header("Settings".to_string()),
         kv("model", &model_label(stats)),
@@ -162,7 +163,7 @@ pub fn digest(stats: &SessionInfo, tag: Option<&str>) -> Vec<InfoRow> {
         InfoRow::Header("Activity".to_string()),
         kv("created", &timestamp(stats.created_at, "(unknown)")),
         kv("last activity", &timestamp(stats.last_activity, "(none)")),
-        kv("size on disk", &size_label(stats.size_bytes)),
+        kv("transcript size", &size_label(stats.size_bytes)),
         InfoRow::Blank,
         InfoRow::Header("Messages".to_string()),
         kv("total", &total_messages.to_string()),
@@ -204,17 +205,12 @@ pub fn digest(stats: &SessionInfo, tag: Option<&str>) -> Vec<InfoRow> {
     rows
 }
 
-/// Project name = the per-project sessions directory the file lives in
-/// (`~/.aj/sessions/<project>/<id>.jsonl`). Derived from the path since
-/// the log itself does not carry it.
-fn project_name(stats: &SessionInfo) -> String {
-    stats
-        .path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("(unknown)")
-        .to_string()
+fn project_name(stats: &SessionInfo) -> &str {
+    if stats.project.is_empty() {
+        "(unknown)"
+    } else {
+        &stats.project
+    }
 }
 
 fn model_label(stats: &SessionInfo) -> String {
@@ -325,7 +321,8 @@ mod tests {
     fn sample_stats() -> SessionStats {
         SessionStats {
             session_id: "2026-06-19-14-22-03-512".to_string(),
-            path: PathBuf::from("/home/u/.aj/sessions/home-u-proj/2026-06-19-14-22-03-512.jsonl"),
+            path: PathBuf::from("/home/u/.aj/sessions.sqlite3"),
+            project: "home-u-proj".to_string(),
             created_at: None,
             last_activity: None,
             size_bytes: Some(48 * 1024),
@@ -446,11 +443,11 @@ mod tests {
             RowView::Header("Session".to_string()),
             RowView::Kv("id".to_string(), "2026-06-19-14-22-03-512".to_string()),
             RowView::Kv("tag".to_string(), "fix-auth".to_string()),
-            RowView::Kv(
-                "file".to_string(),
-                "/home/u/.aj/sessions/home-u-proj/2026-06-19-14-22-03-512.jsonl".to_string(),
-            ),
             RowView::Kv("project".to_string(), "home-u-proj".to_string()),
+            RowView::Kv(
+                "database".to_string(),
+                "/home/u/.aj/sessions.sqlite3".to_string(),
+            ),
             RowView::Blank,
             RowView::Header("Settings".to_string()),
             RowView::Kv(
@@ -469,7 +466,7 @@ mod tests {
             RowView::Header("Activity".to_string()),
             RowView::Kv("created".to_string(), "(unknown)".to_string()),
             RowView::Kv("last activity".to_string(), "(none)".to_string()),
-            RowView::Kv("size on disk".to_string(), "48 KB".to_string()),
+            RowView::Kv("transcript size".to_string(), "48 KB".to_string()),
             RowView::Blank,
             RowView::Header("Messages".to_string()),
             RowView::Kv("total".to_string(), "63".to_string()),

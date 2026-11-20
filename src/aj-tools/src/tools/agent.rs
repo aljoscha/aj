@@ -16,7 +16,7 @@
 //! nested transcripts under the parent's tool-execution component.
 //!
 //! Errors from the spawned agent (model failures, tool errors that
-//! bubble up to its turn loop, etc.) propagate as `Err`; the agent
+//! bubble up to its agent loop, etc.) propagate as `Err`; the agent
 //! runtime catches them and synthesizes a generic error tool_result
 //! with `is_error: true`.
 //!
@@ -56,7 +56,7 @@ or URLs you need.
 
 Set run_in_background: true to keep working while the sub-agent runs: the call
 returns immediately with a task id, and the sub-agent's report is delivered to
-you as a completion notice when it finishes. You do not need to wait for it,
+you as a task notification when it finishes. You do not need to wait for it,
 keep working and the notice reaches you. Never wait by sleeping in the
 foreground: no notice can arrive while a foreground command is running, so
 sleeping only delays the report by the length of the sleep.
@@ -83,7 +83,7 @@ pub struct AgentInput {
     pub description: Option<String>,
 
     /// Run the sub-agent in the background. The call returns immediately with
-    /// a task id, and the report arrives as a completion notice when the run
+    /// a task id, and the report arrives as a task notification when the run
     /// finishes.
     #[serde(default)]
     pub run_in_background: bool,
@@ -142,7 +142,7 @@ pub(super) fn spawn_outcome(task: String, result: SpawnResult) -> ToolOutcome {
         // A background spawn needs no rich details variant: the
         // `SubAgentStart` event already created the transcript
         // box, and the report reaches the transcript through the
-        // completion notice.
+        // task notification.
         SpawnResult::Started { agent_id, task_id } => {
             let summary = format!("agent {agent_id} started in background (task #{task_id})");
             let wire = format!(

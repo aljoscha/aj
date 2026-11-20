@@ -46,6 +46,30 @@ pub struct SessionExport {
     pub html: String,
 }
 
+/// One page of one agent's earlier history in a session, as the event
+/// frames an attach block would have carried for it.
+///
+/// `GET /v1/sessions/{id}/history?before=N&limit=M[&agent=K]` answers the
+/// main agent's entries before position `before`, or sub-agent `K`'s,
+/// starting at one of that agent's messages at least `limit` entries back.
+/// A client prepends the page to that agent's transcript and asks again
+/// with `before = start` until `start` is `1`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryPage {
+    /// The session epoch the positions belong to. A client drops a page
+    /// whose epoch is not the one it is attached under.
+    pub epoch: String,
+    /// The agent whose transcript the page belongs to.
+    pub agent: AgentId,
+    /// Log position of the first entry the page covers. `1` means there is
+    /// no earlier history.
+    pub start: u64,
+    /// Log position the page ends before: the request's `before`, clamped
+    /// to the log. A client applies a page only where it joins what it shows.
+    pub end: u64,
+    pub frames: Vec<Frame>,
+}
+
 /// One host a fan-out read could not include, named for the user.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFailure {
@@ -1544,6 +1568,11 @@ pub enum Frame {
         /// Main's latest driven turn result. Null while working or unknown.
         /// Attach outcomes describe current state, not fresh completion.
         turn_outcome: Option<TurnOutcome>,
+        /// Whether the process that ran Main's last turn ended before the
+        /// turn did. It belongs to the thread the selected branch
+        /// ends in and holds until a turn starts there. A host without the
+        /// field decodes as false.
+        turn_interrupted: bool,
         settings: AgentSettings,
         /// Oracle settings staged for the next main turn. Absent when unresolved
         /// or when the host has no Oracle support.
@@ -1566,6 +1595,12 @@ pub enum Frame {
         last_seq: u64,
         tasks: TaskTable,
         queues: QueueState,
+        /// Log position of the first entry a block that started afresh
+        /// projected. Above `1`, earlier history exists and is fetched in
+        /// pages (see [`HistoryPage`]). Absent on a block that continued
+        /// from the client's cursor, which leaves the client's own start
+        /// standing, and from a host that always sends everything.
+        history_start: Option<u64>,
     },
     List {
         sessions: Vec<SessionSummary>,
@@ -1732,6 +1767,8 @@ enum FrameRef<'a> {
         working: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_outcome: Option<TurnOutcome>,
+        #[serde(skip_serializing_if = "unset")]
+        turn_interrupted: bool,
         settings: &'a AgentSettings,
         #[serde(skip_serializing_if = "Option::is_none")]
         oracle_settings: Option<&'a AgentSettings>,
@@ -1745,6 +1782,8 @@ enum FrameRef<'a> {
         last_seq: u64,
         tasks: &'a [TaskSummary],
         queues: &'a [AgentQueue],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history_start: Option<u64>,
     },
     List {
         sessions: &'a [SessionSummary],
@@ -1786,6 +1825,7 @@ impl Serialize for Frame {
                 opens_block,
                 working,
                 turn_outcome,
+                turn_interrupted,
                 settings,
                 oracle_settings,
                 goal,
@@ -1796,6 +1836,7 @@ impl Serialize for Frame {
                 opens_block: *opens_block,
                 working: *working,
                 turn_outcome: *turn_outcome,
+                turn_interrupted: *turn_interrupted,
                 settings,
                 oracle_settings: oracle_settings.as_ref(),
                 goal: goal.as_ref(),
@@ -1807,12 +1848,14 @@ impl Serialize for Frame {
                 last_seq,
                 tasks,
                 queues,
+                history_start,
             } => FrameRef::CaughtUp {
                 session,
                 epoch,
                 last_seq: *last_seq,
                 tasks: &tasks.tasks,
                 queues: &queues.queues,
+                history_start: *history_start,
             },
             Self::List { sessions, hosts } => FrameRef::List { sessions, hosts },
             Self::Error {
@@ -1897,6 +1940,7 @@ impl<'de> Deserialize<'de> for Frame {
                     opens_block,
                     working,
                     turn_outcome,
+                    turn_interrupted,
                     settings,
                     oracle_settings,
                     goal,
@@ -1908,6 +1952,7 @@ impl<'de> Deserialize<'de> for Frame {
                     opens_block,
                     working,
                     turn_outcome,
+                    turn_interrupted,
                     settings,
                     oracle_settings,
                     goal,
@@ -1921,11 +1966,13 @@ impl<'de> Deserialize<'de> for Frame {
                     last_seq,
                     tasks,
                     queues,
+                    history_start,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::CaughtUp {
                     session,
                     epoch,
                     last_seq,
+                    history_start,
                     tasks: TaskTable { tasks },
                     queues: QueueState { queues },
                 })
@@ -1980,6 +2027,8 @@ struct StateFrameFields {
     working: bool,
     #[serde(default)]
     turn_outcome: Option<TurnOutcome>,
+    #[serde(default)]
+    turn_interrupted: bool,
     settings: AgentSettings,
     #[serde(default)]
     oracle_settings: Option<AgentSettings>,
@@ -1996,6 +2045,8 @@ struct CaughtUpFrameFields {
     last_seq: u64,
     tasks: Vec<TaskSummary>,
     queues: Vec<AgentQueue>,
+    #[serde(default)]
+    history_start: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2449,8 +2500,8 @@ fn is_known_event_type(event_type: &str) -> bool {
         "agent_start"
             | "code_mode_store"
             | "agent_end"
-            | "turn_start"
-            | "turn_end"
+            | "round_start"
+            | "round_end"
             | "message_start"
             | "message_update"
             | "message_end"

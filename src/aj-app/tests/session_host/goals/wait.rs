@@ -346,20 +346,23 @@ async fn completion_already_queued_before_yield_is_not_lost() {
     let (stream, _) = bounded("held Main inference", held).await.unwrap();
     // A real registry notice is queued while Main is still busy. Its own
     // AgentEnd must wake the owner even though no later task event arrives.
-    handles.task_registry.finish(
-        task,
-        TaskStatus::Exited(Some(0)),
-        aj_agent::tool::TaskNotice {
-            owner: AgentId::Main,
-            task_id: task,
-            kind: TaskKind::Bash {
-                command: "server".into(),
+    handles
+        .task_registry
+        .finish(
+            task,
+            TaskStatus::Exited(Some(0)),
+            aj_agent::tool::TaskNotice {
+                owner: AgentId::Main,
+                task_id: task,
+                kind: TaskKind::Bash {
+                    command: "server".into(),
+                },
+                label: "server".into(),
+                status: TaskStatus::Exited(Some(0)),
+                body: "server completed before yield".into(),
             },
-            label: "server".into(),
-            status: TaskStatus::Exited(Some(0)),
-            body: "server completed before yield".into(),
-        },
-    );
+        )
+        .expect("an unrecorded task's end is not refused");
     assert!(handles.task_registry.has_notices(AgentId::Main));
     release(stream, waiting());
     completed(&mut client).await;

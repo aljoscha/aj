@@ -7,7 +7,7 @@
   //
   // The session is embedded in a <script> island as gzip-compressed,
   // base64-encoded JSON:
-  //   { session_id, leaf_id, entries: [ConversationEntry, ...] }
+  //   { session_id, leaf_id, entries: [LogEntry, ...] }
   // Entries keep their on-disk shape except that session environment values
   // are redacted and valid diff details are canonicalized by the Rust exporter
   // before embedding.
@@ -44,12 +44,12 @@
   }
 
   const byId = new Map(entries.map((e) => [e.id, e]));
-  // Append position, used as a stable tiebreaker when sibling branches
+  // Position, used as a stable tiebreaker when sibling branches
   // share (or lack) a timestamp.
   const orderIndex = new Map(entries.map((e, i) => [e.id, i]));
 
-  // The active user-thread tip, computed by the exporter. Fall back to
-  // the last user-thread entry in append order if it is missing.
+  // The active main-thread tip, computed by the exporter. Fall back to
+  // the last main-thread entry in append order if it is missing.
   const defaultLeaf = data.leaf_id || deriveLeaf();
   function deriveLeaf() {
     for (let i = entries.length - 1; i >= 0; i--) {
@@ -125,7 +125,7 @@
     }
   }
 
-  // Audit calls are scoped to their execution cell, not model turns.
+  // Audit calls are scoped to their execution cell, not model responses.
   const activityCalls = new Map();
   const activityResults = new Map();
   function activityKey(entry, id) {
@@ -503,7 +503,7 @@
     // Build the message body (text, thinking, error) first. Tool calls
     // are not part of the body: they render as sibling blocks after the
     // bubble, matching the TUI where each tool execution is its own block
-    // beneath the assistant turn rather than nested inside it.
+    // beneath the assistant message rather than nested inside it.
     let body = '';
     for (const block of msg.content || []) {
       if (block.type === 'text' && block.text && block.text.trim()) {
@@ -527,7 +527,7 @@
         '<div class="role">Assistant <span class="model">' + escapeHtml(msg.model || '') + '</span></div>' +
         body + '</div>';
     } else {
-      // Tool-only assistant turns have no bubble, but their sidebar row still
+      // Tool-only assistant messages have no bubble, but their sidebar row still
       // needs a stable target immediately before the rendered tool blocks.
       html += '<span class="entry-anchor" id="entry-' + escapeHtml(entry.id) + '"></span>';
     }
@@ -765,13 +765,13 @@
   // TREE DATA (pure: flat entries -> nodes and layout)
   // ============================================================
   //
-  // The tree shows the conversation, its branches, and (toggleable)
+  // The tree shows the main thread, its branches, and (toggleable)
   // sub-agent runs. A sub-agent run hangs off the assistant that spawned
   // it, using the same resolved host as the inline transcript box.
   // Session-state and system entries are kept but hidden by the default
   // filter. The layout (indent, ASCII
   // connectors, gutters) draws each branch point one level deeper, so the
-  // conversation's branch structure reads at a glance.
+  // main thread's branch structure reads at a glance.
 
   const treeEntries = entries;
 
@@ -817,9 +817,9 @@
     }
     let cur = treeNodeMap.get(nodeId);
     if (!cur) return nodeId;
-    // Follow the newest child to a leaf, but stay on the conversation:
+    // Follow the newest child to a leaf, but stay on the main thread:
     // never descend into a sub-agent run. Those are reached by clicking
-    // the sub-agent node itself, not by walking a conversation branch.
+    // the sub-agent node itself, not by walking a main-thread branch.
     while (cur.children.length > 0) {
       const onThread = cur.children.filter((c) => c.entry.thread !== 'subagent');
       if (onThread.length === 0) break;
@@ -847,10 +847,10 @@
     return new Set(pathTo(targetId).map((e) => e.id));
   }
 
-  // The conversation entry a sub-agent run belongs to: walk up out of the
-  // sub-agent thread to the assistant that spawned it. For a conversation
+  // The main thread entry a sub-agent run belongs to: walk up out of the
+  // sub-agent thread to the assistant that spawned it. For a main thread
   // entry this returns the entry itself. `seen` guards a malformed cycle.
-  function conversationHost(entryId) {
+  function mainThreadHost(entryId) {
     let cur = byId.get(entryId);
     const seen = new Set();
     while (cur && cur.thread === 'subagent' && !seen.has(cur.id)) {
@@ -860,13 +860,13 @@
     return cur ? cur.id : entryId;
   }
 
-  // The conversation leaf to open when navigating to `targetId`. A
+  // The main thread leaf to open when navigating to `targetId`. A
   // sub-agent target resolves to its host's branch leaf, so the full
-  // conversation stays visible and the run shows in its inline box. A
-  // conversation target resolves to its own branch leaf.
+  // main thread stays visible and the run shows in its inline box. A
+  // main-thread target resolves to its own branch leaf.
   function leafForTarget(targetId) {
     const e = byId.get(targetId);
-    if (e && e.thread === 'subagent') return findNewestLeaf(conversationHost(targetId));
+    if (e && e.thread === 'subagent') return findNewestLeaf(mainThreadHost(targetId));
     return findNewestLeaf(targetId);
   }
 
@@ -915,11 +915,11 @@
   // Lay out the visible nodes as a branch tree and return them in display
   // order with indent / connector / gutter fields set.
   //
-  // The conversation runs down a spine at the base indent. Two things
+  // The main thread runs down a spine at the base indent. Two things
   // hang one level in off a spine node and draw a connector: a sub-agent
-  // run (its `sub_agent_spawn`, rendered before the conversation
-  // continues) and a genuine conversation fork (an edited/retried prompt,
-  // i.e. more than one conversation child). A lone continuation stays on
+  // run (its `sub_agent_spawn`, rendered before the main thread
+  // continues) and a genuine fork point (an edited/retried prompt,
+  // i.e. more than one main-thread child). A lone continuation stays on
   // the spine, so spawning a sub-agent does not indent the rest of the
   // main thread. Each node reattaches to its nearest visible ancestor, so
   // a filter that hides intermediate entries doesn't break the structure.
@@ -960,7 +960,7 @@
     const isSpawn = (id) => visById.get(id).node.entry.type === 'sub_agent_spawn';
 
     // Which subtrees contain the active leaf (post-order, iterative), so a
-    // forked conversation shows its active branch first.
+    // forked main thread shows its active branch first.
     const containsActive = new Map();
     const order = [];
     const markStack = [...childrenOf.get(null)];
@@ -977,8 +977,8 @@
     }
 
     // A node's children in display order: sub-agent runs first (in spawn
-    // order), then the conversation (active branch first). `orderIndex`
-    // breaks ties by append position so the order is stable.
+    // order), then the main thread (active branch first). `orderIndex`
+    // breaks ties by position so the order is stable.
     function split(ids) {
       const oi = (id) => orderIndex.get(id) || 0;
       const spawns = ids.filter(isSpawn).sort((a, b) => oi(a) - oi(b));
@@ -1017,21 +1017,21 @@
       const { spawns, lines } = split(childrenOf.get(id) || []);
       const branched = lines.length > 1;
       // Children that hang one level in and draw a connector: every
-      // sub-agent run, plus the conversation children when the thread
+      // sub-agent run, plus the main thread children when the thread
       // forks. A lone continuation stays on the spine.
       const connectorKids = branched ? [...spawns, ...lines] : spawns;
       const connectorSet = new Set(connectorKids);
       const lastConnectorId = connectorKids.length ? connectorKids[connectorKids.length - 1] : null;
       const ordered = [...spawns, ...lines];
 
-      // A lone conversation continuation that stays on this node's spine
+      // A lone main-thread continuation that stays on this node's spine
       // (not bumped one level in by `justBranched`) and follows one or
       // more sub-agent runs. When present, the runs' connector column
       // threads down to it: the last run draws `├─` (not `└─`) and its
       // body keeps the `│`, so the spine reads as one line from the
       // spawning message, past the runs, to the continuation, whose
       // marker sits on the same column. When the continuation is bumped
-      // (inside a fork) the columns no longer line up, so we don't extend.
+      // (inside a branch) the columns no longer line up, so we don't extend.
       const continuation = !branched && lines.length === 1 ? lines[0] : null;
       const continuationOnSpine = continuation != null && !(justBranched && indent > 0);
 
@@ -1050,7 +1050,7 @@
           childIsLast = childId === lastConnectorId && !continuationOnSpine;
         } else {
           // Spine continuation: no connector. It still indents one more
-          // when it directly follows a hang-in (so a fork or run body
+          // when it directly follows a hang-in (so a branch or run body
           // stays grouped), otherwise it stays on the spine.
           childIndent = justBranched && indent > 0 ? indent + 1 : indent;
           childShowConnector = false;
@@ -1256,9 +1256,9 @@
       div.append(prefix, marker, content);
       div.addEventListener('click', () => {
         if (window.getSelection().toString()) return;
-        // Open the entry's conversation branch and scroll to it. A
+        // Open the entry's main-thread branch and scroll to it. A
         // sub-agent row routes to its host branch (its run shows inline
-        // there), so the full conversation stays visible.
+        // there), so the full main thread stays visible.
         navigateTo(leafForTarget(entry.id), 'target', entry.id);
       });
       container.appendChild(div);

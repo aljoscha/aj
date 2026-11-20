@@ -422,7 +422,7 @@ fn task_status_label(status: TaskStatus) -> String {
     match status {
         TaskStatus::Running => "running".to_string(),
         TaskStatus::Exited(Some(code)) => format!("exited {code}"),
-        TaskStatus::Exited(None) => "signalled".to_string(),
+        TaskStatus::Exited(None) => "lost".to_string(),
         TaskStatus::CaptureFailed(Some(code)) => format!("capture failed, exited {code}"),
         TaskStatus::CaptureFailed(None) => "capture failed, signalled".to_string(),
         TaskStatus::Killed => "killed".to_string(),
@@ -440,7 +440,7 @@ fn sub_status_glyph(status: SubAgentStatus) -> &'static str {
     }
 }
 
-/// Flatten a free-form task string to a single display line: collapse each run
+/// Flatten a free-form task string to a single display line: collapse each sequence
 /// of `\r`/`\n` into one space and trim the ends. Interior spaces are left
 /// as-is (only line breaks are touched). Row widgets truncate to the row width
 /// but still break on hard newlines, so a raw multi-line task would render
@@ -450,7 +450,7 @@ fn single_line(text: &str) -> String {
     let mut last_was_newline = false;
     for ch in text.chars() {
         if matches!(ch, '\n' | '\r') {
-            // Collapse a run of line breaks to a single space.
+            // Collapse a sequence of line breaks to a single space.
             if !last_was_newline {
                 out.push(' ');
                 last_was_newline = true;
@@ -1174,6 +1174,7 @@ mod tests {
                     child,
                     task: "work".into(),
                     tool_name: "agent".into(),
+                    call_id: None,
                     background: false,
                     settings,
                 },

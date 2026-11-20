@@ -120,7 +120,7 @@ async fn concurrent_commands(code_mode: bool) {
             results.iter().any(|result| matches!(
                 result,
                 ToolDetails::Bash { stdout, stderr, exit_code: Some(0), .. }
-                    if stdout == &format!("{label} stdout") && stderr == &format!("{label} stderr")
+                    if stdout == &format!("{label} stdout{label} stderr") && stderr.is_empty()
             )),
             "{label} must finish with its own captured output: {results:?}"
         );

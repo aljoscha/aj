@@ -24,7 +24,6 @@ use aj_app::session_setup::{ComposedHost, compose_host};
 use aj_app::settings::ConfigLayers;
 use aj_conf::Config;
 use aj_models::auth::AuthStorage;
-use aj_session::ConversationPersistence;
 use aj_wire::Hello;
 use anyhow::{Context, Result, bail};
 
@@ -102,8 +101,9 @@ pub(crate) async fn start_server(args: &Args, host: &SessionHost) -> Result<Opti
 /// `aj serve`: hold this working directory's sessions and serve them until
 /// the process is asked to stop.
 ///
-/// Teardown stops accepting first, then the host cancels turns through the
-/// graceful path and closes attachments, then the server joins those streams.
+/// Teardown stops accepting first, then the host stops its sessions as a
+/// host that died would and closes attachments, then the server joins those
+/// streams.
 pub(crate) async fn run(mut args: Args) -> Result<()> {
     // A bare `aj serve` is expected to be reachable by `aj connect` on the
     // same machine, so the control port is the point of the mode rather than
@@ -127,8 +127,7 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
         writes: Default::default(),
     };
     let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
-    let sessions_dir = Config::get_sessions_dir_path()?;
-    let persistence = ConversationPersistence::new(sessions_dir);
+    let persistence = aj_app::current_project_persistence()?;
 
     let ComposedHost { host, .. } = compose_host(&args, layers, &auth, &persistence, None)?;
     let server = match start_server(&args, &host).await {

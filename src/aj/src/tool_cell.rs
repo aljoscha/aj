@@ -184,7 +184,7 @@ fn task_badge(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> Option<S
     Some(match tasks.get(&id).map(|info| info.status) {
         None | Some(TaskStatus::Running) => format!("[task #{id}]"),
         Some(TaskStatus::Exited(Some(code))) => format!("[task #{id} · exited {code}]"),
-        Some(TaskStatus::Exited(None)) => format!("[task #{id} · terminated by signal]"),
+        Some(TaskStatus::Exited(None)) => format!("[task #{id} · lost]"),
         Some(TaskStatus::CaptureFailed(Some(code))) => {
             format!("[task #{id} · capture failed, exited {code}]")
         }
@@ -238,7 +238,7 @@ fn quote_for_summary(s: &str) -> String {
     }
 }
 
-/// One rendered body line: a run of styled spans with no embedded
+/// One rendered body line: a sequence of styled spans with no embedded
 /// newlines. The widget flattens lines with `\n` separator spans,
 /// which [`RichText`] treats as hard breaks.
 type Line = Vec<TextSpan>;
@@ -1776,7 +1776,7 @@ mod tests {
             ),
             (
                 TaskStatus::Exited(None),
-                "[task #4 · terminated by signal]",
+                "[task #4 · lost]",
                 s.tool_error_bg,
                 " ✗",
             ),

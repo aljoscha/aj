@@ -23,7 +23,7 @@ use aj_models::types::{
     AssistantContent, AssistantError, AssistantMessage, Context, ErrorCategory, Message,
     SimpleStreamOptions, StopReason, StreamOptions, ToolCall, UserContent,
 };
-use aj_session::ConversationPersistence;
+use aj_session::ProjectSessions;
 use aj_wire::{AccountSelection, Frame, SessionSettings};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -187,7 +187,7 @@ impl Store {
                 }
             }),
             restore: None,
-            persistence: ConversationPersistence::new(self.dir.path().join("sessions")),
+            persistence: ProjectSessions::new(self.dir.path().join("sessions")),
             auth: self.auth.clone(),
             working_directory: self.dir.path().to_path_buf(),
             name: None,

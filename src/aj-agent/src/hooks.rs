@@ -1,6 +1,6 @@
 //! Single-slot hook surface for agent runtime extension.
 //!
-//! Hooks bracket the per-turn / per-tool flow inside
+//! Hooks bracket the per-round / per-tool flow inside
 //! [`crate::Agent::execute_turn`]:
 //!
 //! - [`BeforeToolCallHook`] — fires after [`crate::events::AgentEvent::ToolExecutionStart`]
@@ -12,13 +12,13 @@
 //!   and before [`crate::events::AgentEvent::ToolExecutionEnd`].
 //!   Mutates the [`crate::tool::ToolOutcome`] in place — typical use
 //!   is redaction, auto-truncation, or flipping an exit code.
-//! - [`ShouldStopAfterTurnHook`] — fires after the post-tool-batch
+//! - [`ShouldStopAfterRoundHook`] — fires after the post-tool-batch
 //!   transcript update and before the next inference. Returning
 //!   `true` ends the turn with no follow-up call (e.g. budget /
 //!   context-window guard).
 //! - [`BeforeContinuationHook`] — runs only when continuing after a
 //!   completed tool batch. Allows application work with exclusive access
-//!   to the paused agent, without ending its run.
+//!   to the paused agent, without ending its turn.
 //!
 //! Hooks are stored as `Option<Arc<dyn Fn... + Send + Sync>>` —
 //! one slot per hook, replacing on `set_*`. No registry, no
@@ -89,20 +89,20 @@ pub type AfterToolCallHook = Arc<
     dyn for<'a> Fn(ToolCallContext<'a>, &'a mut ToolOutcome) -> HookFuture<'a, ()> + Send + Sync,
 >;
 
-/// Closure invoked after every assistant turn completes its tool
+/// Closure invoked after every round completes its tool
 /// batch and before the agent decides whether to run another
 /// inference. Returning `true` ends the turn without a follow-up
 /// inference — useful for "stop before the context window fills"
 /// guards or budget enforcement.
-pub type ShouldStopAfterTurnHook = Arc<dyn Fn() -> HookFuture<'static, bool> + Send + Sync>;
+pub type ShouldStopAfterRoundHook = Arc<dyn Fn() -> HookFuture<'static, bool> + Send + Sync>;
 
 /// Application work before continuing with another model request.
 ///
 /// Runs after the entire tool batch's events and the should-stop hook,
 /// before draining notices or steering. No inference or foreground tool
 /// is in flight, and event subscribers have finished recording the batch.
-/// The callback may replace the transcript, but must not re-enter the run
-/// loop. An error ends the run through its normal lifecycle. The callback
+/// The callback may replace the transcript, but must not re-enter the agent
+/// loop. An error ends the turn through its normal lifecycle. The callback
 /// must cooperate with the supplied cancellation token. The runtime also
 /// checks cancellation before and after awaiting it.
 pub type BeforeContinuationHook = Arc<
@@ -175,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_stop_hook_returns_bool() {
-        let hook: ShouldStopAfterTurnHook = Arc::new(|| Box::pin(async { true }));
+        let hook: ShouldStopAfterRoundHook = Arc::new(|| Box::pin(async { true }));
         assert!(hook().await);
     }
 }

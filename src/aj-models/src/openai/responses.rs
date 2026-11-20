@@ -9,7 +9,7 @@
 //! any number of concurrent requests.
 //!
 //! Unlike the Chat Completions provider in [`super::provider`], this
-//! API preserves encrypted reasoning across turns: prior-turn
+//! API preserves encrypted reasoning across requests: earlier
 //! [`ThinkingContent`] blocks are carried through `thinking_signature`
 //! and replayed back into the `input` array as `reasoning` items, and
 //! per-message `id` / `phase` are round-tripped via the
@@ -106,7 +106,7 @@ impl Provider for OpenAiResponsesProvider {
 
 /// Versioned envelope carried in [`TextContent::text_signature`] for
 /// messages produced by `openai-responses`. Captures the message
-/// item's `id` and optional `phase` so a follow-up turn can replay the
+/// item's `id` and optional `phase` so a follow-up request can replay the
 /// message with the same identifiers, letting the server pair it with
 /// the prior reasoning chain.
 ///
@@ -715,7 +715,7 @@ fn to_response_tool_choice(
 /// this runs. Shared by the Responses and Codex providers.
 pub(super) fn convert_messages(messages: &[Message], out: &mut Vec<ResponseInputItem>) {
     // Results inherit their wire kind from the recorded call, not from the
-    // current declarations, which may change between turns or on resume.
+    // current declarations, which may change between requests or on resume.
     let custom_calls: std::collections::HashSet<&str> = messages
         .iter()
         .filter_map(|m| {
@@ -1571,7 +1571,7 @@ impl StreamState {
                 // signature below.
                 let joined = reasoning_display_text(&summary, content.as_deref());
                 // Re-serialize the reasoning item into a stable
-                // signature so the next turn can replay it.
+                // signature so the next request can replay it.
                 let signature = serde_json::to_string(&ResponseInputItem::Reasoning {
                     id,
                     summary,
@@ -1802,7 +1802,7 @@ impl StreamState {
         self.terminal_seen
     }
 
-    /// The service-tier price multiplier for this turn.
+    /// The service-tier price multiplier for this response.
     ///
     /// The tier the server actually served at wins over the one we asked
     /// for, so this is only final once `final_response` has landed.
@@ -1882,7 +1882,7 @@ impl StreamState {
         } else {
             tracing::debug!(
                 api = %self.partial.api,
-                "stream ended before terminal frame; treating turn as truncated (retryable)"
+                "stream ended before terminal frame; treating response as truncated (retryable)"
             );
             // A preterminal stream cut normally has no response usage to
             // harvest. Seal still runs so every exit carries a consistent
@@ -2668,7 +2668,7 @@ mod tests {
     #[test]
     fn finalize_or_truncate_classifies_missing_completion_as_transient() {
         // No terminal lifecycle event (`finish_status` unset) means the
-        // byte stream dropped mid-turn: finalize as a retryable transient
+        // byte stream dropped mid-response: finalize as a retryable transient
         // error, preserving the accumulated content.
         let mut state = StreamState::new(&fake_model(false), None);
         state

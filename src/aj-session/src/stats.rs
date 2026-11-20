@@ -1,12 +1,14 @@
-//! Aggregate summary of a conversation log.
+//! Aggregate summary of a session.
 //!
 //! [`SessionStats`] is the read-only digest behind a "session info" view:
-//! identity (id, on-disk path), timing, message counts broken out by kind,
-//! a per-tool call breakdown, aggregate token usage and dollar cost, a
-//! usage breakdown per provider, model, account, and served speed, and the
-//! settings the session is running with. It is computed in one pass across all
-//! threads, so the message, tool-call, and usage totals include sub-agent
-//! activity.
+//! identity (id, project, the database that stores it), timing, message
+//! counts broken out by kind, a per-tool call breakdown, aggregate token
+//! usage and dollar cost, a usage breakdown per provider, model, account,
+//! and served speed, and the settings the session is running with. It is
+//! computed in one pass over every entry of the session, so the message,
+//! tool-call, and usage totals include sub-agent activity and branches the
+//! user moved off. A log that holds only part of its session reads the
+//! rest from the database for this.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -15,7 +17,7 @@ use std::path::PathBuf;
 use aj_models::types::{AssistantContent, Message, Usage};
 use chrono::{DateTime, Utc};
 
-use crate::log::{ConversationEntryKind, ConversationLog, SessionSettings, ThreadFilter};
+use crate::log::{LogEntryKind, SessionLog, SessionSettings, ThreadFilter};
 use crate::persistence::parse_session_id_created_at;
 
 /// Usage and response counts for one provider, model, account, and served speed.
@@ -48,33 +50,36 @@ fn compare_usage_buckets(a: &UsageBucket, b: &UsageBucket) -> Ordering {
         .then_with(|| a.usage.served_speed.cmp(&b.usage.served_speed))
 }
 
-/// A read-only digest of a [`ConversationLog`].
+/// A read-only digest of a [`SessionLog`].
 ///
-/// All counts span every thread in the file (the user conversation plus
+/// All counts span every thread of the session (the main thread plus
 /// any sub-agent threads), so they describe the whole session rather than
 /// a single thread. `settings` is the exception: it reflects the user
 /// thread's current values.
 ///
-/// Counts are file-level. They include entries the projected conversation
-/// no longer shows, such as messages a compaction summarized away or a
-/// branch the user moved off. They describe what the log holds on disk,
-/// not what is currently in the model's context.
+/// Counts are session-level. They include entries the projected
+/// thread no longer shows, such as messages a compaction summarized
+/// away or a branch the user moved off. They describe what the store
+/// holds, not what is currently in the model's context.
 #[derive(Debug, Clone)]
 pub struct SessionStats {
     /// The id the session is listed under (`aj list-sessions`).
     pub session_id: String,
-    /// The on-disk JSONL file backing the session.
+    /// The database that stores the session, shared with other sessions.
     pub path: PathBuf,
+    /// The project the session is stored under.
+    pub project: String,
     /// Creation time parsed from the `session_id` stem. `None` when the
     /// id is not a minted timestamp.
     pub created_at: Option<DateTime<Utc>>,
     /// Timestamp of the most recent message entry, i.e. the last time the
     /// session saw activity. `None` for a log with no timestamped messages.
     pub last_activity: Option<DateTime<Utc>>,
-    /// Size of the backing file. `None` when the file does not exist yet
-    /// (a fresh log whose only entries are still buffered in memory).
+    /// Summed length of the session's stored entries. `None` when the
+    /// session is not stored yet (a fresh log whose only entries are still
+    /// in memory).
     pub size_bytes: Option<u64>,
-    /// Every entry in the file: messages, state records, the system
+    /// Every entry in the session: messages, state entries, the system
     /// prompt, sub-agent roots, and compaction checkpoints.
     pub total_entries: usize,
     pub user_messages: usize,
@@ -94,7 +99,7 @@ pub struct SessionStats {
     /// assistant message in the file, plus the summarizer spend recorded
     /// on its compaction entries. Like the other counts this spans all
     /// threads and branches, so it reflects total spend on the session
-    /// rather than the cost of the currently projected conversation. The
+    /// rather than the cost of the currently projected thread. The
     /// cost figures are the per-response amounts recorded when each
     /// response arrived, so a model whose pricing was unknown
     /// contributes zero and a non-trivial token count can still report a
@@ -109,7 +114,7 @@ pub struct SessionStats {
     /// full provider, model, account, and served speed key ascending.
     pub usage_breakdown: Vec<UsageBucket>,
     /// The share of `usage` spent on compaction summaries rather than on
-    /// the conversation itself, summed from the compaction entries that
+    /// the thread itself, summed from the compaction entries that
     /// recorded any.
     pub compaction_usage: Usage,
     /// Model, thinking, speed, and verbosity currently recorded on the user
@@ -120,16 +125,26 @@ pub struct SessionStats {
     pub session_env: Option<BTreeMap<String, String>>,
 }
 
-impl ConversationLog {
+impl SessionLog {
     /// Compute the aggregate [`SessionStats`] for this log.
     ///
     /// One pass over every entry in every thread, so message and
     /// tool-call totals include sub-agent activity. `settings` is read
-    /// from the user thread's current head via [`Conversation::settings`],
+    /// from the main thread's current head via [`BranchView::settings`],
     /// so it reflects the active branch.
     ///
-    /// [`Conversation::settings`]: crate::log::Conversation::settings
-    pub fn stats(&self) -> SessionStats {
+    /// [`BranchView::settings`]: crate::log::BranchView::settings
+    ///
+    /// A log that does not hold its whole session reads it for this, which
+    /// is blocking database I/O. A caller that must not hold the log for
+    /// that long reads [`Self::whole`] itself and passes it to
+    /// [`Self::stats_over`].
+    pub fn stats(&self) -> Result<SessionStats, crate::log::SessionError> {
+        Ok(self.stats_over(&self.whole().read()?))
+    }
+
+    /// [`Self::stats`] over `whole`, this log's whole session.
+    pub fn stats_over(&self, whole: &crate::log::LogSnapshot) -> SessionStats {
         let mut user_messages = 0;
         let mut assistant_messages = 0;
         let mut tool_results = 0;
@@ -143,10 +158,10 @@ impl ConversationLog {
         let mut last_activity: Option<DateTime<Utc>> = None;
         let mut per_tool: HashMap<String, usize> = HashMap::new();
 
-        for entry in self.entries_in_order() {
+        for entry in whole.entries_in_order() {
             total_entries += 1;
             match &entry.entry {
-                ConversationEntryKind::Message { message } => {
+                LogEntryKind::Message { message } => {
                     if let Some(ts) = entry.timestamp {
                         last_activity = Some(last_activity.map_or(ts, |cur| cur.max(ts)));
                     }
@@ -189,8 +204,8 @@ impl ConversationLog {
                         None => {}
                     }
                 }
-                ConversationEntryKind::SubAgentSpawn { .. } => subagents += 1,
-                ConversationEntryKind::Compaction {
+                LogEntryKind::SubAgentSpawn { .. } => subagents += 1,
+                LogEntryKind::Compaction {
                     usage: entry_usage, ..
                 } => {
                     compactions += 1;
@@ -207,17 +222,18 @@ impl ConversationLog {
         let mut usage_breakdown: Vec<UsageBucket> = usage_buckets.into_values().collect();
         usage_breakdown.sort_by(compare_usage_buckets);
 
-        let settings = self
+        let settings = whole
             .head()
-            .map(|head| self.linearize(head, ThreadFilter::USER).settings())
+            .map(|head| whole.linearize(head, ThreadFilter::MAIN).settings())
             .unwrap_or_default();
 
         SessionStats {
             session_id: self.session_id().to_string(),
             path: self.path().to_path_buf(),
+            project: self.project_id().to_owned(),
             created_at: parse_session_id_created_at(self.session_id()),
             last_activity,
-            size_bytes: std::fs::metadata(self.path()).ok().map(|m| m.len()),
+            size_bytes: self.stored_bytes().ok().flatten(),
             total_entries,
             user_messages,
             assistant_messages,
@@ -230,7 +246,7 @@ impl ConversationLog {
             usage_breakdown,
             compaction_usage,
             settings,
-            session_env: self.session_env().cloned(),
+            session_env: whole.session_env().cloned(),
         }
     }
 }
@@ -248,10 +264,9 @@ mod tests {
     use serde_json::json;
 
     use crate::log::{
-        ConversationEntryKind, ConversationLog, ConversationView, SessionSettings, ThreadFilter,
-        ThreadKind,
+        AgentLog, LogEntryKind, SessionLog, SessionSettings, ThreadFilter, ThreadKind,
     };
-    use crate::persistence::ConversationPersistence;
+    use crate::persistence::ProjectSessions;
 
     fn text(body: &str) -> TextContent {
         TextContent {
@@ -302,15 +317,15 @@ mod tests {
         })
     }
 
-    /// Build a small user-thread conversation and assert the digest counts
+    /// Build a small main thread and assert the digest counts
     /// each message kind, every tool call, and ranks the per-tool breakdown.
     #[test]
     fn stats_count_messages_and_tool_calls() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
 
-        let mut head = ConversationView::user(&mut log);
+        let mut head = AgentLog::main(&mut log);
         head.add_message(AgentMessage::wire(user("hi"))).unwrap();
         head.add_message(AgentMessage::wire(assistant_with_calls(&[
             "read_file",
@@ -327,7 +342,7 @@ mod tests {
         head.add_message(AgentMessage::wire(assistant_with_calls(&["read_file"])))
             .unwrap();
 
-        let stats = log.stats();
+        let stats = log.stats().unwrap();
         assert_eq!(stats.user_messages, 1);
         assert_eq!(stats.assistant_messages, 2);
         assert_eq!(stats.tool_results, 3);
@@ -345,9 +360,9 @@ mod tests {
     #[test]
     fn stats_empty_log_is_all_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let log = ConversationLog::create(&persistence).unwrap();
-        let stats = log.stats();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let log = SessionLog::create(&persistence).unwrap();
+        let stats = log.stats().unwrap();
         assert_eq!(stats.user_messages, 0);
         assert_eq!(stats.assistant_messages, 0);
         assert_eq!(stats.tool_results, 0);
@@ -355,36 +370,36 @@ mod tests {
         assert!(stats.tool_call_counts.is_empty());
         assert!(stats.last_activity.is_none());
         assert_eq!(stats.session_env, None);
-        assert!(log.latest_leaf(ThreadFilter::USER).is_none());
+        assert!(log.latest_leaf(ThreadFilter::MAIN).is_none());
     }
 
     #[test]
     fn stats_preserves_an_explicitly_empty_session_env() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
         log.set_system_prompt("p".into()).expect("root");
         log.append_env_change(BTreeMap::new()).expect("empty env");
 
-        assert_eq!(log.stats().session_env, Some(BTreeMap::new()));
+        assert_eq!(log.stats().unwrap().session_env, Some(BTreeMap::new()));
     }
 
     #[test]
     fn stats_reads_session_env_from_active_branch() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
         let expected = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
         let root = log.set_system_prompt("p".into()).expect("root");
         let env = log.append_env_change(expected.clone()).expect("env");
-        assert_eq!(log.stats().session_env, Some(expected.clone()));
+        assert_eq!(log.stats().unwrap().session_env, Some(expected.clone()));
         log.set_head(root.id).expect("root head");
 
-        let stats = log.stats();
+        let stats = log.stats().unwrap();
         assert_eq!(stats.settings, SessionSettings::default());
         assert_eq!(stats.session_env, None);
         log.set_head(env.id).expect("env head");
-        assert_eq!(log.stats().session_env, Some(expected));
+        assert_eq!(log.stats().unwrap().session_env, Some(expected));
     }
 
     /// Build an assistant message carrying explicit token usage and a
@@ -458,22 +473,22 @@ mod tests {
         }
     }
 
-    /// Build a log holding one assistant turn and one compaction
+    /// Build a log holding one assistant message and one compaction
     /// checkpoint carrying `usage`, the shape a compacted session has on
     /// disk. Returns the log and the guard owning its directory.
-    fn log_with_compaction(usage: Usage) -> (tempfile::TempDir, ConversationLog) {
+    fn log_with_compaction(usage: Usage) -> (tempfile::TempDir, SessionLog) {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
         let first_kept = {
-            let mut head = ConversationView::user(&mut log);
+            let mut head = AgentLog::main(&mut log);
             head.add_message(AgentMessage::wire(user("hi"))).unwrap();
             head.add_message(AgentMessage::wire(assistant_with_usage(100, 50, 0.10)))
                 .unwrap()
                 .id
         };
         log.append_compaction(
-            ThreadFilter::USER,
+            ThreadFilter::MAIN,
             "summary".into(),
             first_kept,
             Vec::new(),
@@ -503,7 +518,7 @@ mod tests {
         usage.cost.total = 0.25;
         let (_dir, log) = log_with_compaction(usage);
 
-        let stats = log.stats();
+        let stats = log.stats().unwrap();
         assert_eq!(stats.compactions, 1, "the fixture must record a compaction");
         // The total first: a reader who checks one number checks this one.
         assert!(
@@ -561,10 +576,10 @@ mod tests {
     #[test]
     fn stats_aggregate_usage_across_assistant_messages() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
 
-        let mut head = ConversationView::user(&mut log);
+        let mut head = AgentLog::main(&mut log);
         head.add_message(AgentMessage::wire(user("hi"))).unwrap();
         head.add_message(AgentMessage::wire(assistant_with_usage(100, 50, 0.10)))
             .unwrap();
@@ -582,7 +597,7 @@ mod tests {
         )))
         .unwrap();
 
-        let stats = log.stats();
+        let stats = log.stats().unwrap();
         assert_eq!(stats.usage.input, 300);
         assert_eq!(stats.usage.output, 130);
         assert_eq!(stats.usage.total_tokens, 430);
@@ -595,15 +610,15 @@ mod tests {
     #[test]
     fn stats_breaks_usage_down_by_recorded_response_identity_across_the_whole_log() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
 
         let root = log
             .append(
                 None,
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(user("root")),
                 },
             )
@@ -615,9 +630,9 @@ mod tests {
         let abandoned_high = log
             .append(
                 Some(root.clone()),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(assistant_for(
                         "anthropic",
                         "high",
@@ -629,9 +644,9 @@ mod tests {
             .id;
         log.append(
             Some(abandoned_high),
-            ThreadKind::User,
+            ThreadKind::Main,
             None,
-            ConversationEntryKind::Message {
+            LogEntryKind::Message {
                 message: AgentMessage::wire(assistant_for(
                     "beta",
                     "high",
@@ -645,9 +660,9 @@ mod tests {
         let active_high = log
             .append(
                 Some(root),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(assistant_for(
                         "anthropic",
                         "high",
@@ -660,9 +675,9 @@ mod tests {
         let zero_token = log
             .append(
                 Some(active_high),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(assistant_for(
                         "anthropic",
                         "high",
@@ -675,9 +690,9 @@ mod tests {
         let personal = log
             .append(
                 Some(zero_token),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(assistant_for_account(
                         "anthropic",
                         "high",
@@ -691,9 +706,9 @@ mod tests {
         let work = log
             .append(
                 Some(personal),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(assistant_for_account(
                         "anthropic",
                         "high",
@@ -707,9 +722,9 @@ mod tests {
         let active_head = log
             .append(
                 Some(work),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(assistant_for(
                         "alpha",
                         "tie-a",
@@ -721,14 +736,22 @@ mod tests {
             .id;
 
         let spawn = log
-            .append_subagent_spawn(7, active_head, "measure", "agent", true, &spawn_settings())
+            .append_subagent_spawn(
+                7,
+                active_head,
+                "measure",
+                "agent",
+                None,
+                true,
+                &spawn_settings(),
+            )
             .unwrap();
         let subagent_tie = log
             .append(
                 Some(spawn.id),
-                ThreadKind::Subagent,
+                ThreadKind::Sub,
                 Some(7),
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(assistant_for(
                         "alpha",
                         "tie-z",
@@ -740,9 +763,9 @@ mod tests {
             .id;
         log.append(
             Some(subagent_tie),
-            ThreadKind::Subagent,
+            ThreadKind::Sub,
             Some(7),
-            ConversationEntryKind::Message {
+            LogEntryKind::Message {
                 message: AgentMessage::wire(assistant_for(
                     "zeta",
                     "tie-a",
@@ -752,7 +775,7 @@ mod tests {
         )
         .unwrap();
 
-        let stats = log.stats();
+        let stats = log.stats().unwrap();
         assert_eq!(
             stats.usage_breakdown.len(),
             7,
@@ -861,10 +884,10 @@ mod tests {
     #[test]
     fn resumed_stats_group_by_served_speed_not_requested_speed() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
         log.set_system_prompt("p".into()).unwrap();
-        log.append_speed_change(ThreadFilter::USER, "fast").unwrap();
+        log.append_speed_change(ThreadFilter::MAIN, "fast").unwrap();
 
         // The first response was requested fast but actually served standard.
         // Equal bucket totals also exercise the served-speed ordering tie-break.
@@ -880,7 +903,7 @@ mod tests {
         ] {
             let mut usage = measured_usage(tokens, cost);
             usage.served_speed = speed.map(str::to_string);
-            ConversationView::user(&mut log)
+            AgentLog::main(&mut log)
                 .add_message(AgentMessage::wire(assistant_for_account(
                     "provider",
                     "model",
@@ -889,12 +912,12 @@ mod tests {
                 )))
                 .unwrap();
         }
-        log.flush_pending().unwrap();
         let id = log.session_id().to_string();
-        let disk = std::fs::read_to_string(log.path()).unwrap();
-        let stored_speeds: Vec<_> = disk
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        let stored_speeds: Vec<_> = persistence
+            .read_entries(&id)
+            .unwrap()
+            .iter()
+            .map(|entry| serde_json::to_value(entry).unwrap())
             .filter_map(|entry| entry.pointer("/message/usage").cloned())
             .map(|usage| usage.get("served_speed").cloned())
             .collect();
@@ -910,8 +933,8 @@ mod tests {
         );
         drop(log);
 
-        let resumed = ConversationLog::resume(&persistence, &id).unwrap();
-        let stats = resumed.stats();
+        let resumed = SessionLog::resume(&persistence, &id).unwrap();
+        let stats = resumed.stats().unwrap();
         assert_eq!(stats.settings.speed.as_deref(), Some("fast"));
         let buckets: Vec<_> = stats
             .usage_breakdown

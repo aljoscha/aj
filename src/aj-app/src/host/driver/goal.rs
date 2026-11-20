@@ -1,5 +1,17 @@
 //! Branch-local goal policy. The session driver is the only mutator, including
 //! for model tool requests, so accounting and continuation see one ordered state.
+//!
+//! A goal's definition and status are committed before they take effect.
+//! Whoever changes them computes the next goal, [`Driver::commit_goal`]
+//! appends its entry, and only then is it installed: held as the current
+//! goal, shown to clients, described to the model. A refused commit changes
+//! nothing. A command is refused with it. A change the driver decided on
+//! from events ([`GoalRun::want`]) stays wanted, and the driver tries again
+//! and does not continue the goal meanwhile.
+//!
+//! Usage is a running total and is not committed as it accrues. It rides
+//! on the next entry, and one is forced at a Main turn's end. A session
+//! that ends mid-turn loses at most that turn's accounting.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -8,7 +20,6 @@ use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::goal::{Goal, GoalAction, GoalError, GoalRequest, GoalStatus};
 use aj_models::types::{AssistantContent, ErrorCategory, Message};
-use aj_session::{ConversationError, ConversationLog};
 
 use super::{Driver, HostError, TurnStart};
 
@@ -16,14 +27,23 @@ use super::{Driver, HostError, TurnStart};
 mod tests;
 
 pub(super) struct GoalRun {
+    /// The goal in effect. Its definition and status are as committed. Its
+    /// usage is as accrued and may be ahead of the last entry.
     pub(super) current: Option<Goal>,
-    /// The goal's definition or status changed, or a boundary asked for usage
-    /// to be saved. Only this appends a goal record.
-    dirty: bool,
-    /// Tokens or time accrued since the last record. Usage alone never appends:
-    /// it rides on the next record, and [`Self::save_usage`] forces one at a
-    /// Main turn's end and at teardown. A crash therefore loses at most the
-    /// interrupted turn's accounting.
+    /// A status the driver decided on from what a turn did, not yet
+    /// committed and so not in effect. While it waits, pursuit of the goal
+    /// is held (see [`Self::pursuing`]).
+    wanted: Option<GoalStatus>,
+    /// The failure to commit `wanted` was reported, so a retry that fails
+    /// again says nothing more.
+    refusal_reported: bool,
+    /// A boundary asked for usage to be saved. With `wanted`, the only
+    /// reason [`Driver::checkpoint_goal`] appends an entry.
+    usage_due: bool,
+    /// Tokens or time accrued since the last entry. Usage alone never appends:
+    /// it rides on the next entry, and [`Self::save_usage`] forces one at a
+    /// Main turn's end. A session that ends mid-turn, by a crash or a
+    /// shutdown, therefore loses at most that turn's accounting.
     unsaved_usage: bool,
     /// Tokens were charged since clients last saw the goal. Published from
     /// memory, since clients run their own clock for elapsed time.
@@ -48,7 +68,9 @@ impl GoalRun {
     pub(super) fn new(current: Option<Goal>) -> Self {
         Self {
             current,
-            dirty: false,
+            wanted: None,
+            refusal_reported: false,
+            usage_due: false,
             unsaved_usage: false,
             unpublished: false,
             owners: HashMap::new(),
@@ -70,9 +92,28 @@ impl GoalRun {
             .is_some_and(|goal| goal.status == GoalStatus::Active)
     }
 
-    pub(super) fn stop_pursuit(&mut self) {
-        if self.active() {
-            self.set_status(GoalStatus::Paused);
+    /// Whether the goal is active and no change of its status waits to be
+    /// committed. New work is started for the goal only then: a decision
+    /// to stop holds pursuit from the moment it is taken, although the
+    /// goal reads as active until the decision is committed.
+    fn pursuing(&self) -> bool {
+        self.active() && self.wanted.is_none()
+    }
+
+    /// The goal as the driver has decided it: the current one with the
+    /// wanted status. For the context a starting turn is given, which the
+    /// loop commits before it takes another request.
+    fn decided(&self) -> Option<Goal> {
+        let mut goal = self.current.clone();
+        if let (Some(goal), Some(status)) = (&mut goal, self.wanted) {
+            goal.status = status;
+        }
+        goal
+    }
+
+    fn stop_pursuit(&mut self) {
+        if self.pursuing() {
+            self.want(GoalStatus::Paused);
         }
     }
 
@@ -89,24 +130,38 @@ impl GoalRun {
 
     fn save_usage(&mut self) {
         self.elapsed();
-        self.dirty |= self.unsaved_usage;
+        self.usage_due |= self.unsaved_usage;
     }
 
-    fn set_status(&mut self, status: GoalStatus) {
-        self.elapsed();
-        if let Some(goal) = &mut self.current {
-            if goal.status != status {
-                goal.status = status;
-                self.dirty = true;
-            }
-            if status == GoalStatus::Active {
+    /// Decide that the goal's status becomes `status`. Nothing changes
+    /// until [`Driver::checkpoint_goal`] has committed it.
+    fn want(&mut self, status: GoalStatus) {
+        let Some(goal) = &self.current else {
+            return;
+        };
+        self.wanted = (goal.status != status).then_some(status);
+        self.refusal_reported = false;
+    }
+
+    /// Put `next`, which is committed, in effect, and bring the clock and
+    /// the accounting in line with its status.
+    fn install(&mut self, next: Option<Goal>) {
+        let replaced = self.current.as_ref().map(|goal| &goal.id) != next.as_ref().map(|g| &g.id);
+        self.current = next;
+        self.wanted = None;
+        self.refusal_reported = false;
+        self.usage_due = false;
+        self.unsaved_usage = false;
+        self.unpublished = false;
+        match self.current.as_ref().map(|goal| goal.status) {
+            Some(GoalStatus::Active) => {
+                if replaced {
+                    self.clock = Some(Instant::now());
+                }
                 self.clock.get_or_insert_with(Instant::now);
-            } else if status != GoalStatus::BudgetLimited {
-                self.clock = None;
             }
-        }
-        if !matches!(status, GoalStatus::Active | GoalStatus::BudgetLimited) {
-            self.stop_accounting();
+            Some(GoalStatus::BudgetLimited) => {}
+            _ => self.stop_accounting(),
         }
     }
 
@@ -126,7 +181,7 @@ impl GoalRun {
     fn begin(&mut self, agent: AgentId, automatic: bool) {
         if agent == AgentId::Main {
             self.owners.remove(&agent);
-            if self.active() {
+            if self.pursuing() {
                 let goal = self.current.as_ref().expect("active goal");
                 self.owners.insert(agent, goal.id.clone());
                 self.clock.get_or_insert_with(Instant::now);
@@ -146,7 +201,7 @@ impl GoalRun {
         // A busy Main adopts a changed goal at inference, not at the control
         // edit. Tools from the earlier response, including newly spawned
         // descendants, still belong to the goal that produced them.
-        if agent == AgentId::Main && self.active() {
+        if agent == AgentId::Main && self.pursuing() {
             self.owners.insert(
                 agent,
                 self.current.as_ref().expect("active goal").id.clone(),
@@ -170,12 +225,12 @@ impl GoalRun {
         self.unsaved_usage |= tokens > 0;
         self.unpublished |= tokens > 0;
         if goal.status == GoalStatus::Active
+            && self.wanted.is_none()
             && goal
                 .token_budget
                 .is_some_and(|budget| goal.tokens_used >= budget)
         {
-            goal.status = GoalStatus::BudgetLimited;
-            self.dirty = true;
+            self.want(GoalStatus::BudgetLimited);
         }
     }
 
@@ -184,7 +239,7 @@ impl GoalRun {
         outcome: &Result<Result<(), TurnError>, tokio::task::JoinError>,
     ) {
         self.save_usage();
-        if self.active() {
+        if self.pursuing() {
             match outcome {
                 Ok(Ok(())) => {
                     // Text alone cannot establish that execution recovered. A
@@ -193,20 +248,20 @@ impl GoalRun {
                     if self.execution_failed && !self.tool_succeeded {
                         self.failed_execution_turns = self.failed_execution_turns.saturating_add(1);
                         if self.failed_execution_turns >= 3 {
-                            self.set_status(GoalStatus::Blocked);
+                            self.want(GoalStatus::Blocked);
                         }
                     }
                     if self.automatic && !self.activity {
                         self.empty_turns = self.empty_turns.saturating_add(1);
                         if self.empty_turns >= 3 {
-                            self.set_status(GoalStatus::Blocked);
+                            self.want(GoalStatus::Blocked);
                         }
                     } else {
                         self.empty_turns = 0;
                     }
                 }
-                Ok(Err(TurnError::Aborted)) => self.set_status(GoalStatus::Paused),
-                _ => self.set_status(if self.last_error == Some(ErrorCategory::RateLimit) {
+                Ok(Err(TurnError::Aborted)) => self.want(GoalStatus::Paused),
+                _ => self.want(if self.last_error == Some(ErrorCategory::RateLimit) {
                     GoalStatus::UsageLimited
                 } else {
                     GoalStatus::Blocked
@@ -217,31 +272,6 @@ impl GoalRun {
             self.clock = None;
         }
     }
-}
-
-/// Selecting saved work is not authorization to execute it. Terminal and
-/// blocked states retain their explanation, only active pursuit becomes paused.
-pub(crate) fn restore_goal(log: &mut ConversationLog) -> Result<Option<Goal>, ConversationError> {
-    let mut goal = log.head().and_then(|head| log.goal_at(head));
-    if let Some(goal) = &mut goal
-        && goal.status == GoalStatus::Active
-    {
-        goal.status = GoalStatus::Paused;
-        log.append_goal_change(Some(goal.clone()))?;
-        log.flush_pending()?;
-    }
-    Ok(goal)
-}
-
-/// Even a cleared goal needs an authoritative model hint to supersede old
-/// continuation instructions. Ordinary sessions need no such extra context.
-pub(crate) fn has_goal_history(log: &ConversationLog) -> bool {
-    log.entries_in_order().iter().any(|entry| {
-        matches!(
-            entry.entry,
-            aj_session::ConversationEntryKind::GoalChange { .. }
-        )
-    })
 }
 
 impl Driver {
@@ -255,7 +285,6 @@ impl Driver {
     }
 
     pub(super) fn observe_goal_event(&mut self, event: &AgentEvent) {
-        let was_active = self.goal.active();
         match event {
             // Main is admitted through the request path before provider work.
             // A descendant's owner is fixed at spawn, regardless of receipt time.
@@ -316,7 +345,7 @@ impl Driver {
                 ..
             } => {
                 self.goal.activity = true;
-                if self.goal.active()
+                if self.goal.pursuing()
                     && self.goal.owners.get(&AgentId::Main)
                         == self.goal.current.as_ref().map(|goal| &goal.id)
                 {
@@ -333,13 +362,10 @@ impl Driver {
             }
             _ => {}
         }
-        if was_active && !self.goal.active() {
-            self.steer_goal_state();
-        }
     }
 
     pub(super) fn prepare_goal_turn(&mut self, agent: AgentId, automatic: bool) {
-        if agent == AgentId::Main && self.goal.active() && !self.goal_tools_available() {
+        if agent == AgentId::Main && self.goal.pursuing() && !self.goal_tools_available() {
             self.goal.stop_pursuit();
             self.publish_event(None, AgentEvent::Warning {
                 agent_id: AgentId::Main,
@@ -349,7 +375,7 @@ impl Driver {
         self.goal.begin(agent, automatic);
         if agent == AgentId::Main {
             let text = (!automatic && self.goal_revision > 0)
-                .then(|| context(self.goal.current.as_ref(), false));
+                .then(|| context(self.goal.decided().as_ref(), false));
             self.session.core.message_queues.set_context(agent, text);
         }
     }
@@ -375,7 +401,7 @@ impl Driver {
 
     pub(super) async fn continue_goal(&mut self) -> Result<(), GoalError> {
         if self.session.is_draining()
-            || !self.goal.active()
+            || !self.goal.pursuing()
             || self.turns.is_busy(&self.lifecycle, AgentId::Main)
         {
             return Ok(());
@@ -386,7 +412,7 @@ impl Driver {
         }
         // Explicit input and task results keep their ordinary wake path and
         // precede synthetic continuation. Goal context accompanies that wake.
-        if self.session.has_queued(AgentId::Main)
+        if self.session.has_pending(AgentId::Main)
             || self.session.core.task_registry.has_notices(AgentId::Main)
         {
             self.wake(AgentId::Main);
@@ -397,7 +423,7 @@ impl Driver {
         }
         let prompt = context(self.goal.current.as_ref(), true);
         if let Err(err) = self.spawn(AgentId::Main, TurnStart::Goal(prompt)) {
-            self.goal.set_status(GoalStatus::Blocked);
+            self.goal.want(GoalStatus::Blocked);
             self.publish_event(
                 None,
                 AgentEvent::Error {
@@ -409,15 +435,15 @@ impl Driver {
         self.checkpoint_goal().await
     }
 
-    /// Save usage that would otherwise wait for the next record. For teardown.
-    pub(super) async fn checkpoint_goal_usage(&mut self) -> Result<(), GoalError> {
-        self.goal.save_usage();
-        self.checkpoint_goal().await
-    }
-
+    /// Commit what the driver decided about the goal since the last
+    /// record: a wanted status, and usage a boundary asked to have saved.
+    /// Usage that only accrued is published to clients from memory.
+    ///
+    /// On an error nothing changed. The wanted status stays wanted, and
+    /// the next call tries again.
     pub(super) async fn checkpoint_goal(&mut self) -> Result<(), GoalError> {
         self.goal.elapsed();
-        if !self.goal.dirty {
+        if self.goal.wanted.is_none() && !self.goal.usage_due {
             if std::mem::take(&mut self.goal.unpublished) {
                 let current = self.goal.current.clone();
                 self.session.publish_state(&self.shared.fanout, |status| {
@@ -427,60 +453,80 @@ impl Driver {
             }
             return Ok(());
         }
-        // The log guard fences the event forwarder. Publish preceding appends
-        // before advancing the high-water mark past this non-message record.
-        let log = std::sync::Arc::clone(&self.session.core.log);
-        let mut log = log.lock().await;
-        self.drain_events();
-        let current = self.goal.current.clone();
-        let entry = log
-            .append_goal_change(current.clone())
+        let was_active = self.goal.active();
+        self.commit_goal(self.goal.decided()).await?;
+        if was_active && !self.goal.active() {
+            self.steer_goal_state();
+        }
+        Ok(())
+    }
+
+    /// Commit `next` as the branch's goal, then put it in effect and show
+    /// it to clients. On an error nothing was appended and the goal in
+    /// effect is the one it was.
+    async fn commit_goal(&mut self, next: Option<Goal>) -> Result<(), GoalError> {
+        let recorded = next.clone();
+        // The entry has no event. The journal publishes its position.
+        self.session
+            .core
+            .journal
+            .record(|log| {
+                log.append_goal_change(recorded.clone())?;
+                Ok(((), Vec::new()))
+            })
+            .await
             .map_err(|err| GoalError::Storage(err.to_string()))?;
-        log.flush_pending()
-            .map_err(|err| GoalError::Storage(err.to_string()))?;
-        self.goal.dirty = false;
-        self.goal.unsaved_usage = false;
-        self.goal.unpublished = false;
+        self.goal.install(next.clone());
         // Preserve zero as the fast path for sessions that have never had a
         // goal. Model creation enables context without advancing later revisions.
         self.goal_revision = self.goal_revision.max(1);
         self.session.publish_state(&self.shared.fanout, |status| {
-            status.goal = current;
-            status.last_seq = status.last_seq.max(entry.seq);
-            status.note_activity();
+            status.goal = next;
             true
         });
-        self.shared.fanout.mark_list_dirty();
         Ok(())
     }
 
-    pub(super) async fn fail_goal_persistence(&mut self, error: GoalError) {
+    /// Tell the user that the goal's state could not be saved, once per
+    /// change. The goal in effect is unchanged, a status the driver wanted
+    /// stays wanted and holds pursuit, and the next pass tries again.
+    ///
+    /// A failure that fused the log is not reported here: the driver's
+    /// failure arm reports it and ends the session.
+    pub(super) async fn report_goal_unsaved(&mut self, error: GoalError) {
         if self.session.core.log.lock().await.write_failure().is_some() {
-            // The fuse has already signalled the driver. Its failure arm owns
-            // reporting and teardown, and runs before more requests or work.
             return;
         }
-        self.goal.set_status(GoalStatus::Blocked);
-        self.goal.dirty = false;
-        self.turns.cancel_all();
+        if std::mem::replace(&mut self.goal.refusal_reported, true) {
+            return;
+        }
         self.publish_event(
             None,
             AgentEvent::Error {
                 agent_id: AgentId::Main,
-                text: error.to_string(),
+                text: format!("The goal's state could not be saved and is unchanged: {error}"),
             },
         );
     }
 
+    /// Pause an active goal for a cancel of the main agent. A pause that
+    /// cannot be committed refuses the cancel.
     pub(super) async fn pause_goal(&mut self) -> Result<(), HostError> {
         if self.goal.active() {
-            self.goal.set_status(GoalStatus::Paused);
+            self.goal.elapsed();
+            let mut next = self.goal.current.clone();
+            if let Some(goal) = &mut next {
+                goal.status = GoalStatus::Paused;
+            }
+            self.commit_goal(next).await.map_err(host_error)?;
             self.steer_goal_state();
-            self.checkpoint_goal().await.map_err(host_error)?;
         }
         Ok(())
     }
 
+    /// Apply a goal action: validate it, compute the goal it leads to,
+    /// commit that, and only then put it in effect. A refused commit is
+    /// the action's error, and nothing about the goal has changed.
     pub(super) async fn goal_action(
         &mut self,
         action: GoalAction,
@@ -507,8 +553,13 @@ impl Driver {
                 "only the user can edit, replace, change the budget, resume or clear a goal".into(),
             ));
         }
-        self.goal.elapsed();
-        let user_mutation = !from_tool && !matches!(action, GoalAction::Get);
+        // What the driver already decided comes first, so the action is
+        // computed from the goal as it stands.
+        self.checkpoint_goal().await?;
+        if matches!(action, GoalAction::Get) {
+            return Ok(self.goal.current.clone());
+        }
+        let user_mutation = !from_tool;
         let resumes_work = !from_tool
             && matches!(
                 action,
@@ -518,8 +569,16 @@ impl Driver {
                     | GoalAction::Resume
             );
         let replacing = matches!(action, GoalAction::Replace { .. });
-        match action {
-            GoalAction::Get => {}
+        let clearing = matches!(action, GoalAction::Clear);
+        let current = self.goal.current.clone();
+        // What installing the next goal does beyond its status: start the
+        // audit of failed turns afresh, or close the accounting.
+        let (mut fresh_audit, mut close_accounting) = (false, false);
+        // An edit and a budget change are recorded even when they repeat
+        // what is stored.
+        let mut always_record = false;
+        let next = match action {
+            GoalAction::Get => unreachable!("answered above"),
             GoalAction::Create {
                 objective,
                 token_budget,
@@ -532,53 +591,43 @@ impl Driver {
                 if token_budget == Some(0) {
                     return Err(GoalError::Invalid("token budget must be positive".into()));
                 }
-                if !replacing
-                    && self
-                        .goal
-                        .current
-                        .as_ref()
-                        .is_some_and(|goal| goal.status != GoalStatus::Complete)
-                {
+                let unfinished = |goal: &Goal| goal.status != GoalStatus::Complete;
+                if !replacing && current.as_ref().is_some_and(unfinished) {
                     return Err(GoalError::Conflict("An unfinished goal exists. Edit it, or confirm replacing it before creating another.".into()));
                 }
-                self.goal.current = Some(Goal {
+                fresh_audit = true;
+                always_record = true;
+                Some(Goal {
                     id: crate::host::mint_epoch(),
                     objective,
                     status: GoalStatus::Active,
                     token_budget,
                     tokens_used: 0,
                     time_used_seconds: 0,
-                });
-                self.goal.clock = Some(Instant::now());
-                self.goal.dirty = true;
-                self.goal.empty_turns = 0;
-                self.goal.reset_execution_audit();
-                self.steer_goal_state();
+                })
             }
             GoalAction::Clear => {
-                self.goal.dirty |= self.goal.current.take().is_some();
-                self.goal.stop_accounting();
-                self.goal.empty_turns = 0;
-                self.steer_goal_state();
+                close_accounting = true;
+                None
             }
             GoalAction::SetBudget { token_budget } => {
                 if token_budget == Some(0) {
                     return Err(GoalError::Invalid("token budget must be positive".into()));
                 }
-                let goal = self.goal.current.as_mut().ok_or_else(no_goal)?;
+                let mut goal = current.clone().ok_or_else(no_goal)?;
                 goal.token_budget = token_budget;
                 if goal.status == GoalStatus::Active && goal.remaining_tokens() == Some(0) {
                     goal.status = GoalStatus::BudgetLimited;
                 }
-                self.goal.dirty = true;
-                self.steer_goal_state();
+                always_record = true;
+                Some(goal)
             }
             GoalAction::Edit { objective } => {
                 let objective = validate_objective(objective)?;
-                let current = self.goal.current.as_ref().ok_or_else(no_goal)?;
-                let status = match current.status {
+                let mut goal = current.clone().ok_or_else(no_goal)?;
+                let status = match goal.status {
                     GoalStatus::Complete | GoalStatus::BudgetLimited => {
-                        if current.remaining_tokens() == Some(0) {
+                        if goal.remaining_tokens() == Some(0) {
                             GoalStatus::BudgetLimited
                         } else {
                             GoalStatus::Active
@@ -591,30 +640,27 @@ impl Driver {
                         "Enable update_goal before editing an active goal.".into(),
                     ));
                 }
-                let goal = self.goal.current.as_mut().ok_or_else(no_goal)?;
                 goal.objective = objective;
-                self.goal.set_status(status);
-                self.goal.empty_turns = 0;
-                self.goal.reset_execution_audit();
-                self.goal.dirty = true;
-                self.steer_goal_state();
+                goal.status = status;
+                fresh_audit = true;
+                always_record = true;
+                Some(goal)
             }
             GoalAction::Resume => {
-                let goal = self.goal.current.as_ref().ok_or_else(no_goal)?;
+                let mut goal = current.clone().ok_or_else(no_goal)?;
                 if goal
                     .token_budget
                     .is_some_and(|budget| goal.tokens_used >= budget)
                 {
                     return Err(GoalError::Conflict("The goal exhausted its token budget. Increase or remove the budget before resuming.".into()));
                 }
-                self.goal.set_status(GoalStatus::Active);
-                self.goal.empty_turns = 0;
-                self.goal.reset_execution_audit();
-                self.steer_goal_state();
+                goal.status = GoalStatus::Active;
+                fresh_audit = true;
+                Some(goal)
             }
             GoalAction::Pause | GoalAction::Complete | GoalAction::Block => {
-                let goal = self.goal.current.as_ref().ok_or_else(no_goal)?;
-                let status = match action {
+                let mut goal = current.clone().ok_or_else(no_goal)?;
+                goal.status = match action {
                     GoalAction::Complete => GoalStatus::Complete,
                     GoalAction::Pause if goal.status == GoalStatus::BudgetLimited => {
                         GoalStatus::BudgetLimited
@@ -623,14 +669,26 @@ impl Driver {
                     _ if goal.status == GoalStatus::BudgetLimited => GoalStatus::BudgetLimited,
                     _ => GoalStatus::Blocked,
                 };
-                self.goal.set_status(status);
                 // An explicit stop closes the subtotal returned to the caller.
                 // Reporting and late descendant results are outside that goal,
                 // even when budget-limited remains the displayed stop reason.
-                self.goal.stop_accounting();
-                self.steer_goal_state();
+                close_accounting = true;
+                Some(goal)
             }
+        };
+        if always_record || next != current {
+            self.commit_goal(next).await?;
         }
+        if fresh_audit {
+            self.goal.reset_execution_audit();
+        }
+        if fresh_audit || clearing {
+            self.goal.empty_turns = 0;
+        }
+        if close_accounting {
+            self.goal.stop_accounting();
+        }
+        self.steer_goal_state();
         if user_mutation {
             // Admission and mutation share the driver's request order, so a
             // revision never authorizes tools against an unseen objective.
@@ -640,7 +698,6 @@ impl Driver {
             self.waiting_for_input = false;
             self.goal_resume_pending = self.turns.is_busy(&self.lifecycle, AgentId::Main);
         }
-        self.checkpoint_goal().await?;
         Ok(self.goal.current.clone())
     }
 

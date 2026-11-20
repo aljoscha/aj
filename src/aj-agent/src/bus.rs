@@ -1,16 +1,18 @@
 //! Internal event bus for the [`crate::Agent`] runtime.
 //!
 //! The agent owns a single bus and emits every state transition
-//! through it as an [`crate::events::AgentEvent`]. Subscribers
-//! register an async listener via [`EventBus::subscribe`]; the bus
-//! awaits each listener inline in registration order, so any
-//! durability guarantee a listener requires (e.g. "the persisted log
-//! is never more than one event behind reality") falls out for free
-//! — when a listener is awaited inline, the agent cannot move on
-//! until the listener has handled the event. A listener that returns
-//! `Err` propagates the error back to the caller of [`EventBus::emit`], which
-//! the agent surfaces as [`crate::TurnError::Fatal`] so disk failures abort
-//! the run instead of silently continuing.
+//! through it as an [`crate::events::AgentEvent`].
+//!
+//! The bus publishes an event only after the session has committed what
+//! the event records. A session installs a [`Committer`] for that. It is
+//! awaited before any listener sees the event, and an event it refuses is
+//! not published: [`EventBus::emit`] returns the error, which the agent
+//! surfaces as [`crate::TurnError::Fatal`]. Which listeners are subscribed,
+//! and in what order, therefore has no bearing on what is stored.
+//!
+//! Subscribers register an async listener via [`EventBus::subscribe`]. The
+//! bus awaits each listener inline in registration order, and a listener
+//! that returns `Err` propagates the error the same way.
 //!
 //! Channel-style subscribers (where the listener forwards events into
 //! a `tokio::sync::mpsc` queue) compose on top of [`EventBus::subscribe`]
@@ -40,6 +42,19 @@ pub type Listener = Arc<
         + Sync,
 >;
 
+/// Commits what an event records before the bus publishes the event.
+///
+/// Called for every event, including the streaming ones that record
+/// nothing, so an implementation returns at once for those.
+pub trait Committer: Send + Sync {
+    /// Commit what `event` records. On `Err` nothing was committed, and the
+    /// event is not published.
+    fn commit<'a>(
+        &'a self,
+        event: &'a AgentEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'a>>;
+}
+
 /// One registered subscription.
 struct Slot {
     /// Stable identifier issued by [`EventBus::subscribe`] and used by
@@ -51,6 +66,7 @@ struct Slot {
 /// Shared state between an [`EventBus`] and any outstanding
 /// [`SubscriptionHandle`]s.
 struct BusInner {
+    committer: Mutex<Option<Arc<dyn Committer>>>,
     listeners: Mutex<Vec<Slot>>,
     next_id: AtomicU64,
 }
@@ -87,10 +103,21 @@ impl EventBus {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(BusInner {
+                committer: Mutex::new(None),
                 listeners: Mutex::new(Vec::new()),
                 next_id: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// Install the session's [`Committer`], replacing any earlier one.
+    /// Every clone of this bus commits through it.
+    pub fn set_committer(&self, committer: Arc<dyn Committer>) {
+        *self
+            .inner
+            .committer
+            .lock()
+            .expect("event bus committer mutex poisoned") = Some(committer);
     }
 
     /// Register a listener and return a handle whose drop removes it.
@@ -109,7 +136,8 @@ impl EventBus {
         }
     }
 
-    /// Emit an event to every subscriber in registration order.
+    /// Commit what the event records, then deliver it to every subscriber
+    /// in registration order.
     ///
     /// Listeners are awaited inline: the future returned by this
     /// method only resolves once every subscribed listener has
@@ -120,6 +148,15 @@ impl EventBus {
     /// The listener list is cloned without holding its lock across listener code
     /// or an await. Concurrent emits are not globally serialized by the bus.
     pub async fn emit(&self, event: AgentEvent) -> Result<(), BoxError> {
+        let committer = self
+            .inner
+            .committer
+            .lock()
+            .expect("event bus committer mutex poisoned")
+            .clone();
+        if let Some(committer) = committer {
+            committer.commit(&event).await?;
+        }
         let listeners: Vec<Listener> = self
             .inner
             .listeners

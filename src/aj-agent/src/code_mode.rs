@@ -94,7 +94,7 @@ pub(crate) fn catalog(
         "queues a notification for the next model inference and immediately displays it to the user",
     );
     description.push_str(concat!(
-        "\n\nAJ: committed store()/load() values belong to this agent's conversation branch ",
+        "\n\nAJ: committed store()/load() values belong to this agent's branch ",
         "and survive session resume and compaction. Writes commit when the script finishes, ",
         "including when it ends with a script error. Cancellation before completion discards ",
         "pending writes, but does not undo tool side effects. Cells survive turns, not process ",
@@ -102,7 +102,7 @@ pub(crate) fn catalog(
         "Code Mode or switching to an ineligible model cancels them too, retaining committed ",
         "values. Tool availability is checked on each nested call. An open cell stays in the ",
         "task list until collected or terminated, even if evaluation has finished. Use cell ",
-        "`wait` to collect it rather than waiting for a task-completion notice. AJ's input-yield ",
+        "`wait` to collect it rather than waiting for a task notification. AJ's input-yield ",
         "tool, when present, is named `yield`. AJ supports text and image output, not audio output. ",
         "`content(blockOrBlocks: ContentBlock | Iterable<ContentBlock>)` forwards MCP content ",
         "blocks, for example `content(result.content)`. Audio blocks are unsupported in AJ."
@@ -392,13 +392,31 @@ impl CodeMode {
         let outcome = render(self.shared.public_response(response));
         if let Some(status) = status {
             self.shared.finish(&cell_id, status, &outcome);
-        } else {
-            self.track_yielded(&cell_id, &outcome);
+        } else if let Err(error) = self.track_yielded(&cell_id, &outcome) {
+            // A cell that stays open is owed a notice if this host ends
+            // first, and that notice could not be saved. The cell is
+            // ended instead of left running unannounced.
+            let response = self.runtime.terminate(cell_id.clone().into()).await?;
+            let terminated = render(self.shared.public_response(response.into()));
+            self.shared
+                .finish(&cell_id, TaskStatus::Killed, &terminated);
+            return Err(format!(
+                "the cell could not be recorded as running and was terminated: {error}"
+            )
+            .into());
         }
         Ok(outcome)
     }
 
-    fn track_yielded(&self, cell_id: &protocol::CellId, outcome: &ToolOutcome) {
+    /// Give a cell that yielded its background task, once. The task is
+    /// announced before anyone is told the cell is open (see
+    /// [`crate::TaskRegistry::announce_loss`]): a cell lives in this
+    /// host's memory, and its owner is told once if the host ends first.
+    fn track_yielded(
+        &self,
+        cell_id: &protocol::CellId,
+        outcome: &ToolOutcome,
+    ) -> Result<(), BoxError> {
         let runner = self
             .shared
             .runner
@@ -411,11 +429,11 @@ impl CodeMode {
             .lock()
             .expect("code mode cells lock poisoned");
         let Some(cell) = cells.get_mut(cell_id) else {
-            return;
+            return Ok(());
         };
         cell.output.append(&outcome.content);
         if cell.task.is_some() {
-            return;
+            return Ok(());
         }
         // An open cell includes a completed script whose final result has not
         // yet been collected. The task owns that entire wait/termination lifetime.
@@ -440,6 +458,24 @@ impl CodeMode {
             cell.call_id.clone(),
             label.clone(),
         );
+        let mut lost = TaskNotice {
+            owner: ctx.agent_id,
+            task_id: id,
+            kind: kind.clone(),
+            label: label.clone(),
+            status: TaskStatus::Exited(None),
+            body: format!(
+                "Code Mode cell {public_id} was lost: the session ended while it was open. \
+                 Its state is gone, with any result that was not collected. Tool calls it \
+                 had made may or may not have run."
+            ),
+        }
+        .to_message();
+        lost.set_id(format!("cell-{public_id}-end"));
+        if let Err(error) = ctx.task_registry.announce_loss(id, lost) {
+            registration.abandon();
+            return Err(error);
+        }
         let (done, mut completed) = watch::channel(None);
         cell.task = Some((id, done));
         let runtime = Arc::clone(&self.runtime);
@@ -472,11 +508,14 @@ impl CodeMode {
                 TaskStatus::Exited(_) | TaskStatus::CaptureFailed(_) => "failed",
                 TaskStatus::Running => "is still running",
             };
+            // An end that cannot be saved leaves the announced loss as
+            // the cell's account, which the next open delivers.
             events.finished(status, TaskNotice {
                 owner: events.owner(), task_id: id, kind, label,
                 status, body: format!("Code Mode cell {public_id} {description}."),
             }).await;
         });
+        Ok(())
     }
 
     pub(crate) async fn interrupt(&self) -> Result<(), BoxError> {
@@ -563,8 +602,8 @@ impl Shared {
 struct Delegate {
     shared: Arc<Shared>,
     closed: CancellationToken,
-    // Session shutdown must drain even unobserved store commits before closing
-    // the persistence listener or releasing its writer lock.
+    // The session's owner waits for this cell's callbacks to return before
+    // it releases the session's lock, so none of them outlives the session.
     _cleanup: crate::TaskCleanupGuard,
 }
 

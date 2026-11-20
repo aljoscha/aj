@@ -123,6 +123,7 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
                 parent,
                 "existing child",
                 "agent",
+                None,
                 false,
                 &model.settings(),
             )

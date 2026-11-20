@@ -196,11 +196,11 @@ impl AssistantMessageEvent {
     /// for a stream that closed before the provider sent its terminal
     /// frame (`message_stop` / `finish_reason` / `response.completed`).
     ///
-    /// A mid-stream transport drop leaves a truncated turn: the accumulated
-    /// deltas are real, but the turn never actually finished. This is a
+    /// A mid-stream transport drop leaves a truncated response: the accumulated
+    /// deltas are real, but the response never actually finished. This is a
     /// retryable [`ErrorCategory::Transient`] failure, not a successful
     /// `Done` — so a
-    /// caller's retry layer re-issues the turn instead of persisting a
+    /// caller's retry layer re-issues the request instead of persisting a
     /// cut-off answer as complete. Accumulated content is preserved
     /// verbatim (mirroring [`Self::aborted`]) so a non-retrying consumer
     /// still sees best-effort output. When the partial already carries an

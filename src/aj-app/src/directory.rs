@@ -215,6 +215,20 @@ impl SessionDirectory {
             .map(|attached| &attached.client)
     }
 
+    /// Put a fetched page of earlier history in front of `session`'s
+    /// transcript. Returns whether it was applied (see
+    /// [`SessionClient::apply_history`]).
+    pub fn apply_history(&mut self, session: &str, page: aj_wire::HistoryPage) -> bool {
+        self.attached
+            .iter()
+            .find(|attached| attached.session == session)
+            .is_some_and(|attached| {
+                attached
+                    .client
+                    .apply_history(&mut attached.chat.borrow_mut(), page)
+            })
+    }
+
     /// Whether this client folds frames for `session`.
     pub fn is_attached(&self, session: &str) -> bool {
         self.attached
@@ -740,6 +754,7 @@ mod tests {
     /// The `state` an attach block opens with.
     fn opening(session: &str) -> Frame {
         Frame::State {
+            turn_interrupted: false,
             session: session.to_string(),
             epoch: EPOCH.to_string(),
             opens_block: true,
@@ -759,6 +774,7 @@ mod tests {
             last_seq,
             tasks: Default::default(),
             queues: Default::default(),
+            history_start: None,
         }
     }
 

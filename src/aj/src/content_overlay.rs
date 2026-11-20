@@ -1666,7 +1666,8 @@ mod tests {
     fn sample_stats() -> SessionInfo {
         SessionInfo {
             session_id: "2026-06-19-14-22-03-512".to_string(),
-            path: PathBuf::from("/home/u/.aj/sessions/home-u-proj/2026-06-19-14-22-03-512.jsonl"),
+            path: PathBuf::from("/home/u/.aj/sessions.sqlite3"),
+            project: "home-u-proj".to_string(),
             created_at: None,
             last_activity: None,
             size_bytes: Some(48 * 1024),

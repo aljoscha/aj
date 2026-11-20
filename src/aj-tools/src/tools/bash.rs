@@ -1,75 +1,49 @@
 //! `bash` builtin — execute a command in the system shell.
 //!
 //! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
-//! [`ToolOutcome`] whose
-//! `details` is [`ToolDetails::Bash`] on completion, carrying a
-//! bounded rolling tail of `stdout` / `stderr`, the process exit code,
-//! a `truncated` flag, an optional `full_output_path` pointing at a
-//! temp file with the complete (un-truncated) capture, and per-stream
-//! [`BashStreamTruncation`] summaries with the line/byte totals
-//! renderers use to compose `[Showing lines X-Y of TOTAL ...]`
-//! markers. The wire `content` keeps the text shape
-//! (`<stdout>` then `STDERR:` then `Command failed with exit code: N`)
-//! so the model reads the same transcript it always has, with each
-//! affected stream's marker inserted right after its content when
-//! truncation occurred.
+//! [`ToolOutcome`] whose `details` is [`ToolDetails::Bash`] on completion,
+//! carrying a bounded rolling tail of the command's output, the exit code,
+//! a `truncated` flag, an optional `full_output_path` pointing at the file
+//! with the complete output, and a [`BashStreamTruncation`] summary with
+//! the line/byte totals renderers use to compose
+//! `[Showing lines X-Y of TOTAL ...]` markers. The wire `content` is the
+//! output, its truncation marker when it was truncated, and then
+//! `Command failed with exit code: N` or what else ended the command.
+//!
+//! Every command runs through one runner, [`detached`]: under a shell
+//! wrapper in a session of its own, with its output in a file and its exit
+//! status in a second one. A foreground call waits for the command and
+//! reports its end as the tool result. A background call returns at once,
+//! its command is recorded by the session before it starts, and the
+//! command's end arrives as a task notification.
 //!
 //! Output handling:
 //!
-//! - **Bounded tail.** Each stream is capped at
-//!   [`crate::truncate::BASH_MAX_BYTES`] / [`crate::truncate::BASH_MAX_LINES`]
-//!   for what the model sees; in memory we keep a rolling window up to
-//!   [`ROLLING_CAP_BYTES`] (2× the byte cap) and lazily trim it back
-//!   whenever it crosses [`TRIM_TRIGGER_BYTES`] (4× the byte cap).
-//!   Bytes beyond that get evicted from the in-memory tail but still
-//!   land in the spill file. The first time the source overflows
-//!   either cap, `truncated` flips to `true` and the spill path is
-//!   surfaced in the structured payload so the user (and the TUI) can
-//!   open the full transcript on demand.
-//! - **Spill file.** A [`tempfile::NamedTempFile`] is created up-front
-//!   with prefix `aj-bash-` and suffix `.log`; both reader tasks tee
-//!   into it as bytes flow. If no truncation occurred at completion the
-//!   `NamedTempFile` is dropped (cleaning up the file). Otherwise
-//!   `keep()` persists it and we surface the resulting path. Background
-//!   tasks persist it unconditionally — the spill is the canonical
-//!   full output named in the started result and the completion
-//!   notice.
-//! - **Progress updates.** While the child runs the implementation
-//!   self-throttles `ToolContext::emit_update` to one snapshot per
-//!   [`UPDATE_DEBOUNCE`] (~10/s) using a leading-edge fire so the first
-//!   byte of output lights up the UI without waiting for the next
-//!   tick. Live snapshots carry the boolean `truncated` flag but not
-//!   the structured per-stream summary (that's only meaningful once
-//!   the stream has closed).
-//! - **Cancellation / timeout.** The child is launched in a fresh
-//!   process group (`process_group(0)`) so we can signal every
-//!   descendant the shell forked, which a plain `Child::kill()` would
-//!   leak. On Unix we `SIGTERM` the process group, give it a grace
-//!   period, then escalate to `SIGKILL`. The timeout path falls back
-//!   to killing just the immediate child on non-Unix. The drop path
-//!   has no such fallback, so there a cancelled command's processes
-//!   survive and only the tool's own descriptors are released. A
-//!   descendant that left the group (`setsid`) is out of reach of all
-//!   of this, which is what the capture drain below bounds.
-//!   Every post-`SIGKILL` wait has its own [`KILL_GRACE`] bound. If the
-//!   kernel cannot make the leader reapable within it, the guard releases
-//!   the child handle, capture readers, and session cleanup lease together.
-//!
-//!   Timeout runs through the `select!` loop's own arm. Cancellation
-//!   mostly does not: the driver drops this future instead of polling
-//!   it again, so the loop's cancel arm only runs in the narrow window
-//!   where the token fires while a poll is in flight. What actually
-//!   tears a cancelled command down is [`ProcessGuard`], on drop.
-//! - **Capture drain.** Capture ends when the command ends. The reader
-//!   tasks stop at EOF, EOF needs every write end of the pipes closed,
-//!   and a process that outlives the command holds one unless it
-//!   redirected the tool's stdout and stderr away. So once the command
-//!   has ended, for any reason, the drain waits
-//!   [`CAPTURE_DRAIN_GRACE`] for the pipes to close and then takes
-//!   them back: `SIGTERM` to the group, the same grace again,
-//!   `SIGKILL`, and finally aborting the reader tasks, which drops the
-//!   read ends whatever still holds the far side. A run that got that
-//!   far says so in a trailer, see [`capture_cut_trailer`].
+//! - **One stream.** Stdout and stderr share the output file, in the order
+//!   the command wrote them. The tail and the totals are of both and are
+//!   reported as stdout.
+//! - **Bounded tail.** The model sees at most
+//!   [`crate::truncate::BASH_MAX_BYTES`] / [`crate::truncate::BASH_MAX_LINES`].
+//!   In memory we keep a rolling window up to [`ROLLING_CAP_BYTES`] (2× the
+//!   byte cap) and lazily trim it back whenever it crosses
+//!   [`TRIM_TRIGGER_BYTES`] (4× the byte cap). The first time the source
+//!   overflows either cap, `truncated` flips to `true`.
+//! - **Full output.** The output file is the complete output. A foreground
+//!   call names it when the output was truncated and removes it otherwise.
+//!   A background task always keeps it.
+//! - **Progress updates.** While a foreground command runs the tool emits
+//!   `ToolContext::emit_update` snapshots as output arrives, at most one per
+//!   [`UPDATE_DEBOUNCE`] (~10/s), with a leading-edge fire so a renderer
+//!   shows the running command at once. Live snapshots carry the boolean
+//!   `truncated` flag but not the structured summary, which is only
+//!   meaningful once the command has ended.
+//! - **Cancellation / timeout.** Both stop the command's whole process
+//!   group: `SIGTERM`, then `SIGKILL` after [`KILL_GRACE`]. A cancel
+//!   mostly arrives as a drop, because the agent drops a cancelled call's
+//!   future instead of polling it again. See [`detached`] for what a drop
+//!   does.
+//! - **The host ending.** A foreground command never outlives the process
+//!   that runs it, however that process ends. See [`detached`].
 //! - **Parallel execution.** Independent commands may run concurrently.
 //!   Callers must sequence commands that depend on or conflict with each other.
 
@@ -78,21 +52,22 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aj_agent::TaskCleanupGuard;
 use aj_agent::tool::{
-    BashStreamTruncation, ExecutionMode, StartedTask, TaskEventSink, TaskId, TaskKind, TaskNotice,
-    TaskOutputSource, TaskRead, TaskStatus, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+    BashStreamTruncation, ExecutionMode, TaskId, TaskStatus, ToolContext, ToolDefinition,
+    ToolDetails, ToolOutcome,
 };
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
-use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
+use tokio::process::Command;
 
 use crate::truncate::{BASH_MAX_BYTES, BASH_MAX_LINES, TruncatedBy, format_size, truncate_tail};
+
+mod detached;
+pub use detached::{
+    DetachedProcess, SavedBashTask, ended_background_bash, still_running_outcome,
+    watch_background_bash,
+};
 
 const DESCRIPTION: &str = r#"
 Execute a command in the system shell (bash). The command will be run in the
@@ -101,12 +76,12 @@ working directory of the agent session.
 - This tool enforces no permission checks or sandboxing. Obtain any approval
   required for the command's effects before running it.
 - Commands have a configurable timeout to prevent hanging (default: 30s). It
-  bounds the command itself: a process the command leaves behind still holding
-  its stdout or stderr gets a couple of seconds to let go, after which its
-  process group is killed and the reported output may be incomplete.
-- Output is truncated to the last 2000 lines or 50KB per stream (whichever
-  fires first). When truncated, the full output is saved to a temp file and
-  the marker points at it.
+  bounds the command itself: a process the command leaves behind keeps
+  running, and what it writes after the command ended is not reported.
+- Stdout and stderr are reported as one stream, in the order written.
+- Output is truncated to the last 2000 lines or 50KB (whichever fires first).
+  When truncated, the full output is saved to a file and the marker points
+  at it.
 - The command is passed to `bash -c`, so pipes, redirects, and shell features work.
 - For file search, prefer `rg` (ripgrep) over `grep`/`find` — it's faster and
   respects `.gitignore` by default. Use `read_file` for reading file contents
@@ -118,9 +93,9 @@ working directory of the agent session.
   notified when it completes.
 - For "wait until X is ready", background a command that exits when the
   condition holds (e.g. `until grep -q "Ready" dev.log; do sleep 0.5; done`)
-  — one task, one completion notice — instead of polling in the foreground.
+  — one task, one task notification — instead of polling in the foreground.
 - You do not need to wait for a background task. Keep working and the
-  completion notice reaches you once it finishes. Never wait by sleeping in
+  task notification reaches you once it finishes. Never wait by sleeping in
   the foreground: no notice can arrive while a foreground command is running,
   so sleeping only delays the report by the length of the sleep.
 - Double-forking daemons escape the process group, so stopping the task can't
@@ -160,45 +135,60 @@ const RTK_HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 /// teardown" has to say it in terms of this.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// How long the capture pipes get to close once the command has ended.
-///
-/// Deliberately a constant rather than a slice of the command's
-/// `timeout`: this is not "how long may the command run" but "how long
-/// do we wait for its pipes to close afterwards", and a slice would
-/// make the bound depend on when the child exited (an exit one second
-/// into a 30s budget would leave a 29s wait, which is most of the
-/// hang it is meant to prevent).
-const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
-
-/// Window for the pipes to close after the escalation `SIGKILL`. The
-/// kernel closes a killed process's descriptors, so this covers
-/// scheduling the readers, not any cleanup of theirs.
-const CAPTURE_CLOSE_GRACE: Duration = Duration::from_millis(200);
-
 #[derive(Clone)]
 pub struct BashTool {
     /// When true, eligible commands are dispatched through `rtk`
     /// (https://github.com/rtk-ai/rtk) to compress their output before
     /// it reaches the model. See [`Self::rtk_rewrite`].
     rtk: bool,
-    /// Where spill files are written. `None` uses the ambient temp
-    /// directory, which is what an unset `spill_dir` config means.
+    /// Where commands write their output and exit files when no task
+    /// directory is set. `None` uses the ambient temp directory, which is
+    /// what an unset `spill_dir` config means.
     spill_dir: Option<PathBuf>,
+    /// Where commands write their output and exit files. `None` uses the
+    /// spill directory.
+    task_dir: Option<PathBuf>,
 }
 
 impl BashTool {
     /// Construct with the given rtk passthrough setting and spill directory.
     pub fn new(rtk: bool, spill_dir: Option<PathBuf>) -> Self {
-        Self { rtk, spill_dir }
+        Self {
+            rtk,
+            spill_dir,
+            task_dir: None,
+        }
+    }
+
+    /// Write commands' files to `dir` instead of the spill directory. A
+    /// task record can outlive the process, so its files belong
+    /// somewhere that is not cleaned behind it.
+    pub fn with_task_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.task_dir = dir;
+        self
+    }
+
+    /// Create the output file of a command. Dropping the handle does not
+    /// remove it: whoever reports the command's end decides whether the
+    /// file stays as its full output.
+    fn create_task_log(&self) -> std::io::Result<(std::fs::File, PathBuf)> {
+        let dir = self.task_dir.as_deref().or(self.spill_dir.as_deref());
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("aj-bash-").suffix(".log");
+        let file = match dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                builder.tempfile_in(dir)?
+            }
+            None => builder.tempfile()?,
+        };
+        file.keep().map_err(|error| error.error)
     }
 }
 
 impl Default for BashTool {
     fn default() -> Self {
-        Self {
-            rtk: false,
-            spill_dir: None,
-        }
+        Self::new(false, None)
     }
 }
 
@@ -212,7 +202,7 @@ pub struct BashInput {
     /// A description explaining what the command does and why you want to run it.
     pub description: String,
     /// Run the command in the background. The call returns immediately
-    /// with a task id and the output path, and a completion notice
+    /// with a task id and the output path, and a task notification
     /// arrives when the task finishes. `timeout` is ignored in
     /// background mode, the task runs until it exits or is stopped.
     #[serde(default)]
@@ -225,10 +215,10 @@ struct BashResult<'a> {
     stdout: &'a str,
     stderr: &'a str,
     exit_code: Option<i32>,
-    /// True when either captured tail exceeded its display budget.
+    /// True when the captured tail exceeded its display budget.
     truncated: bool,
     full_output_path: Option<&'a Path>,
-    /// Present for a background launch. Its streams are initially empty.
+    /// Present for a background launch. Its output is initially empty.
     task_id: Option<TaskId>,
 }
 
@@ -296,8 +286,6 @@ impl ToolDefinition for BashTool {
         input: Self::Input,
     ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let working_dir = ctx.working_directory();
-        let cancellation = ctx.cancellation();
-        let timeout = Duration::from_secs(input.timeout);
         let command = input.command.clone();
 
         // Optionally dispatch through `rtk` to compress output. The
@@ -313,355 +301,55 @@ impl ToolDefinition for BashTool {
             None => command.clone(),
         };
 
-        // Build the child. `process_group(0)` makes the child the
-        // leader of a new process group so signaling the group reaches
-        // every descendant the shell may have spawned (a `Child::kill`
-        // alone only signals the immediate child).
-        //
-        // `stdin: null` keeps any command that reads from stdin from
-        // hanging on the agent's terminal — the child gets EOF
-        // immediately rather than waiting for input that will never
-        // come.
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(&executed)
-            .current_dir(&working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // `Command` inherits the process environment by default. Apply the
-        // session map afterward so it shadows inherited values, then apply
-        // the fixed overrides below so deterministic output still wins.
-        cmd.envs(ctx.session_env());
-        // Overlay a fixed set of environment overrides on top of the
-        // inherited and session environment. We capture output rather than
-        // attach a terminal, so we force programs into a deterministic,
-        // uncolored, non-interactive mode: unstable output (colors, spinners,
-        // prompts) is noise the model has to parse, and a prompt with no
-        // attached tty would hang until timeout.
-        // `GIT_OPTIONAL_LOCKS=0` keeps the agent's read-only git calls
-        // from contending with the user's concurrent git over the index
-        // lock. Non-git processes ignore it, so we set it unconditionally.
-        cmd.env("TERM", "dumb")
-            .env("NO_COLOR", "1")
-            .env("CLICOLOR", "0")
-            .env("CLICOLOR_FORCE", "0")
-            .env("FORCE_COLOR", "0")
-            .env("NONINTERACTIVE", "1")
-            .env("DEBIAN_FRONTEND", "noninteractive")
-            .env("AGENT", "aj")
-            .env("GIT_OPTIONAL_LOCKS", "0");
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-
-        let cleanup = ctx.task_registry().track_cleanup();
-        let child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                return Ok(spawn_error_outcome(
-                    &command,
-                    format!("Failed to start command '{}': {}", command, e),
-                ));
-            }
-        };
-
-        // Armed on the line after the spawn, before anything that can
-        // fail: every `?` below this point would otherwise return with
-        // the command running and nothing left to reach it.
-        let mut guard = ProcessGuard::arm(child, cleanup)?;
-        let child_pid = guard.pgid();
-        let stdout = guard
-            .child_mut()
-            .stdout
-            .take()
-            .expect("stdout was piped above");
-        let stderr = guard
-            .child_mut()
-            .stderr
-            .take()
-            .expect("stderr was piped above");
-
-        // The spill file is created eagerly so both reader tasks can
-        // tee into it without coordinating creation. If no truncation
-        // happens we drop the `NamedTempFile` at the end and the file
-        // gets unlinked; if truncation does happen we `keep()` it and
-        // surface the path through the structured payload.
-        let spill = Arc::new(Mutex::new(SpillState::new(self.spill_dir.as_deref())?));
-
-        let stdout_state = Arc::new(Mutex::new(StreamState::new()));
-        let stderr_state = Arc::new(Mutex::new(StreamState::new()));
-        let capture_error = Arc::new(Mutex::new(None));
-
-        let stdout_reader = tokio::spawn(read_stream(
-            stdout,
-            Arc::clone(&stdout_state),
-            Arc::clone(&spill),
-            Arc::clone(&capture_error),
-            "stdout",
-        ));
-        let stderr_reader = tokio::spawn(read_stream(
-            stderr,
-            Arc::clone(&stderr_state),
-            Arc::clone(&spill),
-            Arc::clone(&capture_error),
-            "stderr",
-        ));
-
-        // The readers own the pipe read ends, so the teardown drops them
-        // too. They cannot be handed over at arming time because they do
-        // not exist until the child's pipes do.
-        guard.watch_readers([stdout_reader.abort_handle(), stderr_reader.abort_handle()]);
-
         if input.run_in_background {
-            // Background mode: the spill file is the canonical full
-            // output — it must stay reachable for `read_file`, task
-            // reads, and the completion notice even when nothing ever
-            // overflows the rolling tails — so it is persisted
-            // up-front, not just on truncation. Writes keep flowing
-            // to the same fd after `persist`.
-            let persisted = spill.lock().unwrap().persist();
-            let spill_path = match persisted {
-                Ok(path) => path,
-                Err(err) => {
-                    // The child is already running but has no registry
-                    // entry yet, so nothing here can ever reach it
-                    // again. Returning drops the still-armed guard,
-                    // which tears the group down.
-                    return Err(err.into());
-                }
-            };
-            let output = Arc::new(BashTaskOutput {
-                stdout: Arc::clone(&stdout_state),
-                stderr: Arc::clone(&stderr_state),
-                spill_path: spill_path.clone(),
-            });
-            let kind = TaskKind::Bash {
-                command: command.clone(),
-            };
-            let StartedTask {
-                id,
-                cancel,
-                events,
-                driver,
-            } = ctx.start_background_task(kind, command.clone(), output);
-            // Registration and driver spawn stay one synchronous ownership
-            // handoff. A drop before the spawn settles the registration and
-            // leaves the process guard armed in this future. Once spawned, the
-            // driver owns all task lifecycle emissions: `TaskStart` first, then
-            // `TaskOutput` / `TaskEnd`. That first emit races this future's own
-            // return, so `TaskStart` may land before or after the launch's
-            // `ToolExecutionEnd`.
-            //
-            // The armed process guard moves with the background future. It no
-            // longer belongs to this turn, but remains armed so a forced task-
-            // driver abort still terminates the process group and readers.
-            driver.spawn(drive_background_bash(BackgroundBash {
-                process: guard,
-                child_pid,
-                stdout_reader,
-                stderr_reader,
-                stdout_state,
-                stderr_state,
-                capture_error,
-                spill_path: spill_path.clone(),
-                command: command.clone(),
-                task_id: id,
-                cancel,
-                events,
-            }));
-
-            let wire = format!(
-                "Started background task #{id}: {command}\n\
-                 Output is being written to {path}, read it with read_file \
-                 (supports offset/limit). You will be notified when it \
-                 completes.",
-                path = spill_path.display(),
-            );
-            return Ok(ToolOutcome {
-                structured_content: Some(serde_json::to_value(BashResult {
-                    stdout: "",
-                    stderr: "",
-                    exit_code: None,
-                    truncated: false,
-                    full_output_path: Some(&spill_path),
-                    task_id: Some(id),
-                })?),
-                content: vec![UserContent::text(wire)],
-                details: ToolDetails::Bash {
-                    command,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                    truncated: false,
-                    full_output_path: Some(spill_path),
-                    stdout_truncation: None,
-                    stderr_truncation: None,
-                    task_id: Some(id),
-                },
-                is_error: false,
-            });
+            return detached::launch(self, ctx, command, executed, working_dir);
         }
-
-        let timeout_at = Instant::now() + timeout;
-        // `last_update - UPDATE_DEBOUNCE` triggers a leading-edge fire
-        // on the first iteration, so a renderer can show the running
-        // command label as soon as we enter the loop.
-        let mut last_update = Instant::now() - UPDATE_DEBOUNCE;
-
-        let outcome_kind = loop {
-            let now = Instant::now();
-            if now.duration_since(last_update) >= UPDATE_DEBOUNCE {
-                let snapshot = snapshot_partial(&command, &stdout_state, &stderr_state);
-                ctx.emit_update(snapshot).await;
-                last_update = now;
-            }
-
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    break ChildExit::Cancelled;
-                }
-                _ = tokio::time::sleep_until(timeout_at) => {
-                    break ChildExit::TimedOut;
-                }
-                res = guard.child_mut().wait() => {
-                    let status = res?;
-                    break ChildExit::Exited(status.code());
-                }
-                // Wake periodically so a long-running command without
-                // child-exit / cancel / timeout activity still gets
-                // its progress snapshot through the loop above.
-                _ = tokio::time::sleep(UPDATE_DEBOUNCE) => {}
-            }
-        };
-
-        // Cancel/timeout paths: signal the whole process group so any
-        // shell-spawned grandchildren die with the parent.
-        let capture_released = if matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut)
-        {
-            guard.terminate_user_command().await == ProcessTermination::OwnershipReleased
-        } else {
-            false
-        };
-
-        // The reader tasks own the pipe read ends, and their streams end
-        // only at EOF, which needs every write end closed. The kill
-        // above does not reach a descendant that left the group, so
-        // every exit reason drains under the same bound.
-        let capture_end = drain_capture(
-            stdout_reader,
-            stderr_reader,
-            &capture_error,
-            child_pid,
-            capture_released,
-        )
-        .await;
-        let capture_end = if capture_released {
-            CaptureEnd::ReapReleased
-        } else {
-            capture_end
-        };
-        let capture_error = capture_error.lock().unwrap().clone();
-
-        // Finalize per-stream: apply truncate_tail to the rolling tail
-        // (after dropping any leading partial line) and produce the
-        // model-facing stdout/stderr strings plus optional structured
-        // truncation summaries.
-        let (stdout_str, stdout_truncation) = {
-            let s = stdout_state.lock().unwrap();
-            finalize_stream(&s)
-        };
-        let (stderr_str, stderr_truncation) = {
-            let s = stderr_state.lock().unwrap();
-            finalize_stream(&s)
-        };
-
-        let truncated = stdout_truncation.is_some() || stderr_truncation.is_some();
-
-        // Persist the spill file iff we actually truncated; otherwise
-        // drop it (NamedTempFile's Drop unlinks the file).
-        let full_output_path = {
-            let mut spill = spill.lock().unwrap();
-            if truncated {
-                Some(spill.persist()?)
-            } else {
-                None
-            }
-        };
-
-        let exit_code = match outcome_kind {
-            ChildExit::Exited(code) => code,
-            ChildExit::Cancelled | ChildExit::TimedOut => None,
-        };
-
-        // The command has ended and its capture is closed, so there is
-        // nothing left for a drop to tear down.
-        guard.release();
-
-        let mut wire = build_wire_content(
-            &stdout_str,
-            &stderr_str,
-            stdout_truncation.as_ref(),
-            stderr_truncation.as_ref(),
-            &outcome_kind,
-            exit_code,
-            input.timeout,
-            full_output_path.as_deref(),
-            capture_end,
-        );
-        if let Some(error) = &capture_error {
-            wire.push_str(&format!("\nOutput capture failed: {error}"));
-        }
-
-        // Cancellation and timeout are exceptional outcomes the model
-        // should know to recover from; a non-zero exit code from a
-        // command that ran to completion is a normal "the command
-        // failed" signal that the wire content already conveys.
-        let is_error = capture_error.is_some()
-            || matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut);
-
-        Ok(ToolOutcome {
-            structured_content: Some(serde_json::to_value(BashResult {
-                stdout: &stdout_str,
-                stderr: &stderr_str,
-                exit_code,
-                truncated,
-                full_output_path: full_output_path.as_deref(),
-                task_id: None,
-            })?),
-            content: vec![UserContent::text(wire)],
-            details: ToolDetails::Bash {
-                command,
-                stdout: stdout_str,
-                stderr: stderr_str,
-                exit_code,
-                truncated,
-                full_output_path,
-                stdout_truncation,
-                stderr_truncation,
-                task_id: None,
-            },
-            is_error,
-        })
+        detached::run(self, ctx, command, executed, working_dir, input.timeout).await
     }
 }
 
-/// Why the child stopped. Drives both the wire content's trailer and
-/// the `is_error` flag.
-#[derive(Clone, Copy, Debug)]
-enum ChildExit {
-    /// Child ran to completion. `Some(code)` for normal exit, `None`
-    /// when the child was killed by a signal.
-    Exited(Option<i32>),
-    /// `ToolContext::cancellation` fired during execution.
-    Cancelled,
-    /// The configured timeout elapsed before the child returned.
-    TimedOut,
+/// Give `cmd` the environment every command of the tool runs in.
+fn apply_environment(cmd: &mut Command, session_env: std::collections::BTreeMap<String, String>) {
+    // `Command` inherits the process environment by default. Apply the
+    // session map afterward so it shadows inherited values, then apply
+    // the fixed overrides below so deterministic output still wins.
+    cmd.envs(session_env);
+    // Overlay a fixed set of environment overrides on top of the
+    // inherited and session environment. We capture output rather than
+    // attach a terminal, so we force programs into a deterministic,
+    // uncolored, non-interactive mode: unstable output (colors, spinners,
+    // prompts) is noise the model has to parse, and a prompt with no
+    // attached tty would hang until timeout.
+    // `GIT_OPTIONAL_LOCKS=0` keeps the agent's read-only git calls
+    // from contending with the user's concurrent git over the index
+    // lock. Non-git processes ignore it, so we set it unconditionally.
+    cmd.env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "0")
+        .env("FORCE_COLOR", "0")
+        .env("NONINTERACTIVE", "1")
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .env("AGENT", "aj")
+        .env("GIT_OPTIONAL_LOCKS", "0");
 }
 
-/// Per-stream rolling-tail state shared with the reader task.
+/// Why a foreground command stopped. Drives both the wire content's
+/// trailer and the `is_error` flag.
+#[derive(Clone, Copy, Debug)]
+enum ChildExit {
+    /// The command ran to its end, with the status the shell reports: a
+    /// command killed by signal `N` has exit code `128 + N`.
+    Exited(i32),
+    /// `ToolContext::cancellation` fired during execution.
+    Cancelled,
+    /// The configured timeout elapsed before the command ended.
+    TimedOut,
+    /// The command's process is gone and left no exit status.
+    Lost,
+}
+
+/// Rolling-tail state of a command's output as it has been read so far.
 ///
 /// Tracks both the in-memory rolling tail and the source-stream
 /// totals (line and byte counts) needed to build the truncation
@@ -689,6 +377,10 @@ struct StreamState {
     /// `true` so an empty stream is treated as ending on a (vacuous)
     /// boundary.
     ends_with_newline: bool,
+    /// Bytes at the start of the source that were never read (see
+    /// [`Self::skip`]). When nonzero the line counts are of the part that
+    /// was read, and only the byte total is of the whole source.
+    skipped_bytes: u64,
 }
 
 impl StreamState {
@@ -700,7 +392,18 @@ impl StreamState {
             newlines_seen: 0,
             current_line_bytes: 0,
             ends_with_newline: true,
+            skipped_bytes: 0,
         }
+    }
+
+    /// Account for the first `bytes` of the source without reading them,
+    /// before any chunk is applied. `at_boundary` says whether the last of
+    /// them was `\n`, so that what follows starts on a line.
+    fn skip(&mut self, bytes: u64, at_boundary: bool) {
+        debug_assert_eq!(self.total_bytes_seen, 0);
+        self.skipped_bytes = bytes;
+        self.total_bytes_seen = bytes;
+        self.tail_starts_at_boundary = at_boundary;
     }
 
     /// Source line count. The empty stream has zero lines; a stream
@@ -753,515 +456,13 @@ impl StreamState {
     }
 }
 
-/// Spill-file state: a temp file we tee both streams into.
-///
-/// Foreground runs persist it only when truncation occurred
-/// (otherwise dropping `Self` unlinks it); background runs persist it
-/// up-front — the spill is the canonical full output — and keep
-/// writing to the same fd afterwards.
-struct SpillState {
-    /// `None` only transiently inside `persist` (and after a failed
-    /// `keep`, in which case further writes are dropped — the caller
-    /// already surfaced the error).
-    file: Option<SpillFile>,
-}
-
-enum SpillFile {
-    /// Unlinked on drop unless persisted.
-    Temp(NamedTempFile),
-    /// Persisted at `path`; writes keep flowing to `file`.
-    Kept { file: std::fs::File, path: PathBuf },
-}
-
-impl SpillState {
-    /// A fresh spill file in `dir`, or in the ambient temp directory when
-    /// `dir` is `None`.
-    ///
-    /// The directory is created if missing, so a configured path does not have
-    /// to exist before the first command runs.
-    fn new(dir: Option<&Path>) -> std::io::Result<Self> {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix("aj-bash-").suffix(".log");
-        let file = match dir {
-            Some(dir) => {
-                std::fs::create_dir_all(dir)?;
-                builder.tempfile_in(dir)?
-            }
-            None => builder.tempfile()?,
-        };
-        Ok(Self {
-            file: Some(SpillFile::Temp(file)),
-        })
-    }
-
-    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        match self.file.as_mut() {
-            Some(SpillFile::Temp(f)) => f.as_file_mut().write_all(bytes),
-            Some(SpillFile::Kept { file, .. }) => file.write_all(bytes),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "spill file is unavailable",
-            )),
-        }
-    }
-
-    /// Persist the spill file at its current path, returning that path
-    /// for the caller to surface. Idempotent; the open handle is kept
-    /// so reader tasks can continue teeing into the persisted file.
-    fn persist(&mut self) -> std::io::Result<PathBuf> {
-        match self.file.take() {
-            Some(SpillFile::Temp(tmp)) => {
-                let (file, path) = tmp.keep().map_err(|e| e.error)?;
-                self.file = Some(SpillFile::Kept {
-                    file,
-                    path: path.clone(),
-                });
-                Ok(path)
-            }
-            Some(SpillFile::Kept { file, path }) => {
-                let out = path.clone();
-                self.file = Some(SpillFile::Kept { file, path });
-                Ok(out)
-            }
-            None => unreachable!("spill file present unless a prior persist failed"),
-        }
-    }
-}
-
-/// Drain `reader` into the shared stream state, teeing every byte into
-/// the spill file as it arrives. Terminates when the pipe closes.
-async fn read_stream<R>(
-    mut reader: R,
-    state: Arc<Mutex<StreamState>>,
-    spill: Arc<Mutex<SpillState>>,
-    capture_error: Arc<Mutex<Option<String>>>,
-    stream_name: &'static str,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buf = vec![0u8; 8 * 1024];
-    loop {
-        match reader.read(&mut buf).await {
-            // EOF — the child has closed this pipe.
-            Ok(0) => return,
-            Ok(n) => {
-                let chunk = &buf[..n];
-                // The spill file always sees every byte; the rolling
-                // tail is what gets surfaced to the model and the UI.
-                {
-                    let mut spill = spill.lock().unwrap();
-                    if let Err(error) = spill.write_all(chunk) {
-                        record_capture_error(
-                            &capture_error,
-                            format!("{stream_name} spill write: {error}"),
-                        );
-                        return;
-                    }
-                }
-                {
-                    let mut s = state.lock().unwrap();
-                    s.append_chunk(chunk);
-                }
-            }
-            Err(error) => {
-                record_capture_error(&capture_error, format!("{stream_name} pipe read: {error}"));
-                return;
-            }
-        }
-    }
-}
-
-fn record_capture_error(error_slot: &Mutex<Option<String>>, error: String) {
-    let mut slot = error_slot.lock().unwrap();
-    if slot.is_none() {
-        *slot = Some(error);
-    }
-}
-
-async fn await_reader(
-    reader: &mut Option<tokio::task::JoinHandle<()>>,
-    capture_error: &Mutex<Option<String>>,
-    cancellation_expected: bool,
-) {
-    if let Some(handle) = reader.as_mut() {
-        if let Err(error) = handle.await {
-            if !(cancellation_expected && error.is_cancelled()) {
-                record_capture_error(capture_error, format!("capture reader task: {error}"));
-            }
-        }
-        // Clearing the slot is what keeps a later drain round from
-        // polling a handle that already returned, which panics.
-        *reader = None;
-    }
-}
-
-/// How a command's output capture ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureEnd {
-    /// Both pipes closed on their own: the capture is complete.
-    Closed,
-    /// A straggler still held a pipe when the drain expired, so the
-    /// pipes were taken back and the output may be incomplete.
-    Cut,
-    /// A killed command remained unavailable to reap, so its process and
-    /// capture ownership were released at the reap boundary.
-    ReapReleased,
-}
-
-/// Escalation step for signalling a command's process group.
-#[derive(Clone, Copy, Debug)]
-enum GroupSignal {
-    Term,
-    Kill,
-}
-
-/// Wait for the capture pipes to close now the command has ended, and
-/// take them back if something still holds them.
-///
-/// Returns [`CaptureEnd::Cut`] when the wait had to be cut short, which
-/// means the output is possibly incomplete and the command's process
-/// group has been killed. Callers report that; `pgid` is the child's
-/// pid, which is its group id because it was spawned with
-/// `process_group(0)`.
-///
-/// Every exit reason comes through here, including the paths that
-/// already killed the group: [`read_stream`] returns only on EOF, EOF
-/// needs every write end closed, and a descendant that left the group
-/// holds one just as well as one that stayed.
-///
-/// The escalation keys on EOF rather than on the child, because the caller has
-/// either reaped it or exhausted the bounded reap and released its handle.
-async fn drain_capture(
-    stdout_reader: tokio::task::JoinHandle<()>,
-    stderr_reader: tokio::task::JoinHandle<()>,
-    capture_error: &Mutex<Option<String>>,
-    pgid: i32,
-    reader_cancellation_expected: bool,
-) -> CaptureEnd {
-    let mut stdout_reader = Some(stdout_reader);
-    let mut stderr_reader = Some(stderr_reader);
-
-    if drain_round(
-        &mut stdout_reader,
-        &mut stderr_reader,
-        capture_error,
-        CAPTURE_DRAIN_GRACE,
-        reader_cancellation_expected,
-    )
-    .await
-    {
-        return CaptureEnd::Closed;
-    }
-
-    // Something the command started outlived it holding a write end.
-    // Signalling a reaped leader's group is a theoretical stray kill if
-    // the pid were recycled, but the drain only expires while a member
-    // of that group is alive and holding our pipe.
-    signal_process_group(pgid, GroupSignal::Term);
-    if !drain_round(
-        &mut stdout_reader,
-        &mut stderr_reader,
-        capture_error,
-        CAPTURE_DRAIN_GRACE,
-        reader_cancellation_expected,
-    )
-    .await
-    {
-        signal_process_group(pgid, GroupSignal::Kill);
-        drain_round(
-            &mut stdout_reader,
-            &mut stderr_reader,
-            capture_error,
-            CAPTURE_CLOSE_GRACE,
-            reader_cancellation_expected,
-        )
-        .await;
-    }
-
-    // A holder outside the group survives both signals, so the last
-    // word is dropping the read ends: the reader tasks own them, the
-    // turn returns, the host keeps no descriptors, and the holder's
-    // next write fails.
-    for reader in [stdout_reader, stderr_reader].into_iter().flatten() {
-        reader.abort();
-    }
-    CaptureEnd::Cut
-}
-
-/// One drain window: both readers, bounded by `budget`, concurrently so
-/// a stalled stream cannot spend the other's budget. True iff both are
-/// finished.
-async fn drain_round(
-    stdout_reader: &mut Option<tokio::task::JoinHandle<()>>,
-    stderr_reader: &mut Option<tokio::task::JoinHandle<()>>,
-    capture_error: &Mutex<Option<String>>,
-    budget: Duration,
-    reader_cancellation_expected: bool,
-) -> bool {
-    let _ = tokio::time::timeout(budget, async {
-        tokio::join!(
-            await_reader(stdout_reader, capture_error, reader_cancellation_expected),
-            await_reader(stderr_reader, capture_error, reader_cancellation_expected),
-        );
-    })
-    .await;
-    stdout_reader.is_none() && stderr_reader.is_none()
-}
-
-/// Trailer for a run whose capture was cut short, in
-/// [`CaptureEnd::Cut`]'s terms: what happened, what it costs the
-/// reader, and the supported way to avoid it.
-fn capture_cut_trailer() -> String {
-    format!(
-        "Output capture was cut short: a process this command started still held \
-         stdout/stderr {}s after the command ended, so its process group was killed \
-         and the pipes were closed. The output above may be incomplete. Use \
-         run_in_background for work that should outlive the call.",
-        CAPTURE_DRAIN_GRACE.as_secs(),
-    )
-}
-
-/// Explain capture released with a command that remained unavailable to reap.
-fn reap_release_trailer() -> String {
-    format!(
-        "Output capture was cut short: the command leader was still unavailable to reap {}s \
-         after its process group was killed, so its process and pipes were released. The output \
-         above may be incomplete.",
-        KILL_GRACE.as_secs(),
-    )
-}
-
-fn capture_end_trailer(capture_end: CaptureEnd) -> Option<String> {
-    match capture_end {
-        CaptureEnd::Closed => None,
-        CaptureEnd::Cut => Some(capture_cut_trailer()),
-        CaptureEnd::ReapReleased => Some(reap_release_trailer()),
-    }
-}
-
-/// [`TaskOutputSource`] over a background bash task's shared stream
-/// states. Snapshots are stateless reads of the rolling tails; the
-/// always-persisted spill file is the canonical full output.
-struct BashTaskOutput {
-    stdout: Arc<Mutex<StreamState>>,
-    stderr: Arc<Mutex<StreamState>>,
-    spill_path: PathBuf,
-}
-
-impl TaskOutputSource for BashTaskOutput {
-    fn snapshot(&self) -> TaskRead {
-        let (stdout_tail, stdout_total_bytes) = tail_snapshot(&self.stdout);
-        let (stderr_tail, stderr_total_bytes) = tail_snapshot(&self.stderr);
-        TaskRead {
-            stdout_tail,
-            stderr_tail,
-            stdout_total_bytes,
-            stderr_total_bytes,
-            spill_path: Some(self.spill_path.clone()),
-            report: None,
-        }
-    }
-}
-
-/// Decode a stream's rolling tail plus its exact byte total. Mirrors
-/// `finalize_stream`'s whole-line policy: a leading partial line left
-/// by a mid-line trim is dropped, except when the tail has no newline
-/// at all (a single huge line stays visible).
-fn tail_snapshot(state: &Arc<Mutex<StreamState>>) -> (String, u64) {
-    let (bytes, at_boundary, total) = {
-        let s = state.lock().unwrap();
-        (
-            s.tail.clone(),
-            s.tail_starts_at_boundary,
-            s.total_bytes_seen,
-        )
-    };
-    let decoded = decode_stream_output(bytes);
-    let text = if at_boundary {
-        decoded
-    } else {
-        match decoded.find('\n') {
-            None => decoded,
-            Some(idx) => decoded[idx + 1..].to_string(),
-        }
-    };
-    (text, total)
-}
-
-/// Everything a detached background-bash driver owns.
-struct BackgroundBash {
-    process: ProcessGuard,
-    child_pid: i32,
-    stdout_reader: tokio::task::JoinHandle<()>,
-    stderr_reader: tokio::task::JoinHandle<()>,
-    stdout_state: Arc<Mutex<StreamState>>,
-    stderr_state: Arc<Mutex<StreamState>>,
-    capture_error: Arc<Mutex<Option<String>>>,
-    spill_path: PathBuf,
-    command: String,
-    task_id: TaskId,
-    cancel: CancellationToken,
-    events: TaskEventSink,
-}
-
-/// Drive a background bash task to completion: announce it with
-/// `TaskStart`, emit throttled `TaskOutput` snapshots, kill the
-/// process group on cancellation, and finish with the registry status
-/// flip + completion notice.
-async fn drive_background_bash(task: BackgroundBash) {
-    let BackgroundBash {
-        mut process,
-        child_pid,
-        stdout_reader,
-        stderr_reader,
-        stdout_state,
-        stderr_state,
-        capture_error,
-        spill_path,
-        command,
-        task_id,
-        cancel,
-        events,
-    } = task;
-
-    events
-        .started(TaskKind::Bash {
-            command: command.clone(),
-        })
-        .await;
-
-    let mut last_update = Instant::now() - UPDATE_DEBOUNCE;
-    // `None` forces the leading-edge emit so the TUI cell shows the
-    // running command immediately.
-    let mut last_totals: Option<(u64, u64)> = None;
-    let (process_status, capture_released) = loop {
-        let now = Instant::now();
-        if now.duration_since(last_update) >= UPDATE_DEBOUNCE {
-            let totals = (
-                stdout_state.lock().unwrap().total_bytes_seen,
-                stderr_state.lock().unwrap().total_bytes_seen,
-            );
-            // Skip the emit while the streams are quiet: an idle
-            // watcher task would otherwise push identical snapshots
-            // (each cloning both rolling tails) onto the bus at the
-            // throttle rate for as long as it runs.
-            if last_totals != Some(totals) {
-                let mut partial = snapshot_partial(&command, &stdout_state, &stderr_state);
-                if let ToolDetails::Bash {
-                    task_id: tid,
-                    full_output_path,
-                    ..
-                } = &mut partial
-                {
-                    *tid = Some(task_id);
-                    *full_output_path = Some(spill_path.clone());
-                }
-                events.output(partial).await;
-                last_totals = Some(totals);
-            }
-            last_update = now;
-        }
-
-        tokio::select! {
-            biased;
-            // The task token (a child of the registry's session root)
-            // is the only cancellation that reaches a background
-            // task: task_stop, the picker's kill action, and shutdown
-            // all fire it. The originating turn's token is
-            // deliberately not wired in — outliving the turn is the
-            // point.
-            _ = cancel.cancelled() => {
-                let capture_released = process.terminate_user_command().await
-                    == ProcessTermination::OwnershipReleased;
-                break (TaskStatus::Killed, capture_released);
-            }
-            res = process.child_mut().wait() => {
-                break (TaskStatus::Exited(res.ok().and_then(|s| s.code())), false);
-            }
-            _ = tokio::time::sleep(UPDATE_DEBOUNCE) => {}
-        }
-    };
-
-    // The task is over, so the same bound applies one level down: a
-    // straggler holding the pipes would otherwise keep the notice from
-    // ever rendering and the registry row from ever settling.
-    let capture_end = drain_capture(
-        stdout_reader,
-        stderr_reader,
-        &capture_error,
-        child_pid,
-        capture_released,
-    )
-    .await;
-    let capture_end = if capture_released {
-        CaptureEnd::ReapReleased
-    } else {
-        capture_end
-    };
-    let capture_error = capture_error.lock().unwrap().clone();
-    let status = background_terminal_status(process_status, capture_error.is_some());
-
-    let (stdout_str, stdout_truncation) = {
-        let s = stdout_state.lock().unwrap();
-        finalize_stream(&s)
-    };
-    let (stderr_str, stderr_truncation) = {
-        let s = stderr_state.lock().unwrap();
-        finalize_stream(&s)
-    };
-
-    let mut body = format!(
-        "Background task #{task_id} finished: {command} — {}",
-        task_status_text(status)
-    );
-    let tail = render_stream_block(
-        &stdout_str,
-        &stderr_str,
-        stdout_truncation.as_ref(),
-        stderr_truncation.as_ref(),
-        Some(&spill_path),
-    );
-    if !tail.is_empty() {
-        body.push('\n');
-        body.push_str(&tail);
-    }
-    if let Some(error) = capture_error {
-        body.push_str(&format!("\nOutput capture failed: {error}"));
-    }
-    if let Some(trailer) = capture_end_trailer(capture_end) {
-        body.push('\n');
-        body.push_str(&trailer);
-    }
-    if !body.ends_with('\n') {
-        body.push('\n');
-    }
-    body.push_str(&format!("Full output: {}", spill_path.display()));
-
-    let notice = TaskNotice {
-        owner: events.owner(),
-        task_id,
-        kind: TaskKind::Bash {
-            command: command.clone(),
-        },
-        label: command,
-        status,
-        body,
-    };
-    events.finished(status, notice).await;
-    // Every cancellation or panic above keeps the guard armed. Only a fully
-    // reported driver relinquishes the reaped child or completed bounded
-    // ownership release.
-    process.release();
-}
-
-/// Human-readable terminal-status phrase shared by completion notices
+/// Human-readable terminal-status phrase shared by task notifications
 /// and `task_output` / `task_stop` reports.
 pub(crate) fn task_status_text(status: TaskStatus) -> String {
     match status {
         TaskStatus::Running => "still running".to_string(),
         TaskStatus::Exited(Some(code)) => format!("exit code {code}"),
-        TaskStatus::Exited(None) => "terminated by signal".to_string(),
+        TaskStatus::Exited(None) => "lost".to_string(),
         TaskStatus::CaptureFailed(Some(code)) => {
             format!("output capture failed after exit code {code}")
         }
@@ -1286,7 +487,7 @@ fn background_terminal_status(status: TaskStatus, capture_failed: bool) -> TaskS
 /// the per-stream byte/line cap exactly.
 ///
 /// Reads the state without consuming it: background tasks finalize
-/// for the completion notice while `task_output` snapshots must keep
+/// for the task notification while `task_output` snapshots must keep
 /// seeing the tail afterwards.
 #[allow(clippy::as_conversions)]
 fn finalize_stream(state: &StreamState) -> (String, Option<BashStreamTruncation>) {
@@ -1343,30 +544,21 @@ fn finalize_stream(state: &StreamState) -> (String, Option<BashStreamTruncation>
 }
 
 /// Build a [`ToolDetails::Bash`] partial from the in-flight state. Used
-/// for `emit_update` snapshots while the child is running. The
-/// structured per-stream summaries are intentionally left `None` —
-/// they only become meaningful once the stream has closed and we can
-/// run `truncate_tail` on the final rolling tail. The boolean
-/// `truncated` flag is updated live so the UI can show a "truncated"
-/// badge as soon as the source crosses the cap.
+/// for `emit_update` snapshots while the command is running. The
+/// structured truncation summary is intentionally left `None`: it only
+/// becomes meaningful once the command has ended and we can run
+/// `truncate_tail` on the final rolling tail. The boolean `truncated`
+/// flag is updated live so the UI can show a "truncated" badge as soon
+/// as the source crosses the cap.
 #[allow(clippy::as_conversions)]
-fn snapshot_partial(
-    command: &str,
-    stdout_state: &Arc<Mutex<StreamState>>,
-    stderr_state: &Arc<Mutex<StreamState>>,
-) -> ToolDetails {
-    let stdout_state = stdout_state.lock().unwrap();
-    let stderr_state = stderr_state.lock().unwrap();
-    let stdout_data = stdout_state.tail.clone();
-    let stderr_data = stderr_state.tail.clone();
-    let truncated = stdout_state.total_lines() > BASH_MAX_LINES as u64
-        || stdout_state.total_bytes_seen > BASH_MAX_BYTES as u64
-        || stderr_state.total_lines() > BASH_MAX_LINES as u64
-        || stderr_state.total_bytes_seen > BASH_MAX_BYTES as u64;
+fn snapshot_partial(command: &str, state: &Arc<Mutex<StreamState>>) -> ToolDetails {
+    let state = state.lock().unwrap();
+    let truncated = state.total_lines() > BASH_MAX_LINES as u64
+        || state.total_bytes_seen > BASH_MAX_BYTES as u64;
     ToolDetails::Bash {
         command: command.to_string(),
-        stdout: decode_stream_output(stdout_data),
-        stderr: decode_stream_output(stderr_data),
+        stdout: decode_stream_output(state.tail.clone()),
+        stderr: String::new(),
         exit_code: None,
         truncated,
         full_output_path: None,
@@ -1376,73 +568,35 @@ fn snapshot_partial(
     }
 }
 
-/// Build the wire content the model sees. Per-stream truncation
-/// markers (`[Showing lines X-Y of TOTAL ...]`) are inserted right
-/// after each affected stream's content so the model reads the
-/// elision context next to the truncated text. The trailing
-/// exit-status / cancel / timeout block stays last.
-#[allow(clippy::too_many_arguments)]
+/// Build the wire content the model sees for a foreground command: its
+/// output, the truncation marker right after it so the model reads the
+/// elision context next to the truncated text, and last what ended the
+/// command when that was not exit code 0.
 fn build_wire_content(
-    stdout: &str,
-    stderr: &str,
-    stdout_truncation: Option<&BashStreamTruncation>,
-    stderr_truncation: Option<&BashStreamTruncation>,
-    outcome: &ChildExit,
-    exit_code: Option<i32>,
+    output: &str,
+    truncation: Option<&BashStreamTruncation>,
+    outcome: ChildExit,
     timeout_secs: u64,
     full_output_path: Option<&std::path::Path>,
-    capture_end: CaptureEnd,
 ) -> String {
-    let mut wire = render_stream_block(
-        stdout,
-        stderr,
-        stdout_truncation,
-        stderr_truncation,
-        full_output_path,
-    );
-    match outcome {
-        ChildExit::Exited(_) => {
-            if let Some(code) = exit_code {
-                if code != 0 {
-                    if !wire.is_empty() && !wire.ends_with('\n') {
-                        wire.push('\n');
-                    }
-                    wire.push_str(&format!("Command failed with exit code: {}", code));
-                }
-            } else {
-                // Killed by signal: report something sensible so the
-                // model can reason about the failure.
-                if !wire.is_empty() && !wire.ends_with('\n') {
-                    wire.push('\n');
-                }
-                wire.push_str("Command terminated by signal");
-            }
-        }
-        ChildExit::Cancelled => {
-            if !wire.is_empty() && !wire.ends_with('\n') {
-                wire.push('\n');
-            }
-            wire.push_str("Command cancelled");
-        }
-        ChildExit::TimedOut => {
-            if !wire.is_empty() && !wire.ends_with('\n') {
-                wire.push('\n');
-            }
-            wire.push_str(&format!("Command timed out after {} seconds", timeout_secs));
-        }
-    }
-    if let Some(trailer) = capture_end_trailer(capture_end) {
-        if !wire.is_empty() && !wire.ends_with('\n') {
-            wire.push('\n');
-        }
-        wire.push_str(&trailer);
-    }
+    let mut wire = render_stream_block(output, "", truncation, None, full_output_path);
+    let trailer = match outcome {
+        ChildExit::Exited(0) => return wire,
+        ChildExit::Exited(code) => format!("Command failed with exit code: {code}"),
+        ChildExit::Cancelled => "Command cancelled".to_string(),
+        ChildExit::TimedOut => format!("Command timed out after {timeout_secs} seconds"),
+        ChildExit::Lost => "Command lost: its process is gone and left no exit status. \
+                            It was killed, or the machine restarted."
+            .to_string(),
+    };
+    push_marker(&mut wire, &trailer);
     wire
 }
 
-/// Render the two streams plus their truncation markers — the shared
-/// body of foreground wire content, background completion notices,
-/// and `task_output` reports.
+/// Render output plus its truncation markers: the shared
+/// body of foreground wire content, background task notifications,
+/// and `task_output` reports. A bash command has one stream, passed as
+/// stdout.
 pub(crate) fn render_stream_block(
     stdout: &str,
     stderr: &str,
@@ -1485,9 +639,9 @@ fn push_marker(wire: &mut String, marker: &str) {
 /// - line cap fired: `[Showing lines X-Y of TOTAL of <stream>. Full output at <path>]`
 /// - byte cap fired: `[Showing lines X-Y of TOTAL of <stream> (50.0KB limit). Full output at <path>]`
 ///
-/// `full_output_path` is shared across both streams (we tee both into
-/// one spill file); a missing path falls back to a path-less form so
-/// the marker still tells the model what was dropped.
+/// `full_output_path` is the command's output file. A missing path falls
+/// back to a path-less form so the marker still tells the model what was
+/// dropped.
 #[allow(clippy::as_conversions)]
 pub fn stream_marker(
     stream: &str,
@@ -1527,6 +681,24 @@ pub fn stream_marker(
     }
 }
 
+/// The truncation marker of a stream whose start was never read, so its
+/// lines cannot be counted: `[Showing last <bytes> of <total> of <stream>.
+/// Full output at <path>]`.
+fn skipped_stream_marker(
+    stream: &str,
+    t: &BashStreamTruncation,
+    full_output_path: &std::path::Path,
+) -> String {
+    let size = |bytes: u64| format_size(usize::try_from(bytes).unwrap_or(usize::MAX));
+    format!(
+        "[Showing last {} of {} of {}. Full output at {}]",
+        size(t.output_bytes),
+        size(t.total_bytes),
+        stream,
+        full_output_path.display(),
+    )
+}
+
 /// Build a recoverable-error outcome for the spawn-failure path.
 /// Surface the failure both as the wire content (so the model can see
 /// what went wrong) and as `stderr` in the structured payload (no
@@ -1564,314 +736,29 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
     crate::sanitize_terminal_output(&lossy)
 }
 
-/// Owns a spawned process group's teardown for as long as this tool's future
-/// can be dropped.
-///
-/// The driver races a tool against cancellation and drops the losing
-/// future rather than polling it again, so a tool cannot clean up by
-/// observing its own token: a drop is the one moment nothing polls it.
-/// Dropping a [`Child`] does not signal the process and dropping a
-/// `JoinHandle` only detaches its task, so without this a cancelled
-/// turn leaves the whole process group running and both pipe read ends
-/// held.
-///
-/// Armed at the spawn, before the first fallible step, because a
-/// command that outlives an early `?` leaks exactly as a cancelled one
-/// does. A normal foreground return disarms after the command has ended. A
-/// background handoff moves the armed guard into its tracked driver, which
-/// disarms only after final reporting. Every abnormal way out (a `?`, a panic,
-/// or either future being dropped) leaves it armed and tears the group down.
-///
-/// Only the `SIGTERM` is guaranteed. The escalation to `SIGKILL` and
-/// the reap run on the runtime, so a host exiting under an in-flight
-/// command loses them and a command that ignores the signal outlives
-/// it. What is lost has an heir: init reaps the orphan, and the pipe
-/// read ends close with the host process.
-struct ProcessGuard {
-    /// `None` once disarmed.
-    armed: Option<ArmedProcess>,
-}
-
-struct ArmedProcess {
-    child: Child,
-    pgid: i32,
-    /// Retains the session's advisory-lock lifetime through asynchronous
-    /// teardown when the owning tool or task future is dropped.
-    _cleanup: TaskCleanupGuard,
-    /// Empty between the spawn and [`ProcessGuard::watch_readers`]: the
-    /// reader tasks do not exist for the first few lines of a call.
-    readers: Vec<tokio::task::AbortHandle>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProcessTermination {
-    Reaped,
-    OwnershipReleased,
-}
-
-impl ProcessGuard {
-    /// Take ownership of a freshly spawned user-command child.
-    ///
-    /// Fails only if the pid is unavailable, which cannot happen
-    /// between a spawn and the reap, and which would leave nothing to
-    /// signal anyway.
-    fn arm(child: Child, cleanup: TaskCleanupGuard) -> Result<Self, aj_agent::BoxError> {
-        // The pid is the group id, because the child was spawned with
-        // `process_group(0)`.
-        let pgid: i32 = child
-            .id()
-            .ok_or("child PID unavailable after spawn")?
-            .try_into()
-            .map_err(|e| format!("child PID does not fit in i32: {e}"))?;
-        Ok(Self {
-            armed: Some(ArmedProcess {
-                child,
-                pgid,
-                _cleanup: cleanup,
-                readers: Vec::new(),
-            }),
-        })
-    }
-
-    /// The command's process-group id.
-    fn pgid(&self) -> i32 {
-        self.expect_armed().pgid
-    }
-
-    /// The child, for the caller that is still driving it.
-    fn child_mut(&mut self) -> &mut Child {
-        &mut self
-            .armed
-            .as_mut()
-            .expect("the guard stays armed until the command's lifetime moves")
-            .child
-    }
-
-    /// Hand the capture readers to the teardown, which drops the pipe
-    /// read ends after it has signalled.
-    fn watch_readers(&mut self, readers: [tokio::task::AbortHandle; 2]) {
-        self.armed
-            .as_mut()
-            .expect("the guard stays armed until the command's lifetime moves")
-            .readers
-            .extend(readers);
-    }
-
-    /// Release process, capture, and cleanup ownership after every async step
-    /// that needs it has completed.
-    fn release(&mut self) {
-        let Some(armed) = self.armed.take() else {
-            return;
-        };
-        for reader in &armed.readers {
-            reader.abort();
-        }
-    }
-
-    /// Give a user command its TERM grace, escalate to KILL, and retain
-    /// ownership until either the leader is reaped or the reap bound expires.
-    ///
-    /// On expiry the capture handles, child, and cleanup lease are released in
-    /// this method's synchronous tail. Cancellation can therefore only occur
-    /// while the still-armed guard owns all three.
-    async fn terminate_user_command(&mut self) -> ProcessTermination {
-        let reaped = {
-            let armed = self
-                .armed
-                .as_mut()
-                .expect("the guard stays armed through command termination");
-            terminate_process_group(&mut armed.child, armed.pgid).await
-        };
-        if reaped {
-            ProcessTermination::Reaped
-        } else {
-            self.release();
-            ProcessTermination::OwnershipReleased
-        }
-    }
-
-    fn expect_armed(&self) -> &ArmedProcess {
-        self.armed
-            .as_ref()
-            .expect("the guard stays armed until the command's lifetime moves")
-    }
-}
-
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        let Some(armed) = self.armed.take() else {
-            return;
-        };
-        // The first signal leaves from `Drop` itself rather than from
-        // the teardown, because a spawn is not a promise: a runtime
-        // that is shutting down answers one by dropping the future
-        // unpolled, and then nothing would ever be sent.
-        signal_process_group(armed.pgid, GroupSignal::Term);
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(tear_down_process(armed));
-            }
-            Err(_) => {
-                // Dropped outside a runtime, so there is nothing to
-                // escalate or reap on. The descriptors are still ours
-                // to release.
-                for reader in &armed.readers {
-                    reader.abort();
-                }
-            }
-        }
-    }
-}
-
-/// Finish what [`ProcessGuard`]'s caller started: give the group its
-/// grace, escalate to `SIGKILL`, reap what is still ours, and drop the
-/// pipe read ends.
-///
-/// The grace is a timer on every path, never [`Child::wait`]. Once the
-/// leader has been reaped, `wait` answers instantly from a cached
-/// status and the grace collapses to nothing. Waiting on a live child
-/// is no better: `bash` exits the moment it takes the `SIGTERM` while
-/// the descendants it forked are still running their handlers, and
-/// those descendants are who the grace is for.
-///
-/// The `SIGKILL` goes to the group whatever became of the leader,
-/// because a reaped leader is exactly the drain-expiry case where a
-/// pipe holder is still alive and still holding a turn's descriptors.
-/// The stray-kill worry that would argue for skipping it does not
-/// survive its own two cases: a group with a live member still owns
-/// its id, since the id stays reserved for as long as the group is
-/// non-empty, and a group that has emptied answers `ESRCH` and reaches
-/// nobody. The signal is either on target or a no-op, which is what
-/// `drain_capture` says about the same hazard on the completion path.
-///
-/// The residue, so that argument is not read as more than it is: once
-/// the group has emptied *and* the leader has been reaped, the pid
-/// number is free, so a `SIGKILL` landing after a full pid-space
-/// wraparound inside the grace window could reach a stranger. That is
-/// the same theoretical stray kill the completion path already
-/// accepts, and reaping after the kill rather than before is what
-/// keeps the leader's zombie pinning the id for the whole window.
-async fn tear_down_process(armed: ArmedProcess) {
-    let ArmedProcess {
-        mut child,
-        pgid,
-        _cleanup,
-        readers,
-    } = armed;
-    // Drop or synchronous termination sent SIGTERM before entering here. The
-    // sleep is the window that signal gets.
-    tokio::time::sleep(KILL_GRACE).await;
-    signal_process_group(pgid, GroupSignal::Kill);
-    if child.id().is_some() {
-        // Bounded, because a `SIGKILL` is only delivered once the
-        // target leaves an uninterruptible wait, and a teardown that
-        // parks forever on one is a leak of a different shape.
-        let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
-    }
-    // Dropping the read ends comes last. A command handling its
-    // `SIGTERM` dies of `SIGPIPE` before it reaches its handler if its
-    // output disappears first, which costs exactly the cleanup the
-    // grace was for (measured against this teardown, not assumed).
-    for reader in &readers {
-        reader.abort();
-    }
-    drop(_cleanup);
-}
-
-/// Reap a killed child when the kernel makes it available, without allowing an
-/// uninterruptible wait to retain the caller's cleanup ownership indefinitely.
-async fn reap_child_bounded(child: &mut Child) -> bool {
-    child.id().is_none()
-        || matches!(
-            tokio::time::timeout(KILL_GRACE, child.wait()).await,
-            Ok(Ok(_))
-        )
-}
-
-/// Send one signal to a command's process group.
-///
-/// `pgid` is the child's pid, which equals its group id because the
-/// child was spawned with `process_group(0)`. That also guarantees the
-/// id is greater than 1, so this never targets group 0, which is our
-/// own, or group 1, which `killpg` turns into the `kill(-1)` broadcast
-/// to every process we are allowed to signal. Errors mean the group is
-/// already gone (`ESRCH`) or we lack permission, and there is nothing
-/// actionable to do with either. Process groups are a Unix notion.
-/// Elsewhere a straggler keeps its descriptors until the readers are
-/// dropped.
-fn signal_process_group(pgid: i32, signal: GroupSignal) {
-    debug_assert!(pgid > 1, "child pid/pgid must be > 1");
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-
-        let signal = match signal {
-            GroupSignal::Term => Signal::SIGTERM,
-            GroupSignal::Kill => Signal::SIGKILL,
-        };
-        let _ = killpg(Pid::from_raw(pgid), signal);
-    }
-    #[cfg(not(unix))]
-    let _ = signal;
-}
-
-/// Terminate the child's whole process group and make a bounded reap attempt.
-///
-/// Sends `SIGTERM` to the group first so the command (and any
-/// descendants the shell forked) can run their cleanup handlers, then
-/// waits up to [`KILL_GRACE`] for the leader to exit before escalating
-/// to an unconditional `SIGKILL`. Returns `false` only when the post-KILL reap
-/// bound expires. The armed caller then releases its child, capture handles,
-/// and cleanup lease together.
-///
-/// Only for a child that is still running: the grace window keys on
-/// [`Child::wait`], which returns the cached status instantly once the
-/// child has been reaped. [`drain_capture`] is what signals a group
-/// after that point.
-#[cfg(unix)]
-async fn terminate_process_group(child: &mut Child, pgid: i32) -> bool {
-    signal_process_group(pgid, GroupSignal::Term);
-    if matches!(
-        tokio::time::timeout(KILL_GRACE, child.wait()).await,
-        Ok(Ok(_))
-    ) {
-        return true;
-    }
-    // A child still alive after the grace window, or one whose wait could not
-    // establish an exit, gets an unconditional escalation. Bound the reap
-    // independently because SIGKILL remains pending in uninterruptible I/O.
-    signal_process_group(pgid, GroupSignal::Kill);
-    reap_child_bounded(child).await
-}
-
-#[cfg(not(unix))]
-async fn terminate_process_group(child: &mut Child, _pgid: i32) -> bool {
-    // Process-group semantics are Unix-only; elsewhere we kill just the
-    // immediate child and accept that shell-forked grandchildren may
-    // leak.
-    let _ = child.start_kill();
-    reap_child_bounded(child).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::DummyToolContext;
-    use aj_agent::TaskRegistry;
     use aj_models::types::UserContent;
     use std::path::Path;
-    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{self, AtomicBool};
-    use std::task::{Context, Poll};
     use tempfile::TempDir;
-    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
-    fn arm_for_test(child: Child) -> ProcessGuard {
-        let registry = TaskRegistry::default();
-        ProcessGuard::arm(child, registry.track_cleanup()).expect("arm")
+    /// A tool that writes its commands' files below `dir`, so a file a
+    /// test's command leaves is removed with the test's directory.
+    fn tool_in(dir: &TempDir) -> BashTool {
+        BashTool::new(false, Some(dir.path().join("output")))
+    }
+
+    /// The files commands of [`tool_in`] left in `dir`.
+    fn left_in(dir: &TempDir) -> Vec<PathBuf> {
+        std::fs::read_dir(dir.path().join("output"))
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
     }
 
     /// A real Bash process connects at the phase under test and waits for EOF.
@@ -1900,59 +787,6 @@ mod tests {
                 .expect("accept Bash gate")
                 .0
         }
-    }
-
-    struct FailingReader;
-
-    impl AsyncRead for FailingReader {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected read failure",
-            )))
-        }
-    }
-
-    #[tokio::test]
-    async fn read_stream_surfaces_pipe_read_failure() {
-        let state = Arc::new(Mutex::new(StreamState::new()));
-        let spill = Arc::new(Mutex::new(SpillState::new(None).expect("spill")));
-        let error = Arc::new(Mutex::new(None));
-
-        read_stream(FailingReader, state, spill, Arc::clone(&error), "stdout").await;
-
-        assert_eq!(
-            error.lock().unwrap().as_deref(),
-            Some("stdout pipe read: injected read failure")
-        );
-    }
-
-    #[tokio::test]
-    async fn read_stream_surfaces_spill_write_failure() {
-        let state = Arc::new(Mutex::new(StreamState::new()));
-        let mut unavailable_spill = SpillState::new(None).expect("spill");
-        unavailable_spill.file = None;
-        let spill = Arc::new(Mutex::new(unavailable_spill));
-        let error = Arc::new(Mutex::new(None));
-
-        read_stream(
-            &b"captured bytes"[..],
-            Arc::clone(&state),
-            spill,
-            Arc::clone(&error),
-            "stderr",
-        )
-        .await;
-
-        assert_eq!(
-            error.lock().unwrap().as_deref(),
-            Some("stderr spill write: spill file is unavailable")
-        );
-        assert_eq!(state.lock().unwrap().total_bytes_seen, 0);
     }
 
     #[test]
@@ -2112,229 +946,18 @@ esac
         }
     }
 
-    /// A direct command can remain unavailable to `wait` after SIGKILL while
-    /// the kernel finishes an uninterruptible operation. The TERM grace and
-    /// post-KILL reap windows still end with one synchronous release of the
-    /// child, capture readers, and session cleanup lease.
+    /// Kills a process a test means to outlive its command, when the test
+    /// ends, however it ends.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn direct_command_reap_bound_releases_capture_and_cleanup_ownership() {
-        let gate = BashGate::new().await;
-        let child = Command::new("bash")
-            .arg("-c")
-            .arg(gate.command())
-            .spawn()
-            .expect("spawn unavailable direct-command fixture");
-        let pid: i32 = child
-            .id()
-            .expect("fixture pid")
-            .try_into()
-            .expect("fixture pid fits i32");
-        let mut fixture = FixtureProcess(Some(pid));
-        let _held = gate.ready().await;
-        let registry = TaskRegistry::default();
-        let stdout_reader = tokio::spawn(std::future::pending::<()>());
-        let stderr_reader = tokio::spawn(std::future::pending::<()>());
-        let mut guard = ProcessGuard {
-            armed: Some(ArmedProcess {
-                child,
-                // No process group owns this id, so neither signal makes the
-                // live fixture reapable. That models a post-SIGKILL kernel wait
-                // without placing the test process in uninterruptible I/O.
-                pgid: i32::MAX,
-                _cleanup: registry.track_cleanup(),
-                readers: vec![stdout_reader.abort_handle(), stderr_reader.abort_handle()],
-            }),
-        };
-
-        assert!(
-            process_is_live(pid),
-            "the fixture must be live before its unavailable reap is modelled"
-        );
-        // Only the modelled unavailable-reap windows use virtual time. The
-        // real child is already blocked, and neither signal can reach it.
-        tokio::time::pause();
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            KILL_GRACE + KILL_GRACE + Duration::from_secs(1),
-            guard.terminate_user_command(),
-        )
-        .await;
-        let elapsed = started.elapsed();
-        tokio::time::resume();
-        let result = result.expect("direct-command termination exceeded both of its bounds");
-        assert!(elapsed >= KILL_GRACE + KILL_GRACE);
-        assert_eq!(result, ProcessTermination::OwnershipReleased);
-        assert!(
-            process_is_live(pid),
-            "the unavailable child exited, so the reap bound was not exercised"
-        );
-        for (stream, reader) in [("stdout", stdout_reader), ("stderr", stderr_reader)] {
-            assert!(
-                tokio::time::timeout(Duration::from_secs(1), reader)
-                    .await
-                    .unwrap_or_else(|_| panic!("{stream} reader release was not bounded"))
-                    .unwrap_err()
-                    .is_cancelled(),
-                "{stream} reader completed instead of being released with capture ownership"
-            );
-        }
-        assert!(
-            registry.quiesce(Duration::ZERO).await,
-            "the direct-command reap bound retained its session cleanup lease"
-        );
-
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-        wait_until(
-            || !Path::new(&format!("/proc/{pid}")).exists(),
-            "the observed fixture process to reach reaped terminal state",
-        )
-        .await;
-        fixture.disarm();
-    }
-
-    /// The detached driver uses the same direct-command termination boundary.
-    /// Its terminal registry row is not enough: quiescence also requires the
-    /// driver record, capture readers, and process cleanup lease to be gone.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn cancelled_background_command_settles_after_an_unavailable_reap() {
-        let gate = BashGate::new().await;
-        let child = Command::new("bash")
-            .arg("-c")
-            .arg(gate.command())
-            .spawn()
-            .expect("spawn unavailable background-command fixture");
-        let pid: i32 = child
-            .id()
-            .expect("fixture pid")
-            .try_into()
-            .expect("fixture pid fits i32");
-        let mut fixture = FixtureProcess(Some(pid));
-        let _held = gate.ready().await;
-        let mut ctx = DummyToolContext::default();
-        let registry = ctx.task_registry();
-        let stdout_reader = tokio::spawn(std::future::pending::<()>());
-        let stderr_reader = tokio::spawn(std::future::pending::<()>());
-        let stdout_observer = stdout_reader.abort_handle();
-        let stderr_observer = stderr_reader.abort_handle();
-        let process = ProcessGuard {
-            armed: Some(ArmedProcess {
-                child,
-                pgid: i32::MAX,
-                _cleanup: registry.track_cleanup(),
-                readers: vec![stdout_reader.abort_handle(), stderr_reader.abort_handle()],
-            }),
-        };
-        let stdout_state = Arc::new(Mutex::new(StreamState::new()));
-        let stderr_state = Arc::new(Mutex::new(StreamState::new()));
-        let spill_dir = TempDir::new().expect("spill tempdir");
-        let spill_path = spill_dir.path().join("background.log");
-        std::fs::write(&spill_path, []).expect("create spill fixture");
-        let kind = TaskKind::Bash {
-            command: "unavailable reap fixture".to_string(),
-        };
-        let StartedTask {
-            id,
-            cancel,
-            events,
-            driver,
-        } = ctx.start_background_task(
-            kind,
-            "unavailable reap fixture".to_string(),
-            Arc::new(BashTaskOutput {
-                stdout: Arc::clone(&stdout_state),
-                stderr: Arc::clone(&stderr_state),
-                spill_path: spill_path.clone(),
-            }),
-        );
-        driver.spawn(drive_background_bash(BackgroundBash {
-            process,
-            child_pid: pid,
-            stdout_reader,
-            stderr_reader,
-            stdout_state,
-            stderr_state,
-            capture_error: Arc::new(Mutex::new(None)),
-            spill_path,
-            command: "unavailable reap fixture".to_string(),
-            task_id: id,
-            cancel,
-            events,
-        }));
-
-        assert!(process_is_live(pid), "the unavailable child must be live");
-        // The child is held at its gate and the readers are synthetic pending
-        // tasks. Only the driver's unavailable-reap policy needs to progress.
-        tokio::time::pause();
-        let started = Instant::now();
-        assert!(registry.kill(id), "cancel the live background driver");
-        let quiesced = registry
-            .quiesce(KILL_GRACE + KILL_GRACE + Duration::from_secs(1))
-            .await;
-        let elapsed = started.elapsed();
-        tokio::time::resume();
-        assert!(elapsed >= KILL_GRACE + KILL_GRACE);
-        assert!(
-            quiesced,
-            "the background driver exceeded the direct-command ownership bound"
-        );
-        assert_eq!(registry.status(id), Some(TaskStatus::Killed));
-        assert!(
-            stdout_observer.is_finished() && stderr_observer.is_finished(),
-            "background capture outlived terminal driver ownership"
-        );
-        let notices = registry.drain_notices(aj_agent::events::AgentId::Main);
-        assert_eq!(notices.len(), 1, "the cancelled driver reports once");
-        let notice = &notices[0].body;
-        assert!(
-            notice.contains(&reap_release_trailer()),
-            "the notice names the reap boundary that cut capture: {notice:?}"
-        );
-        assert!(
-            !notice.contains("Output capture failed") && !notice.contains(&capture_cut_trailer()),
-            "expected reader cancellation was reported as a capture failure or pipe-holder cut: \
-             {notice:?}"
-        );
-        assert!(
-            process_is_live(pid),
-            "the unavailable background child exited, so the reap bound was not exercised"
-        );
-
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-        wait_until(
-            || !Path::new(&format!("/proc/{pid}")).exists(),
-            "the observed background fixture to reach reaped terminal state",
-        )
-        .await;
-        fixture.disarm();
-    }
+    struct Straggler(i32);
 
     #[cfg(target_os = "linux")]
-    struct FixtureProcess(Option<i32>);
-
-    #[cfg(target_os = "linux")]
-    impl FixtureProcess {
-        fn disarm(&mut self) {
-            self.0 = None;
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for FixtureProcess {
+    impl Drop for Straggler {
         fn drop(&mut self) {
-            if let Some(pid) = self.0 {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.0),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
     }
 
@@ -2513,16 +1136,16 @@ esac
         }
     }
 
-    /// stderr captures show up under a `STDERR:` header on the wire,
-    /// and as a separate field in the structured payload.
+    /// Stdout and stderr are one stream in the order written. Nothing is
+    /// reported under a `STDERR:` header or in the `stderr` field.
     #[tokio::test]
-    async fn stderr_is_captured_under_its_own_header() {
+    async fn stderr_joins_the_output_in_the_order_written() {
         let mut ctx = DummyToolContext::default();
         let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
-                    command: "echo to-stdout; echo to-stderr 1>&2".to_string(),
+                    command: "echo to-stdout; echo to-stderr 1>&2; echo again".to_string(),
                     timeout: 30,
                     description: "test stderr".to_string(),
                     run_in_background: false,
@@ -2533,13 +1156,11 @@ esac
 
         assert!(!outcome.is_error);
         let wire = extract_text(&outcome.content);
-        assert!(wire.contains("to-stdout\n"), "wire: {wire:?}");
-        assert!(wire.contains("STDERR:\n"), "wire: {wire:?}");
-        assert!(wire.contains("to-stderr"), "wire: {wire:?}");
+        assert_eq!(wire, "to-stdout\nto-stderr\nagain\n");
         match &outcome.details {
             ToolDetails::Bash { stdout, stderr, .. } => {
-                assert!(stdout.contains("to-stdout"), "stdout: {stdout:?}");
-                assert!(stderr.contains("to-stderr"), "stderr: {stderr:?}");
+                assert_eq!(stdout, "to-stdout\nto-stderr\nagain\n");
+                assert!(stderr.is_empty(), "stderr: {stderr:?}");
             }
             other => panic!("expected Bash details, got {other:?}"),
         }
@@ -2881,26 +1502,19 @@ esac
         );
     }
 
-    /// A command whose shell exits while a descendant still holds a
-    /// pipe write end must not hold the turn open until that descendant
-    /// is done: `read_stream` returns only on EOF, and EOF needs every
-    /// write end closed, so the wait is otherwise unbounded. The
-    /// timeout does not cover this case, the loop breaks on
-    /// `ChildExit::Exited` and discards the deadline with it.
+    /// A command whose shell exits while a descendant still has the output
+    /// open does not hold the call open: the call ends when the command
+    /// does. The descendant is left running, and the result says so and
+    /// names the file it writes to.
     ///
     /// Linux-only: the fixture proves the descendant inherited fd 1 by
-    /// reading it back from `/proc`, which is the one proof that
-    /// survives a run where the turn never returns at all.
+    /// reading it back from `/proc`.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for the pipe drain grace"
-    )]
-    async fn descendant_holding_a_pipe_does_not_hold_the_turn_open() {
-        /// How long the turn may take once the shell has exited. Well
-        /// above any bounded drain, well below the descendant's own
-        /// lifetime, so a run that reaches it is waiting on EOF.
+    async fn a_descendant_holding_the_output_does_not_hold_the_call_open() {
+        /// How long the call may take once the shell has exited. Well
+        /// below the descendant's own lifetime, so a run that reaches it
+        /// is waiting on the descendant.
         const BOUND: Duration = Duration::from_secs(5);
 
         let dir = TempDir::new().expect("create temp dir");
@@ -2908,10 +1522,8 @@ esac
         let pid_path = dir.path().join("descendant-pid");
 
         // The descendant records its fd 1, its pid, and writes to stdout
-        // before the shell is allowed to exit, so the evidence lands
-        // whatever the tool does next. It then holds the pipe until this
-        // test drops `dir`, with `$SECONDS` as a backstop so it cannot
-        // outlive the test process by more than a few seconds.
+        // before the shell is allowed to exit. It then holds the output
+        // until this test drops `dir`, with `$SECONDS` as a backstop.
         let command = format!(
             "{{ readlink /proc/$BASHPID/fd/1 > '{fd1}'; \
                 echo $BASHPID > '{pid}'; \
@@ -2927,77 +1539,64 @@ esac
         let mut ctx = DummyToolContext::default();
         let result = tokio::time::timeout(
             BOUND,
-            BashTool::default().execute(
+            tool_in(&dir).execute(
                 &mut ctx,
                 BashInput {
                     command,
-                    // Short so that a fix which spends the command's
-                    // remaining timeout budget on the drain still
-                    // finishes inside `BOUND`.
-                    timeout: 1,
-                    description: "test descendant holding the pipes".to_string(),
+                    timeout: 30,
+                    description: "test descendant holding the output".to_string(),
                     run_in_background: false,
                 },
             ),
         )
         .await;
-
-        let inherited = std::fs::read_to_string(&fd1_path).unwrap_or_default();
-        assert!(
-            inherited.starts_with("pipe:"),
-            "the descendant should have inherited the stdout pipe, its fd 1 was {inherited:?}: \
-             with nothing holding a write end this test measures nothing"
-        );
+        let _straggler = Straggler(read_pid(&pid_path));
 
         let outcome = result
             .unwrap_or_else(|_| {
-                panic!(
-                    "the shell exited at once, but the turn was still waiting on capture \
-                     after {BOUND:?}, with the descendant still holding the pipe"
-                )
+                panic!("the shell exited at once, but the call was still waiting after {BOUND:?}")
             })
             .expect("execute");
 
         assert!(!outcome.is_error, "the command itself succeeded");
-        match &outcome.details {
-            ToolDetails::Bash {
-                exit_code, stdout, ..
-            } => {
-                // `Some(0)` is what puts this run on the `Exited` arm
-                // of the select: a timeout or a cancel leaves it unset.
-                assert_eq!(*exit_code, Some(0), "the shell exited normally");
-                assert!(
-                    stdout.contains("shell-done"),
-                    "the shell's own output is reported, stdout: {stdout:?}"
-                );
-                assert!(
-                    stdout.contains("descendant-wrote"),
-                    "output written before the shell exited is reported, stdout: {stdout:?}"
-                );
-            }
-            other => panic!("expected Bash details, got {other:?}"),
-        }
-
+        let ToolDetails::Bash {
+            exit_code,
+            stdout,
+            full_output_path,
+            ..
+        } = &outcome.details
+        else {
+            panic!("expected Bash details, got {:?}", outcome.details);
+        };
+        assert_eq!(*exit_code, Some(0), "the shell exited normally");
+        assert!(stdout.contains("shell-done"), "stdout: {stdout:?}");
+        assert!(
+            stdout.contains("descendant-wrote"),
+            "output written before the shell exited is reported, stdout: {stdout:?}"
+        );
+        let path = full_output_path
+            .as_ref()
+            .expect("the file a process still writes to stays");
+        let inherited = std::fs::read_to_string(&fd1_path).unwrap_or_default();
+        assert_eq!(
+            Path::new(inherited.trim()),
+            path,
+            "the descendant should hold the output file: otherwise this test measures nothing"
+        );
         let wire = extract_text(&outcome.content);
         assert!(
-            wire.contains(&capture_cut_trailer()),
-            "the model is told the capture was cut short, wire: {wire:?}"
+            wire.contains("A process this command started is still running")
+                && wire.contains(&path.display().to_string()),
+            "the model is told where the rest goes, wire: {wire:?}"
         );
-        let pid = read_pid(&pid_path);
-        wait_until(
-            || !process_is_live(pid),
-            "the pipe holder to be killed with its group",
-        )
-        .await;
+        assert!(
+            process_is_live(read_pid(&pid_path)),
+            "the descendant is left running"
+        );
     }
 
-    /// The rule from the other side: a straggler that redirected the
-    /// tool's stdout and stderr away has let go of the capture channel,
-    /// so it reaches EOF at once and is none of the tool's business. It
-    /// keeps running and nothing is reported.
-    ///
-    /// This is what keeps the drain from becoming an unconditional kill
-    /// of everything a command leaves behind, which would break every
+    /// A straggler that redirected its output away is left running as
+    /// well. This is what keeps a call's end from killing every
     /// `nohup`-style daemon that behaves.
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -3005,14 +1604,13 @@ esac
         not(feature = "slow-tests"),
         ignore = "slow: waits through a 300ms survival window"
     )]
-    async fn a_straggler_that_let_go_of_the_pipes_is_left_alone() {
+    async fn a_straggler_that_let_go_of_the_output_is_left_alone() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("daemon-pid");
 
-        // `exec` drops this subshell's copies of the pipes before it
-        // does anything else, which is the daemon discipline the tool
-        // description asks for. The shell waits for its pid so the test
-        // never races the fork.
+        // `exec` drops this subshell's copies of the output before it
+        // does anything else. The shell waits for its pid so the test
+        // never races the branch.
         let command = format!(
             "{{ exec >/dev/null 2>&1; \
                 echo $BASHPID > '{pid}'; \
@@ -3025,7 +1623,7 @@ esac
 
         let mut ctx = DummyToolContext::default();
         let start = Instant::now();
-        let outcome = BashTool::default()
+        let outcome = tool_in(&dir)
             .execute(
                 &mut ctx,
                 BashInput {
@@ -3040,27 +1638,19 @@ esac
         let elapsed = start.elapsed();
 
         let pid = read_pid(&pid_path);
+        let _straggler = Straggler(pid);
         // Long enough for a teardown that should never have started to
-        // have signalled: the guard is disarmed on this path, and
-        // without the wait a stray SIGTERM would still be in flight
-        // when the assertion reads the process table.
+        // have signalled.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             process_is_live(pid),
-            "the straggler let go of the pipes and must be left running: \
-             a test that kills it here measures nothing"
+            "the straggler must be left running: a test that kills it here measures nothing"
         );
         assert!(
-            elapsed < CAPTURE_DRAIN_GRACE,
-            "capture closed with the shell, so no drain window should have been \
-             spent, took {elapsed:?}"
+            elapsed < KILL_GRACE,
+            "the call ends with the shell, took {elapsed:?}"
         );
         assert!(!outcome.is_error);
-        let wire = extract_text(&outcome.content);
-        assert!(
-            !wire.contains(&capture_cut_trailer()),
-            "nothing was cut short, so nothing is reported, wire: {wire:?}"
-        );
         match &outcome.details {
             ToolDetails::Bash {
                 exit_code, stdout, ..
@@ -3070,29 +1660,33 @@ esac
             }
             other => panic!("expected Bash details, got {other:?}"),
         }
+        // Whether a straggler still has the output open is not known, so
+        // every one is reported.
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.contains("A process this command started is still running"),
+            "wire: {wire:?}"
+        );
     }
 
-    /// A holder in its own session survives the process-group kill, so
-    /// dropping the pipe read ends is the only thing that ends the wait.
-    /// This is the timeout path, where the group kill already ran and a
-    /// `setsid`ed descendant walked away from it.
+    /// A process in a session of its own survives the kill of the
+    /// command's process group, and does not hold the call open past the
+    /// timeout.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[cfg_attr(
         not(feature = "slow-tests"),
-        ignore = "slow: waits for command timeout and pipe drain windows"
+        ignore = "slow: waits for the command timeout"
     )]
-    async fn a_holder_outside_the_group_is_bounded_by_dropping_the_pipes() {
-        /// Timeout, two drain windows, the post-kill window, and room
-        /// for a loaded machine.
-        const BOUND: Duration = Duration::from_secs(12);
+    async fn a_process_outside_the_group_does_not_hold_a_timed_out_call_open() {
+        const BOUND: Duration = Duration::from_secs(6);
 
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("session-leader-pid");
 
-        // `setsid` leaves the tool's process group, keeping the
-        // inherited pipes. The shell then blocks so the run ends on the
-        // timeout rather than on child exit.
+        // `setsid` leaves the command's process group, keeping the
+        // inherited output. The shell then blocks so the run ends on the
+        // timeout rather than on its own.
         let command = format!(
             "setsid bash -c \"echo \\$$ > '{pid}'; \
                 while [ -d '{dir}' ] && [ \\$SECONDS -lt 30 ]; do sleep 0.05; done\" & \
@@ -3105,7 +1699,7 @@ esac
         let mut ctx = DummyToolContext::default();
         let result = tokio::time::timeout(
             BOUND,
-            BashTool::default().execute(
+            tool_in(&dir).execute(
                 &mut ctx,
                 BashInput {
                     command,
@@ -3118,19 +1712,18 @@ esac
         .await;
 
         let pid = read_pid(&pid_path);
+        let _straggler = Straggler(pid);
         let outcome = result
             .unwrap_or_else(|_| {
                 panic!(
-                    "the command timed out at 1s, but the turn was still waiting on capture \
-                     after {BOUND:?}: the group kill cannot reach a holder in its own session"
+                    "the command timed out at 1s, but the call was still waiting after {BOUND:?}"
                 )
             })
             .expect("execute");
 
         assert!(
             process_is_live(pid),
-            "the holder is outside the group and no signal of ours reaches it, so the wait \
-             ended by dropping the read ends: with it dead this test measures the kill instead"
+            "the holder is outside the group and no signal of ours reaches it"
         );
         assert!(outcome.is_error, "the command timed out");
         let wire = extract_text(&outcome.content);
@@ -3138,226 +1731,13 @@ esac
             wire.contains("Command timed out after 1 seconds"),
             "wire: {wire:?}"
         );
-        assert!(
-            wire.contains(&capture_cut_trailer()),
-            "the incomplete capture is reported beside the timeout, wire: {wire:?}"
-        );
     }
 
-    /// A straggler can hold one stream and not the other, so the drain
-    /// rounds have to cope with the two readers finishing in different
-    /// windows: here stdout reaches EOF with the shell and stderr is
-    /// held open past the grace.
+    /// The same for a cancel that reaches bash's own arm, the window
+    /// where the token fires while a poll is in flight.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for the pipe drain grace"
-    )]
-    async fn a_straggler_holding_one_stream_is_drained_like_any_other() {
-        let dir = TempDir::new().expect("create temp dir");
-        let pid_path = dir.path().join("stderr-holder-pid");
-
-        // `exec >/dev/null` drops only this subshell's stdout, so the
-        // stderr pipe is the one thing keeping capture open.
-        let command = format!(
-            "{{ exec >/dev/null; \
-                echo $BASHPID > '{pid}'; \
-                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-             until [ -s '{pid}' ]; do sleep 0.01; done; \
-             echo shell-done",
-            pid = pid_path.display(),
-            dir = dir.path().display(),
-        );
-
-        let mut ctx = DummyToolContext::default();
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            BashTool::default().execute(
-                &mut ctx,
-                BashInput {
-                    command,
-                    timeout: 1,
-                    description: "test straggler holding stderr only".to_string(),
-                    run_in_background: false,
-                },
-            ),
-        )
-        .await;
-
-        let pid = read_pid(&pid_path);
-        let outcome = result
-            .unwrap_or_else(|_| panic!("the turn was still waiting on the held stderr pipe"))
-            .expect("execute");
-
-        let wire = extract_text(&outcome.content);
-        assert!(
-            wire.contains(&capture_cut_trailer()),
-            "one held stream is enough to cut the capture short, wire: {wire:?}"
-        );
-        match &outcome.details {
-            ToolDetails::Bash {
-                exit_code, stdout, ..
-            } => {
-                assert_eq!(*exit_code, Some(0));
-                // The stream that did close is complete: a partial
-                // drain must not cost the output it already had.
-                assert!(stdout.contains("shell-done"), "stdout: {stdout:?}");
-            }
-            other => panic!("expected Bash details, got {other:?}"),
-        }
-        wait_until(
-            || !process_is_live(pid),
-            "the stderr holder to be killed with its group",
-        )
-        .await;
-    }
-
-    /// The drain escalates rather than giving up: the group gets a
-    /// `SIGTERM` first, so a holder that cleans up on signals gets the
-    /// chance, and a holder that takes the signal and keeps the pipes
-    /// anyway is killed in the next window.
-    ///
-    /// Mirrors `cancellation_escalates_to_sigkill_when_sigterm_is_ignored`
-    /// for the drain's own escalation, which cannot key on the child
-    /// because the child has already been reaped.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for pipe drain and escalation windows"
-    )]
-    async fn the_drain_escalates_from_sigterm_to_sigkill() {
-        let dir = TempDir::new().expect("create temp dir");
-        let pid_path = dir.path().join("holder-pid");
-        let termed_path = dir.path().join("holder-was-termed");
-
-        // The holder records `SIGTERM` and carries on holding the pipes,
-        // so the run can only end on the escalation. `trap` fires
-        // between commands, i.e. within one `sleep` of the signal.
-        let command = format!(
-            "{{ trap \"echo termed > '{termed}'\" TERM; \
-                echo $BASHPID > '{pid}'; \
-                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-             until [ -s '{pid}' ]; do sleep 0.01; done; \
-             echo shell-done",
-            termed = termed_path.display(),
-            pid = pid_path.display(),
-            dir = dir.path().display(),
-        );
-
-        let mut ctx = DummyToolContext::default();
-        let result = tokio::time::timeout(
-            Duration::from_secs(15),
-            BashTool::default().execute(
-                &mut ctx,
-                BashInput {
-                    command,
-                    timeout: 1,
-                    description: "test drain escalation".to_string(),
-                    run_in_background: false,
-                },
-            ),
-        )
-        .await;
-
-        let pid = read_pid(&pid_path);
-        let outcome = result
-            .unwrap_or_else(|_| panic!("the turn was still waiting on the held pipes"))
-            .expect("execute");
-
-        assert!(
-            termed_path.exists(),
-            "the group is signalled before it is killed, so a holder can clean up: \
-             without the TERM this test measures only the kill"
-        );
-        wait_until(
-            || !process_is_live(pid),
-            "the holder that shrugged off SIGTERM to be killed",
-        )
-        .await;
-        let wire = extract_text(&outcome.content);
-        assert!(wire.contains(&capture_cut_trailer()), "wire: {wire:?}");
-    }
-
-    /// A drop can land mid-drain, when the child has already been
-    /// reaped and the drain is waiting on a straggler's pipes. The
-    /// guard has to tear the group down from there too, which is why
-    /// its escalation runs on a timer: `Child::wait` answers instantly
-    /// from the cached status at that point and would collapse the
-    /// grace to nothing.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for the 300ms mid-drain drop timeout"
-    )]
-    async fn a_drop_during_the_drain_still_kills_the_group() {
-        let dir = TempDir::new().expect("create temp dir");
-        let pid_path = dir.path().join("holder-pid");
-        let termed_path = dir.path().join("holder-was-termed");
-
-        // The shell exits at once and the holder keeps the pipes, so
-        // execute is inside the drain when the timeout below drops it.
-        // The holder cleans up on SIGTERM, which is what the guard's
-        // grace has to leave room for even here, where the child was
-        // reaped long before the drop.
-        let command = format!(
-            "{{ trap \"echo termed > '{termed}'; exit\" TERM; \
-                echo $BASHPID > '{pid}'; \
-                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-             until [ -s '{pid}' ]; do sleep 0.01; done; \
-             echo shell-done",
-            termed = termed_path.display(),
-            pid = pid_path.display(),
-            dir = dir.path().display(),
-        );
-
-        let mut ctx = DummyToolContext::default();
-        let dropped = tokio::time::timeout(
-            Duration::from_millis(300),
-            BashTool::default().execute(
-                &mut ctx,
-                BashInput {
-                    command,
-                    timeout: 30,
-                    description: "test drop during the drain".to_string(),
-                    run_in_background: false,
-                },
-            ),
-        )
-        .await;
-
-        assert!(
-            dropped.is_err(),
-            "the future has to still be draining when it is dropped, \
-             otherwise this measures a completed call"
-        );
-        let pid = read_pid(&pid_path);
-        wait_until(
-            || !process_is_live(pid),
-            "the dropped command's group to be killed",
-        )
-        .await;
-        assert!(
-            termed_path.exists(),
-            "the holder should have run its SIGTERM handler: an escalation keyed on the \
-             already-reaped child would answer instantly and kill it with no grace at all"
-        );
-    }
-
-    /// When a cancel does reach bash's own arm (the window where the
-    /// token fires while a poll is in flight), the group kill cannot
-    /// touch a holder in its own session, so the bounded drain is what
-    /// returns the turn. The holder survives, which is what says the
-    /// wait ended by dropping the read ends.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for escaped-holder pipe drain windows"
-    )]
-    async fn a_cancel_with_a_holder_outside_the_group_is_still_bounded() {
+    async fn a_process_outside_the_group_does_not_hold_a_cancelled_call_open() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("session-leader-pid");
 
@@ -3375,21 +1755,16 @@ esac
         let ready = pid_path.clone();
         tokio::spawn(async move {
             wait_until(
-                || {
-                    std::fs::metadata(&ready)
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false)
-                },
-                "the holder to be up before the cancel: cancelling first would leave \
-                 nothing for the drain to be bounded against",
+                || std::fs::metadata(&ready).is_ok_and(|m| m.len() > 0),
+                "the holder to be up before the cancel",
             )
             .await;
             token.cancel();
         });
 
         let result = tokio::time::timeout(
-            Duration::from_secs(12),
-            BashTool::default().execute(
+            Duration::from_secs(6),
+            tool_in(&dir).execute(
                 &mut ctx,
                 BashInput {
                     command,
@@ -3402,49 +1777,34 @@ esac
         .await;
 
         let pid = read_pid(&pid_path);
+        let _straggler = Straggler(pid);
         let outcome = result
             .unwrap_or_else(|_| {
-                panic!("the cancelled turn was still waiting on a holder no signal reaches")
+                panic!("the cancelled call was still waiting on a holder no signal reaches")
             })
             .expect("execute");
 
         assert!(
             process_is_live(pid),
-            "the holder is in its own session, so no kill of ours reaches it and the \
-             drain's abort is what ended the wait: with it dead this measures the kill"
+            "the holder is in its own session, so no kill of ours reaches it"
         );
         assert!(outcome.is_error, "cancellation marks the outcome");
         let wire = extract_text(&outcome.content);
         assert!(wire.contains("Command cancelled"), "wire: {wire:?}");
-        assert!(
-            wire.contains(&capture_cut_trailer()),
-            "the incomplete capture is reported beside the cancel, wire: {wire:?}"
-        );
     }
 
-    /// A failure between the spawn and the first await leaks the
-    /// command unless the guard is already armed. `spill_dir` is user
-    /// configuration, so an unwritable or full one turns every call
-    /// into this path, which is the failure this guard exists to
-    /// prevent arriving through the back door.
+    /// The output directory is user configuration, so an unwritable or
+    /// full one turns every call into this path: the call fails, and its
+    /// command does not run.
     ///
     /// The error's own text is asserted so the second phase cannot be
-    /// satisfied by some unrelated failure. What no assertion here can
-    /// hold is that the spill step is still *after* the spawn: moving
-    /// it before would keep this test green, and would do so precisely
-    /// because the guard is supposed to kill the child faster than it
-    /// can leave a trace of its own.
-    #[cfg(target_os = "linux")]
+    /// satisfied by some unrelated failure.
     #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for 1s shell staging and a 1.5s leak window"
-    )]
-    async fn a_spill_failure_does_not_leak_the_command() {
+    async fn an_unusable_output_directory_fails_the_call_and_runs_nothing() {
         let dir = TempDir::new().expect("create temp dir");
         let allowed = dir.path().join("spill");
-        // `SpillState::new` runs `create_dir_all`, which cannot make a
-        // directory underneath a regular file.
+        // The tool creates the directory, which cannot be done underneath
+        // a regular file.
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"").expect("write blocker");
         let refused = blocker.join("spill");
@@ -3452,15 +1812,14 @@ esac
         let ran = dir.path().join("ran");
         let leaked = dir.path().join("leaked");
         let input = |marker: &Path| BashInput {
-            command: format!("sleep 1; touch '{}'", marker.display()),
+            command: format!("touch '{}'", marker.display()),
             timeout: 30,
-            description: "test spill failure".to_string(),
+            description: "test unusable output directory".to_string(),
             run_in_background: false,
         };
 
-        // With a usable spill directory the command reaches its marker,
-        // which is what makes the second phase's absence mean
-        // something.
+        // With a usable directory the command reaches its marker, which
+        // is what makes the second phase's absence mean something.
         let mut ctx = DummyToolContext::default();
         BashTool::new(false, Some(allowed))
             .execute(&mut ctx, input(&ran))
@@ -3474,26 +1833,63 @@ esac
             .await;
         let error = outcome
             .err()
-            .expect("an unusable spill directory fails the call")
+            .expect("an unusable output directory fails the call")
             .to_string();
         assert!(
             error.contains("Not a directory"),
-            "the call has to fail on the spill directory, not on something before it: {error}"
+            "the call has to fail on the directory, not on something else: {error}"
         );
-
-        // Past the command's own sleep: if the guard was armed at the
-        // spawn the child never got here, and if it was armed after the
-        // spill it is still running.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(
-            !leaked.exists(),
-            "the command outlived the error return that abandoned it"
-        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!leaked.exists(), "the command ran without its output file");
     }
 
-    /// A command that ignores `SIGTERM` is still killed. Nothing else
-    /// pins the escalation on the guard's path: every other teardown
-    /// test uses a command that goes away on the first signal.
+    /// A dropped call stops its command, which is what a cancel by the
+    /// user comes to. The session stays open until the teardown the drop
+    /// handed to the runtime is done, and the command's files go with it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dropped_call_stops_its_command_and_removes_its_files() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("shell-pid");
+        let command = format!(
+            "echo $$ > '{pid}'; while true; do sleep 0.2; done",
+            pid = pid_path.display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let registry = ctx.task_registry();
+        drop_when_ready(
+            tool_in(&dir).execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 60,
+                    description: "test dropped call".to_string(),
+                    run_in_background: false,
+                },
+            ),
+            &pid_path,
+        )
+        .await;
+
+        assert!(
+            !registry.quiesce(Duration::ZERO).await,
+            "the dropped call hands its session lease to the teardown"
+        );
+        let pid = read_pid(&pid_path);
+        wait_until(
+            || !process_is_live(pid),
+            "the dropped command to be stopped",
+        )
+        .await;
+        assert!(
+            registry.quiesce(Duration::from_secs(5)).await,
+            "the lease ends with the teardown"
+        );
+        assert_eq!(left_in(&dir), Vec::<PathBuf>::new());
+    }
+
+    /// A dropped command that ignores `SIGTERM` is still killed.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[cfg_attr(
@@ -3510,7 +1906,7 @@ esac
 
         let mut ctx = DummyToolContext::default();
         drop_when_ready(
-            BashTool::default().execute(
+            tool_in(&dir).execute(
                 &mut ctx,
                 BashInput {
                     command,
@@ -3535,130 +1931,10 @@ esac
         .await;
     }
 
-    /// The teardown drops the pipe read ends, which is one of the two
-    /// harms a dropped command leaves behind and the one no other test
-    /// looks at.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for teardown grace before reader release"
-    )]
-    async fn a_dropped_command_releases_its_capture_readers() {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg("sleep 30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let child = cmd.spawn().expect("spawn");
-        let pgid: i32 = child.id().expect("pid").try_into().expect("pid fits");
-
-        // Stand-ins for the capture readers: they never finish on their
-        // own, so finishing at all means the teardown aborted them.
-        let stdout_reader = tokio::spawn(std::future::pending::<()>());
-        let stderr_reader = tokio::spawn(std::future::pending::<()>());
-        let registry = TaskRegistry::default();
-        let mut guard =
-            ProcessGuard::arm(child, registry.track_cleanup()).expect("arm process guard");
-        guard.watch_readers([stdout_reader.abort_handle(), stderr_reader.abort_handle()]);
-
-        assert!(
-            !stdout_reader.is_finished() && !stderr_reader.is_finished(),
-            "the readers have to be running before the drop"
-        );
-        drop(guard);
-        assert!(
-            !registry.quiesce(Duration::ZERO).await,
-            "the dropped guard transfers its session lease into asynchronous process cleanup"
-        );
-
-        wait_until(
-            || stdout_reader.is_finished() && stderr_reader.is_finished(),
-            "both capture readers to be aborted",
-        )
-        .await;
-        wait_until(
-            || !process_is_live(pgid),
-            "the dropped command to be killed",
-        )
-        .await;
-        assert!(
-            registry.quiesce(Duration::ZERO).await,
-            "the session lease ends only after process and reader cleanup"
-        );
-    }
-
-    /// The tool hands its reader abort handles to the guard, so a
-    /// dropped call releases the pipe read ends as well as the process
-    /// group. Losing that handoff leaves both reader tasks running on
-    /// a pipe nobody will ever close, which is the second harm this
-    /// bead names and the one every other test here reaches through a
-    /// guard it wired itself.
-    ///
-    /// The oracle is a straggler in its own session, out of reach of
-    /// the group kill, whose next write to the inherited pipe fails
-    /// once the host has let go of the read end. It ignores `SIGPIPE`
-    /// so the failed write is an error it can report rather than the
-    /// signal that would kill it, and it reports into a file rather
-    /// than into the pipe under test.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for teardown grace before reader release"
-    )]
-    async fn a_dropped_call_releases_the_pipes_the_tool_opened() {
-        let dir = TempDir::new().expect("create temp dir");
-        let pid_path = dir.path().join("session-leader-pid");
-        let write_failed = dir.path().join("write-failed");
-
-        let command = format!(
-            "setsid bash -c \"trap '' PIPE; echo \\$$ > '{pid}'; \
-                while [ -d '{dir}' ] && [ \\$SECONDS -lt 30 ]; do \
-                    echo tick || {{ echo gone > '{failed}'; exit 0; }}; \
-                    sleep 0.05; \
-                done\" & \
-             until [ -s '{pid}' ]; do sleep 0.01; done; \
-             sleep 30",
-            pid = pid_path.display(),
-            dir = dir.path().display(),
-            failed = write_failed.display(),
-        );
-
-        let mut ctx = DummyToolContext::default();
-        drop_when_ready(
-            BashTool::default().execute(
-                &mut ctx,
-                BashInput {
-                    command,
-                    timeout: 60,
-                    description: "test reader release through the tool".to_string(),
-                    run_in_background: false,
-                },
-            ),
-            &pid_path,
-        )
-        .await;
-
-        let holder = read_pid(&pid_path);
-        assert!(
-            process_is_live(holder),
-            "the holder is in its own session, so no kill of ours reaches it: with it dead \
-             this would measure the kill instead of the descriptors"
-        );
-        wait_until(
-            || write_failed.exists(),
-            "the straggler's write to fail once the host released the read ends",
-        )
-        .await;
-    }
-
     /// The grace is the group's, not the leader's. `bash` exits the
     /// instant it takes the `SIGTERM` while the descendants it forked
     /// are still running their handlers, so a teardown that waits on
-    /// the child kills exactly the processes the grace was for.
+    /// the leader kills exactly the processes the grace was for.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_grace_outlives_a_leader_that_exits_at_once() {
@@ -3669,7 +1945,7 @@ esac
         let cleaned_path = dir.path().join("descendant-cleaned-up");
 
         // Hold the descendant's handler until the leader is observed dead.
-        // Reaping the leader must not cut short the group's real TERM grace.
+        // The leader's end must not cut short the group's real TERM grace.
         let command = format!(
             "trap 'exit 0' TERM; echo $$ > '{leader}'; \
              {{ trap \"{gate}; echo done > '{cleaned}'; exit 0\" TERM; \
@@ -3686,7 +1962,7 @@ esac
 
         let mut ctx = DummyToolContext::default();
         drop_when_ready(
-            BashTool::default().execute(
+            tool_in(&dir).execute(
                 &mut ctx,
                 BashInput {
                     command,
@@ -3722,255 +1998,137 @@ esac
         .await;
     }
 
-    /// A drop landing after the leader was reaped still kills the
-    /// group. That is the drain-expiry case, where the shell is gone
-    /// and a holder of the turn's pipes is still alive: skipping the
-    /// escalation there leaves it running, which would make a cancelled
-    /// command strictly weaker than a completed one, since the
-    /// completion path kills the same holder.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for the SIGKILL escalation grace"
-    )]
-    async fn a_reaped_leader_still_gets_its_group_killed() {
-        let dir = TempDir::new().expect("create temp dir");
-        let shell_pid_path = dir.path().join("shell-pid");
-        let holder_pid_path = dir.path().join("holder-pid");
-
-        // The holder ignores SIGTERM, so only the escalation can end
-        // it. The shell exits as soon as the holder is up, which puts
-        // the call in the drain with its leader already reaped.
-        let command = format!(
-            "echo $$ > '{shell}'; \
-             {{ trap '' TERM; echo $BASHPID > '{holder}'; \
-                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-             until [ -s '{holder}' ]; do sleep 0.01; done; \
-             echo shell-done",
-            shell = shell_pid_path.display(),
-            holder = holder_pid_path.display(),
-            dir = dir.path().display(),
-        );
-
-        let mut ctx = DummyToolContext::default();
-        let dropped = tokio::time::timeout(
-            Duration::from_millis(300),
-            BashTool::default().execute(
-                &mut ctx,
-                BashInput {
-                    command,
-                    timeout: 60,
-                    description: "test a drop with the leader already reaped".to_string(),
-                    run_in_background: false,
-                },
-            ),
-        )
-        .await;
-        assert!(
-            dropped.is_err(),
-            "the call has to still be draining when it is dropped"
-        );
-
-        let shell = read_pid(&shell_pid_path);
-        let holder = read_pid(&holder_pid_path);
-        assert!(
-            !process_is_live(shell),
-            "the shell has to be gone before the drop, otherwise this measures the \
-             live-leader path and says nothing about a reaped one"
-        );
-        assert!(
-            process_is_live(holder),
-            "the holder has to outlive the SIGTERM it ignores, otherwise the escalation \
-             has nothing left to kill"
-        );
-        wait_until(
-            || !process_is_live(holder),
-            "the SIGTERM-immune holder of a reaped leader's group to be killed",
-        )
-        .await;
-    }
-
-    /// A guard dropped after its runtime is gone has nothing to spawn
-    /// onto, and still signals rather than panicking on a runtime that
-    /// is not there.
+    /// A call dropped after its runtime is gone has nothing to spawn its
+    /// teardown onto, and still signals rather than panicking on a
+    /// runtime that is not there.
     ///
-    /// This is the guard carried out of the runtime and dropped on a
-    /// plain thread. It is NOT the host-exit path: a runtime that is
-    /// shutting down still answers `Handle::try_current` with `Ok`, so
-    /// what a host exit does with an in-flight command is a separate
-    /// question and a separate test.
+    /// This is the call carried out of the runtime and dropped on a plain
+    /// thread. It is NOT the host-exit path: a runtime that is shutting
+    /// down still answers `Handle::try_current` with `Ok`, so what a host
+    /// exit does with an in-flight command is a separate test.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_guard_dropped_without_a_runtime_still_kills_the_group() {
+    fn a_call_dropped_without_a_runtime_still_signals_the_group() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("descendant-pid");
-
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let (guard, pgid, descendant) = runtime.block_on(async {
-            let command = format!(
-                "{{ echo $BASHPID > '{pid}'; \
-                    while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-                 until [ -s '{pid}' ]; do sleep 0.01; done; \
-                 sleep 30",
-                pid = pid_path.display(),
-                dir = dir.path().display(),
-            );
-            let mut cmd = Command::new("bash");
-            cmd.arg("-c")
-                .arg(&command)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0);
-            let child = cmd.spawn().expect("spawn");
-            let pgid: i32 = child.id().expect("pid").try_into().expect("pid fits");
-            // The readers are irrelevant here, only their handles are.
-            let readers = [
-                tokio::spawn(std::future::pending::<()>()).abort_handle(),
-                tokio::spawn(std::future::pending::<()>()).abort_handle(),
-            ];
-            // Wait for the descendant so the group has a member the
-            // immediate child's death would not take with it.
-            for _ in 0..400 {
-                if std::fs::metadata(&pid_path)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let descendant = read_pid(&pid_path);
-            let mut guard = arm_for_test(child);
-            guard.watch_readers(readers);
-            (guard, pgid, descendant)
+        let command = format!(
+            "{{ echo $BASHPID > '{pid}'; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             sleep 30",
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+        let tool = tool_in(&dir);
+        let mut call = Box::pin(async move {
+            let mut ctx = DummyToolContext::default();
+            let input = BashInput {
+                command,
+                timeout: 60,
+                description: "test drop without a runtime".to_string(),
+                run_in_background: false,
+            };
+            let _ = tool.execute(&mut ctx, input).await;
         });
 
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        // Wait for the descendant so the group has a member the shell's
+        // death would not take with it.
+        runtime.block_on(async {
+            for _ in 0..400 {
+                tokio::select! {
+                    biased;
+                    () = call.as_mut() => panic!("the call ended before it was dropped"),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                if std::fs::metadata(&pid_path).is_ok_and(|m| m.len() > 0) {
+                    return;
+                }
+            }
+            panic!("the fixture never reported ready");
+        });
+        let descendant = read_pid(&pid_path);
         assert!(
-            process_is_live(pgid) && process_is_live(descendant),
-            "the command and its descendant should be running before the runtime goes: \
-             otherwise this measures nothing"
+            process_is_live(descendant),
+            "the command should be running before the runtime goes"
         );
 
         // The host is on its way out: no runtime, no async, no reap.
         drop(runtime);
-        drop(guard);
+        drop(call);
 
         for _ in 0..400 {
-            if !process_is_live(pgid) && !process_is_live(descendant) {
+            if !process_is_live(descendant) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("the group outlived the runtime: leader {pgid}, descendant {descendant}");
+        panic!("the group outlived the dropped call: descendant {descendant}");
     }
 
-    /// The `SIGTERM` lands even when the spawned teardown is never
-    /// polled, which is what a host exit does to it: a runtime being
-    /// dropped shuts down inside its own context, so the guard's spawn
-    /// is answered with a handle whose future is discarded unpolled.
-    /// A teardown that owned the first signal would send nothing at
-    /// all here and the whole group would outlive the host.
+    /// A command whose call a dying runtime drops is killed, though it
+    /// ignores `SIGTERM`. This is what a host exit does to a call: a
+    /// runtime being dropped shuts down inside its own context, so the
+    /// drop's spawn is answered with a handle whose future is discarded
+    /// unpolled, and the escalation never runs. The lifeline that future
+    /// held closes with it, and the wrapper kills the group.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_guard_dropped_by_a_dying_runtime_still_signals() {
+    fn a_call_dropped_by_a_dying_runtime_kills_its_command() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("shell-pid");
-        let termed_path = dir.path().join("shell-was-termed");
-        // The trap is installed before the pid appears, so a readable
-        // pid also says the command can answer a signal.
         let command = format!(
-            "trap \"echo termed > '{termed}'; exit\" TERM; \
-             echo $$ > '{pid}'; \
+            "trap '' TERM; echo $$ > '{pid}'; \
              while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done",
-            termed = termed_path.display(),
             pid = pid_path.display(),
             dir = dir.path().display(),
         );
-        let held = GuardHeldByItsRuntime::spawn(command, &pid_path);
+        let dropped_in_runtime_context = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&dropped_in_runtime_context);
+        let tool = tool_in(&dir);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        // The call never finishes, so nothing but the runtime's shutdown
+        // drops it.
+        runtime.spawn(async move {
+            let mut ctx = DummyToolContext::default();
+            let _probe = DropContextProbe(probe);
+            let input = BashInput {
+                command,
+                timeout: 60,
+                description: "test drop by a dying runtime".to_string(),
+                run_in_background: false,
+            };
+            let _ = tool.execute(&mut ctx, input).await;
+        });
+        for _ in 0..400 {
+            if std::fs::metadata(&pid_path).is_ok_and(|m| m.len() > 0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = read_pid(&pid_path);
+        assert!(
+            process_is_live(pid),
+            "the command has to be running when the runtime goes"
+        );
 
-        held.drop_the_runtime();
+        drop(runtime);
+        assert!(
+            dropped_in_runtime_context.load(atomic::Ordering::SeqCst),
+            "the call was dropped outside the runtime context, which is the plain-thread \
+             case another test already covers"
+        );
 
         for _ in 0..400 {
-            if termed_path.exists() {
+            if !process_is_live(pid) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!(
-            "the command never took a SIGTERM: on this path the only signal is the one Drop \
-             sends itself, since the teardown it spawned is discarded unpolled"
+            "the command outlived the runtime: it ignores the SIGTERM the drop sends, and \
+             nothing ran the escalation"
         );
-    }
-
-    /// A command running under an armed guard that only the runtime's
-    /// own shutdown can drop, which is the shape a host exit has.
-    ///
-    /// The command is expected to write its pid to `pid_path` once it
-    /// is ready to take a signal, and to end on its own if nobody ever
-    /// signals it.
-    #[cfg(target_os = "linux")]
-    struct GuardHeldByItsRuntime {
-        runtime: tokio::runtime::Runtime,
-        dropped_in_runtime_context: Arc<AtomicBool>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl GuardHeldByItsRuntime {
-        fn spawn(command: String, pid_path: &Path) -> Self {
-            let dropped_in_runtime_context = Arc::new(AtomicBool::new(false));
-            let probe = Arc::clone(&dropped_in_runtime_context);
-            let runtime = tokio::runtime::Runtime::new().expect("runtime");
-            // The task never finishes, so nothing but the runtime's
-            // shutdown reaches the guard.
-            runtime.spawn(async move {
-                let mut cmd = Command::new("bash");
-                cmd.arg("-c")
-                    .arg(&command)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .process_group(0);
-                let child = cmd.spawn().expect("spawn");
-                let _guard = arm_for_test(child);
-                let _probe = DropContextProbe(probe);
-                std::future::pending::<()>().await;
-            });
-
-            for _ in 0..400 {
-                if std::fs::metadata(pid_path)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let pid = read_pid(pid_path);
-            assert!(
-                process_is_live(pid),
-                "the command has to be running when the runtime goes, \
-                 otherwise this measures nothing"
-            );
-            Self {
-                runtime,
-                dropped_in_runtime_context,
-            }
-        }
-
-        /// End the host, and hold the construction to the shape it
-        /// claims before the caller reads anything into the result.
-        fn drop_the_runtime(self) {
-            let context = self.dropped_in_runtime_context;
-            drop(self.runtime);
-            assert!(
-                context.load(atomic::Ordering::SeqCst),
-                "the guard was dropped outside the runtime context, which is the plain-thread \
-                 case another test already covers: this fixture only measures the host-exit \
-                 shape while a shutting-down runtime still answers Handle::try_current with Ok"
-            );
-        }
     }
 
     /// Records where its drop landed, so a tokio that stops shutting
@@ -4291,7 +2449,7 @@ esac
 
     /// The started result returns immediately with the task id and
     /// the always-persisted spill path; the real outcome arrives as a
-    /// completion notice carrying exit status, tail, and spill path.
+    /// task notification carrying exit status, tail, and spill path.
     #[tokio::test]
     async fn background_started_result_carries_id_and_spill_path() {
         let mut ctx = DummyToolContext::default();
@@ -4321,7 +2479,7 @@ esac
         );
         assert!(
             wire.contains("notified when it completes"),
-            "the started result promises the completion notice: {wire:?}"
+            "the started result promises the task notification: {wire:?}"
         );
         let spill_path = match &outcome.details {
             ToolDetails::Bash {
@@ -4362,7 +2520,7 @@ esac
         let on_disk = std::fs::read_to_string(&spill_path).expect("spill readable");
         assert_eq!(on_disk, "hello\n");
 
-        // The completion notice carries exit status, tail, and path.
+        // The task notification carries exit status, tail, and path.
         let notices = registry.drain_notices(aj_agent::events::AgentId::Main);
         assert_eq!(notices.len(), 1);
         let body = &notices[0].body;
@@ -4377,44 +2535,6 @@ esac
             body.contains(&format!("Full output: {}", spill_path.display())),
             "notice body: {body:?}"
         );
-    }
-
-    /// The driver's join is the same defect one level down: a straggler
-    /// holding the pipes after the task's own process exited would keep
-    /// the completion notice from ever rendering and the registry row
-    /// from ever settling. Same drain, so the notice arrives, says the
-    /// capture was cut short, and still reports the real exit status.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: waits for the pipe drain grace"
-    )]
-    async fn background_task_with_a_pipe_holder_still_finishes() {
-        let dir = TempDir::new().expect("create temp dir");
-        let mut ctx = DummyToolContext::default();
-        let command = format!(
-            "{{ echo descendant-wrote; \
-                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-             echo shell-done",
-            dir = dir.path().display(),
-        );
-
-        let (id, _spill_path, _spill_dir) = start_background(&mut ctx, &command, 30).await;
-        let registry = ctx.task_registry();
-        let status = await_terminal(&registry, id).await;
-
-        // The task's own process succeeded: a cut capture is not a
-        // capture failure and must not be reported as one.
-        assert_eq!(status, aj_agent::tool::TaskStatus::Exited(Some(0)));
-        let notices = registry.drain_notices(aj_agent::events::AgentId::Main);
-        assert_eq!(notices.len(), 1);
-        let body = &notices[0].body;
-        assert!(
-            body.contains(&capture_cut_trailer()),
-            "notice body: {body:?}"
-        );
-        assert!(body.contains("shell-done"), "notice body: {body:?}");
     }
 
     /// The detached driver announces the task on the bus as its

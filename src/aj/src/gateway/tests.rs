@@ -7117,6 +7117,7 @@ fn deep_block(session: &str, epoch: &str, backfilled: u64) -> Vec<String> {
 /// The `state` frame an attach block opens with.
 fn state_frame(session: &str, epoch: &str) -> String {
     serde_json::to_string(&Frame::State {
+        turn_interrupted: false,
         session: session.to_string(),
         epoch: epoch.to_string(),
         opens_block: true,
@@ -7138,6 +7139,7 @@ fn caught_up_frame(session: &str, epoch: &str, last_seq: u64) -> String {
         last_seq,
         tasks: Default::default(),
         queues: Default::default(),
+        history_start: None,
     })
     .expect("a caught_up frame")
 }
@@ -8402,9 +8404,9 @@ async fn environment_reads_and_edits_cross_the_gateway() {
         let message = log
             .append(
                 parent,
-                aj_session::ThreadKind::User,
+                aj_session::ThreadKind::Main,
                 None,
-                aj_session::ConversationEntryKind::Message {
+                aj_session::LogEntryKind::Message {
                     message: aj_agent::message::AgentMessage::wire(
                         aj_models::types::Message::User(aj_models::types::UserMessage::text(
                             "branch point",
@@ -8415,7 +8417,6 @@ async fn environment_reads_and_edits_cross_the_gateway() {
             .unwrap();
         log.append_env_change(BTreeMap::from([("TOKEN".into(), "current".into())]))
             .unwrap();
-        log.flush_pending().unwrap();
         message.id
     };
     assert_eq!(

@@ -2,9 +2,10 @@
 // and the in-tree `aj` binary. The agent runtime in this file drives
 // tools through the [`tool::ToolDefinition`] / [`tool::ToolContext`]
 // surface and emits every state transition through its internal
-// [`bus::EventBus`]; the binary subscribes a renderer listener and a
-// persistence listener (the latter lives in `aj-session`) and owns
-// the readline loop, log management, and history display.
+// [`bus::EventBus`], which commits an event through the session's
+// [`bus::Committer`] before it publishes it. The binary subscribes its
+// renderer and owns the readline loop, log management, and history
+// display.
 mod assignment;
 pub mod bus;
 mod code_mode;
@@ -85,12 +86,12 @@ pub fn sub_agent_session_id(base: &str, agent_id: usize) -> String {
 /// A code on `Failed` therefore means exactly "the command ran to
 /// completion and exited non-zero", which frontends read as an answer
 /// rather than a broken task. A capture failure broke the task whatever
-/// the exit code, so it carries none. The notice body still names the
+/// the exit code, so it carries none. The notification body still names the
 /// code.
 ///
-/// Only reached for terminal notices, so `Running` should never occur.
+/// Only reached for terminal notifications, so `Running` should never occur.
 /// We fold it into `Failed { code: None }` defensively rather than
-/// panic: a stray non-terminal notice is a harmless "did not succeed",
+/// panic: a stray non-terminal notification is a harmless "did not succeed",
 /// not worth aborting a turn over.
 fn task_outcome(kind: TaskNotificationKind, status: TaskStatus) -> TaskOutcome {
     match (kind, status) {
@@ -106,6 +107,53 @@ fn task_outcome(kind: TaskNotificationKind, status: TaskStatus) -> TaskOutcome {
             TaskNotificationKind::Bash,
             TaskStatus::CaptureFailed(_) | TaskStatus::Exited(None) | TaskStatus::Running,
         ) => TaskOutcome::Failed { code: None },
+    }
+}
+
+/// How long a task's driver waits between tries to save the task's end.
+pub const TASK_END_SAVE_RETRIES: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// The notification the parent of background sub-agent `n` gets when the run's
+/// host ended before the run did. It is saved when the run starts (see
+/// [`TaskRegistry::announce_loss`]), so its id is also the id of the run's
+/// task notification. A sub-agent number is used once per session and has
+/// one background run, so the id names one notification.
+pub fn interrupted_run_notice(n: usize) -> AgentMessage {
+    let mut notice = AgentMessage::task_notification(TaskNotification::new(
+        format!("agent {n}"),
+        TaskNotificationKind::Agent,
+        TaskOutcome::Failed { code: None },
+        format!(
+            "Background agent {n} was interrupted before it finished: the session ended \
+             while it ran. It keeps its history and can be continued by sending it a \
+             message."
+        ),
+    ));
+    notice.set_id(format!("agent-{n}-run-end"));
+    notice
+}
+
+impl TaskNotice {
+    /// The transcript message this notification is delivered as, with a fresh id.
+    pub fn to_message(&self) -> AgentMessage {
+        let kind = match &self.kind {
+            TaskKind::Bash { .. } => TaskNotificationKind::Bash,
+            TaskKind::Agent { .. } => TaskNotificationKind::Agent,
+            TaskKind::CodeMode { .. } => TaskNotificationKind::CodeMode,
+        };
+        AgentMessage::task_notification(TaskNotification::new(
+            self.label.clone(),
+            kind,
+            task_outcome(kind, self.status),
+            // Store the exact model-facing text: trimming the trailing
+            // whitespace here keeps the projected framing byte-identical
+            // to the pre-typed tagged string.
+            self.body.trim_end().to_string(),
+        ))
     }
 }
 
@@ -139,9 +187,9 @@ mod task_outcome_tests {
 #[derive(Debug, Default)]
 pub struct AgentSeed {
     /// Replaces the agent's in-memory transcript. On resume the
-    /// binary opens the log, linearizes the user thread, and passes
+    /// binary opens the log, linearizes the main thread, and passes
     /// the resulting messages so the next turn sees the prior
-    /// conversation. Empty for a fresh session.
+    /// messages. Empty for a fresh session.
     pub transcript: Vec<AgentMessage>,
     /// The fully-assembled system prompt for the session: either
     /// reused verbatim from the log (cache-warm resume) or freshly
@@ -185,7 +233,7 @@ pub const SUBAGENT_TRUNCATION_NOTE: &str = "[note: the sub-agent's report was \
 /// `Truncated` report is annotated with [`SUBAGENT_TRUNCATION_NOTE`] so the
 /// model treats the token-capped text as incomplete rather than final.
 /// Every other conclusion is delivered verbatim. Shared by the blocking
-/// `agent` tool result and the background completion notice so the two stay
+/// `agent` tool result and the background task notification so the two stay
 /// in sync. The box's own report is always the raw text. This only shapes
 /// the model-facing copy.
 pub fn delivered_report(conclusion: SubAgentConclusion, report: &str) -> String {
@@ -195,24 +243,25 @@ pub fn delivered_report(conclusion: SubAgentConclusion, report: &str) -> String 
     }
 }
 
-/// Selects the protocol transition emitted for one accounted usage delta.
+/// The successful [`AgentEvent::CompactionEnd`] of a checkpoint whose
+/// summarizer spend the agent has already taken into its usage.
 ///
-/// Assistant terminals emit one [`AgentEvent::UsageUpdate`]. A committed
-/// compaction emits one successful [`AgentEvent::CompactionEnd`] carrying usage.
-/// Failed and canceled operations do not enter this boundary.
+/// Only [`Agent::account_compaction`] makes one, so the event cannot be
+/// forged with usage the accumulator never saw. The session commits the
+/// event with the checkpoint it stands for, and [`Agent::publish_compaction`]
+/// then delivers it to the bus.
 #[derive(Debug)]
-pub enum UsageAccounting {
-    AssistantTerminal,
-    CommittedCompaction {
-        reason: CompactionReason,
-        tokens_before: u64,
-        tokens_after: u64,
-        summary: String,
-    },
+#[must_use = "an accounted compaction end is delivered by Agent::publish_compaction"]
+pub struct AccountedCompaction(AgentEvent);
+
+impl AccountedCompaction {
+    pub fn event(&self) -> &AgentEvent {
+        &self.0
+    }
 }
 
 pub struct Agent {
-    /// The fully-assembled system prompt for the current run.
+    /// The fully-assembled system prompt of this agent.
     /// Populated by [`Agent::seed_session`] (resume path or fresh
     /// assembly) before any turn runs. Inference reads it directly.
     /// Defaults to the empty string, which every provider tolerates
@@ -263,9 +312,8 @@ pub struct Agent {
     /// listeners can route nested transcripts.
     agent_id: AgentId,
     /// Internal event bus. Every state transition the agent goes
-    /// through is mirrored here as an [`AgentEvent`]; the binary
-    /// subscribes a renderer listener and a persistence listener
-    /// (the latter lives in `aj_session::persistence_listener`).
+    /// through is emitted here as an [`AgentEvent`]. The session's
+    /// committer stores what an event records before listeners see it.
     bus: EventBus,
     /// Cancellation token for the in-flight turn. The agent does not
     /// fire it: the binary installs a fresh token per turn (via
@@ -292,10 +340,10 @@ pub struct Agent {
     /// `content`, `details`, or `is_error` before the bus event
     /// and the wire projection fire.
     after_tool_call: Option<hooks::AfterToolCallHook>,
-    /// Optional hook consulted after every assistant turn finishes
-    /// its tool batch. Set via [`Agent::set_should_stop_after_turn`];
+    /// Optional hook consulted after every round finishes
+    /// its tool batch. Set via [`Agent::set_should_stop_after_round`];
     /// returning `true` ends the turn without a follow-up inference.
-    should_stop_after_turn: Option<hooks::ShouldStopAfterTurnHook>,
+    should_stop_after_round: Option<hooks::ShouldStopAfterRoundHook>,
     /// Application-owned work at the paused continuation boundary.
     /// Not inherited by sub-agents.
     before_continuation: Option<hooks::BeforeContinuationHook>,
@@ -332,11 +380,11 @@ pub struct Agent {
     /// clone into each spawned sub-agent (see
     /// [`SessionContextWrapper::spawn_agent`]) so the TUI can enqueue
     /// while a turn runs; the turn driver drains them at the in-loop
-    /// steering point and the run-top (wake) point. A default handle
+    /// steering point and the turn-top (wake) point. A default handle
     /// is used by print mode and tests, where nothing enqueues.
     message_queues: MessageQueues,
     /// Maximum number of tool calls this agent runs concurrently within
-    /// one turn (see [`max_tool_concurrency`]). Read once at
+    /// one round (see [`max_tool_concurrency`]). Read once at
     /// construction so a turn never re-reads the environment.
     max_tool_concurrency: usize,
     code_mode_requested: bool,
@@ -416,7 +464,7 @@ impl Agent {
             transcript: Vec::new(),
             before_tool_call: None,
             after_tool_call: None,
-            should_stop_after_turn: None,
+            should_stop_after_round: None,
             before_continuation: None,
             block_images: false,
             sub_agent_registry: SubAgentRegistry::default(),
@@ -465,7 +513,7 @@ impl Agent {
     /// Used by [`SessionContextWrapper::spawn_agent`] to make a
     /// sub-agent inherit a child token derived from the parent's
     /// token, and by
-    /// [`Agent::prompt`] / [`Agent::continue_run`] /
+    /// [`Agent::prompt`] / [`Agent::continue_turn`] /
     /// [`Agent::run_single_turn`] to install the per-turn token the
     /// binary owns and can `cancel()` from a different code path
     /// (e.g. the TUI's Ctrl+C handler) without locking the agent.
@@ -500,6 +548,18 @@ impl Agent {
         self.block_images = block;
     }
 
+    /// What this agent's sub-agents are built with (see
+    /// [`SubAgentBuilder`]). Take it once the task registry and the message
+    /// queues are injected: it shares the ones the agent holds then.
+    pub fn sub_agent_builder(&self) -> SubAgentBuilder {
+        SubAgentBuilder {
+            session_state: self.session_state.clone(),
+            bus: self.bus.clone(),
+            task_registry: self.task_registry.clone(),
+            message_queues: self.message_queues.clone(),
+        }
+    }
+
     /// Inject the shared sub-agent registry.
     ///
     /// The binary calls this on the main agent so the agent and the
@@ -524,13 +584,24 @@ impl Agent {
 
     /// Inject the shared steering / follow-up message queues.
     ///
-    /// The binary calls this on the main agent so the agent and the
-    /// binary share one handle; the agent threads a clone into every
-    /// spawned sub-agent so the TUI can steer or queue for any agent
-    /// it views. Callers that never inject one get a default handle
-    /// that nothing ever enqueues onto.
+    /// A host calls this on the main agent so the two share one handle.
+    /// The agent threads a clone into every spawned sub-agent, so the
+    /// host can queue input for any agent. An agent nothing injects one
+    /// into has a handle of its own.
     pub fn set_message_queues(&mut self, queues: MessageQueues) {
         self.message_queues = queues;
+    }
+
+    /// The queues this agent drains its pending input from.
+    pub fn message_queues(&self) -> &MessageQueues {
+        &self.message_queues
+    }
+
+    /// Install the session's [`bus::Committer`] on the agent's event bus.
+    /// The agent, and every sub-agent it spawns, then holds a message only
+    /// after the committer has stored it.
+    pub fn set_committer(&self, committer: Arc<dyn bus::Committer>) {
+        self.bus.set_committer(committer);
     }
 
     /// Subscribe an async listener to the agent's internal event
@@ -549,9 +620,10 @@ impl Agent {
     ///
     /// Lets the host drive out-of-band lifecycle events that the agent
     /// loop itself doesn't produce, including compaction progress and
-    /// unsuccessful terminal events. Usage updates and a successful
-    /// checkpoint end belong exclusively to [`Self::account_usage`], which
-    /// couples their delivery to the accumulator transition. Listeners are
+    /// unsuccessful terminal events. Usage updates belong exclusively to
+    /// [`Self::account_usage`] and a successful checkpoint end to
+    /// [`Self::account_compaction`], which couple them to the accumulator
+    /// transition. Listeners are
     /// awaited inline (a failing listener maps to [`TurnError::Fatal`]),
     /// exactly like the agent's own emits, so the event reaches the renderer
     /// and any out-of-process sinks in order.
@@ -567,7 +639,7 @@ impl Agent {
                 }
         ) {
             return Err(TurnError::Fatal(BoxError::from(
-                "accounting events must be emitted through Agent::account_usage",
+                "accounting events are emitted by the Agent's accounting methods",
             )));
         }
         self.bus.emit(event).await.map_err(TurnError::Fatal)
@@ -581,12 +653,12 @@ impl Agent {
     /// [`SubscriptionHandle`] that owns the subscription's
     /// lifetime. The listener returns `Ok(())` even if the
     /// receiver has been dropped, so a renderer that hangs up
-    /// mid-run does not fail the agent's turn.
+    /// mid-turn does not fail the agent's turn.
     ///
     /// This is the channel sugar the TUI's event pump uses to
     /// decouple itself from the
     /// agent's emit timing. The agent never blocks on a slow
-    /// renderer because the forwarder's `send` is non-blocking;
+    /// renderer because the journal's `send` is non-blocking;
     /// renderers see events at their own pace by polling the
     /// receiver from a `tokio::select!`.
     pub fn subscribe_channel(
@@ -607,6 +679,46 @@ impl Agent {
         (handle, rx)
     }
 
+    /// Take up a task an earlier process of this session recorded, under
+    /// the id it has. The plumbing is what
+    /// [`ToolContext::start_background_task`] hands a tool, and the caller
+    /// spawns the driver through it in the same way. `None` when the task
+    /// registry already tracks that id.
+    pub fn resume_background_task(
+        &self,
+        id: TaskId,
+        owner: AgentId,
+        call_id: String,
+        kind: TaskKind,
+        label: String,
+        running_for: Duration,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> Option<StartedTask> {
+        let (cancel, driver) = self.task_registry.resume_driver(
+            id,
+            owner,
+            call_id.clone(),
+            kind,
+            label.clone(),
+            running_for,
+            output,
+        )?;
+        let events = TaskEventSink::new(
+            self.bus.clone(),
+            self.task_registry.clone(),
+            owner,
+            id,
+            call_id,
+            label,
+        );
+        Some(StartedTask {
+            id,
+            cancel,
+            events,
+            driver,
+        })
+    }
+
     /// Return a cloneable subscription-only handle for this agent's event bus.
     pub fn event_subscriptions(&self) -> EventSubscriptions {
         self.bus.subscriptions()
@@ -620,8 +732,8 @@ impl Agent {
         self.session_state.accumulated_usage()
     }
 
-    /// Fold one completed operation into this agent's usage and emit its
-    /// corresponding usage event.
+    /// Fold one assistant terminal's usage into this agent's usage and emit
+    /// its [`AgentEvent::UsageUpdate`].
     ///
     /// The payload carries the accumulator snapshot from before `delta`, and
     /// the complete delta is folded under one state lock before listener
@@ -629,45 +741,49 @@ impl Agent {
     /// emission, so two operations cannot publish duplicate or reordered
     /// cumulative snapshots. Cancellation or listener failure cannot erase
     /// spend already incurred.
+    pub async fn account_usage(&mut self, delta: &Usage) -> Result<(), TurnError> {
+        let usage = self.session_state.account_usage(delta);
+        self.bus
+            .emit(AgentEvent::UsageUpdate {
+                agent_id: self.agent_id,
+                usage,
+            })
+            .await
+            .map_err(TurnError::Fatal)
+    }
+
+    /// Fold a committed checkpoint's summarizer spend into this agent's
+    /// usage and return the successful `CompactionEnd` that reports it.
     ///
-    /// Callers selecting [`UsageAccounting::CommittedCompaction`] must invoke
-    /// this only after the checkpoint append commits. The successful end carries
-    /// usage in the same event, so listeners observe both together.
-    pub async fn account_usage(
+    /// Call this in the step that commits the checkpoint, so the event the
+    /// session publishes for the checkpoint carries the usage. It does not
+    /// await, so that step can hold the log. The accumulator snapshot follows
+    /// the same rule as [`Self::account_usage`]. Failed and canceled
+    /// compactions do not enter this boundary.
+    pub fn account_compaction(
         &mut self,
         delta: &Usage,
-        accounting: UsageAccounting,
-    ) -> Result<(), TurnError> {
+        reason: CompactionReason,
+        tokens_before: u64,
+        tokens_after: u64,
+        summary: String,
+    ) -> AccountedCompaction {
         let usage = self.session_state.account_usage(delta);
-        let delivered = match accounting {
-            UsageAccounting::AssistantTerminal => {
-                self.bus
-                    .emit(AgentEvent::UsageUpdate {
-                        agent_id: self.agent_id,
-                        usage,
-                    })
-                    .await
-            }
-            UsageAccounting::CommittedCompaction {
-                reason,
-                tokens_before,
-                tokens_after,
-                summary,
-            } => {
-                self.bus
-                    .emit(AgentEvent::CompactionEnd {
-                        agent_id: self.agent_id,
-                        reason,
-                        tokens_before,
-                        tokens_after,
-                        usage: Some(usage),
-                        summary: Some(summary),
-                        error: None,
-                    })
-                    .await
-            }
-        };
-        delivered.map_err(TurnError::Fatal)
+        AccountedCompaction(AgentEvent::CompactionEnd {
+            agent_id: self.agent_id,
+            reason,
+            tokens_before,
+            tokens_after,
+            usage: Some(usage),
+            summary: Some(summary),
+            error: None,
+        })
+    }
+
+    /// Deliver an accounted compaction end to the bus. The spend is already
+    /// accounted, so cancellation or a listener failure here cannot erase it.
+    pub async fn publish_compaction(&self, end: AccountedCompaction) -> Result<(), TurnError> {
+        self.bus.emit(end.0).await.map_err(TurnError::Fatal)
     }
 
     /// Borrow the agent's in-memory transcript. The binary uses
@@ -726,10 +842,10 @@ impl Agent {
     }
 
     /// Replace the in-memory transcript wholesale. Contract: call only
-    /// while no run is in flight, or from a [`hooks::BeforeContinuationHook`]
-    /// while the run is paused with its entire tool batch recorded. Used by
+    /// while no turn is in flight, or from a [`hooks::BeforeContinuationHook`]
+    /// while the turn is paused with its entire tool batch recorded. Used by
     /// host-driven compaction to install the reduced post-compaction
-    /// projection; the durable record is the conversation log's
+    /// projection; the durable form is the session log's
     /// compaction entry, from which an identical transcript is
     /// reconstructed on resume. The assembled system prompt and
     /// sub-agent counter are untouched.
@@ -749,17 +865,39 @@ impl Agent {
         self.session_state.set_todo_list(Vec::new());
     }
 
-    /// Replace JavaScript state with the selected branch's committed values.
-    /// Call only after the host has established that no run or task is live.
+    /// Shut the live JavaScript evaluator down. The committed values stay,
+    /// and the next turn that needs an evaluator builds one from them. Call
+    /// only after the host has established that no turn or task is live.
+    ///
+    /// On an error the evaluator is gone all the same, and the agent is
+    /// as usable as after a success.
+    pub async fn shutdown_code_mode(&mut self) -> Result<(), BoxError> {
+        if let Some(mode) = self.code_mode.take() {
+            mode.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    /// Replace JavaScript state with a branch's committed values:
+    /// [`Self::shutdown_code_mode`], then [`Self::set_code_mode_store`].
     pub async fn reset_code_mode(
         &mut self,
         store: BTreeMap<String, serde_json::Value>,
     ) -> Result<(), BoxError> {
-        if let Some(mode) = self.code_mode.take() {
-            mode.shutdown().await?;
-        }
-        self.code_mode_store = Arc::new(StdMutex::new(code_mode::Store::new(store)));
+        self.shutdown_code_mode().await?;
+        self.set_code_mode_store(store);
         Ok(())
+    }
+
+    /// Replace the committed JavaScript values with `store`, a branch's.
+    /// For an agent without a live evaluator (see
+    /// [`Self::shutdown_code_mode`]). Cannot fail.
+    pub fn set_code_mode_store(&mut self, store: BTreeMap<String, serde_json::Value>) {
+        debug_assert!(
+            self.code_mode.is_none(),
+            "the evaluator holds the old values"
+        );
+        self.code_mode_store = Arc::new(StdMutex::new(code_mode::Store::new(store)));
     }
 
     /// Install a hook fired before every tool call, replacing any
@@ -783,18 +921,18 @@ impl Agent {
         self.after_tool_call = hook;
     }
 
-    /// Install a hook consulted after each assistant turn completes
+    /// Install a hook consulted after each round completes
     /// its tool batch, replacing any previous hook. Returning `true`
     /// short-circuits the turn — the agent emits no follow-up
     /// inference and returns control to the caller. Use case:
     /// context-window guards, per-turn budget enforcement.
-    pub fn set_should_stop_after_turn(&mut self, hook: Option<hooks::ShouldStopAfterTurnHook>) {
-        self.should_stop_after_turn = hook;
+    pub fn set_should_stop_after_round(&mut self, hook: Option<hooks::ShouldStopAfterRoundHook>) {
+        self.should_stop_after_round = hook;
     }
 
     /// Install application work before the next tool-continuation request.
     /// The hook is not inherited by sub-agents. Hosts replace it when
-    /// configuring a run, and pass `None` to disable it.
+    /// configuring a turn, and pass `None` to disable it.
     pub fn set_before_continuation(&mut self, hook: Option<hooks::BeforeContinuationHook>) {
         self.before_continuation = hook;
     }
@@ -1017,16 +1155,16 @@ impl Agent {
     }
 
     /// Append `message` as a user-role text input to the transcript
-    /// and run one assistant turn against it.
+    /// and run a turn against it.
     ///
     /// Emits [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`]
     /// for the user message before driving
-    /// the assistant turn loop so the persistence listener writes
-    /// the user's input to disk. The turn loop runs one inference,
+    /// the round loop so the journal writes
+    /// the user's input to disk. The round loop runs one inference,
     /// processes any tool calls the assistant emits (each with its
     /// own [`AgentEvent::ToolExecutionStart`] /
     /// [`AgentEvent::ToolExecutionEnd`] bracket), and loops until
-    /// the assistant produces a non-tool turn.
+    /// the assistant responds without tool calls.
     ///
     /// The whole call is bracketed by [`AgentEvent::AgentStart`] /
     /// [`AgentEvent::AgentEnd`] events tagged with this agent's id
@@ -1115,17 +1253,17 @@ impl Agent {
         .await
     }
 
-    /// Wake the agent on pending work it can react to without a fresh
-    /// user prompt: queued task-completion notices and messages the
-    /// user queued while the agent was busy (steering / follow-up).
-    /// Drains them into the transcript and runs a turn.
+    /// Wake the agent on its pending work: queued task-completion
+    /// notifications and pending input (steering / follow-up), which is how a
+    /// host delivers every prompt. Drains them into the transcript and
+    /// runs a turn.
     ///
     /// Returns [`WakeOutcome::Empty`] — emitting no events at all —
     /// when there is nothing pending, which makes the binary's wake
     /// triggers idempotent: several may fire for the same work and the
     /// losers are cheap no-ops. Otherwise this is
-    /// [`Agent::continue_run`] minus the ends-in-user-message
-    /// precondition — the drained notices and queued messages are
+    /// [`Agent::continue_turn`] minus the ends-in-user-message
+    /// precondition — the drained notifications and queued messages are
     /// themselves the user-role messages that make the transcript
     /// valid for inference.
     pub async fn wake(&mut self, cancel: CancellationToken) -> Result<WakeOutcome, TurnError> {
@@ -1143,7 +1281,7 @@ impl Agent {
             .map(|()| WakeOutcome::Ran)
     }
 
-    /// Run one assistant turn against the existing transcript
+    /// Run a turn against the existing transcript
     /// without appending a new user message.
     ///
     /// Used after a recoverable turn error, when the user's input
@@ -1157,9 +1295,9 @@ impl Agent {
     /// Like [`Agent::prompt`], the call is bracketed by
     /// [`AgentEvent::AgentStart`] / [`AgentEvent::AgentEnd`] events,
     /// and `cancel` is honoured the same way.
-    pub async fn continue_run(&mut self, cancel: CancellationToken) -> Result<(), TurnError> {
+    pub async fn continue_turn(&mut self, cancel: CancellationToken) -> Result<(), TurnError> {
         // Check the projected role: a task notification has no stored wire
-        // message but projects to a user message, so a notice-tailed
+        // message but projects to a user message, so a notification-tailed
         // transcript is a valid provider request and must pass this guard.
         let last_is_user_or_tool_result = matches!(
             self.transcript.last().and_then(|m| m.to_projected_wire()),
@@ -1167,26 +1305,26 @@ impl Agent {
         );
         if !last_is_user_or_tool_result {
             return Err(TurnError::Fatal(
-                "continue_run requires the transcript to end in a user-role message".into(),
+                "continue_turn requires the transcript to end in a user-role message".into(),
             ));
         }
         self.cancellation = cancel;
         self.run_top_level_turn(None).await
     }
 
-    /// Shared driver for [`Agent::prompt`] / [`Agent::continue_run`]
+    /// Shared driver for [`Agent::prompt`] / [`Agent::continue_turn`]
     /// / [`Agent::wake`].
     ///
     /// `prompt` is `Some` for [`Agent::prompt`] /
     /// [`Agent::prompt_with_content`] (a fresh user message is
     /// appended before inference) and `None` for
-    /// [`Agent::continue_run`] and [`Agent::wake`] (the existing
-    /// transcript — including any just-drained notices — is fed back
+    /// [`Agent::continue_turn`] and [`Agent::wake`] (the existing
+    /// transcript — including any just-drained notifications — is fed back
     /// to the model unchanged).
     async fn run_top_level_turn(&mut self, prompt: Option<AgentMessage>) -> Result<(), TurnError> {
         let mut assignment_guard =
             assignment::AssignmentTurnGuard(self.assignment.clone().filter(|a| a.is_pending()));
-        // Mirror the run as `AgentStart` / `AgentEnd` events on the
+        // Mirror the turn as `AgentStart` / `AgentEnd` events on the
         // bus. `AgentEnd` carries a clone of the agent's transcript
         // so a listener can take a final snapshot without replaying
         // the message stream.
@@ -1253,15 +1391,13 @@ impl Agent {
             }
             other => other,
         };
-        // Notices that arrived while the agent was idle land before
+        // Notifications that arrived while the agent was idle land before
         // the user's new message, in arrival order.
         self.drain_task_notices().await?;
 
-        // Messages the user queued while the agent was busy are
-        // delivered here on the wake / continuation path: steering
-        // first (more urgent), then follow-up. On a fresh user prompt
-        // both queues are empty (the queue box only appears while the
-        // agent is busy), so these are no-ops.
+        // Pending input is taken here: steering first (more urgent),
+        // then follow-up. A host delivers every prompt this way, so on
+        // a wake this is where the user's message enters the transcript.
         self.drain_context().await?;
         self.drain_queued_messages(PendingKind::Steering).await?;
         self.drain_queued_messages(PendingKind::FollowUp).await?;
@@ -1278,7 +1414,7 @@ impl Agent {
     /// use.
     ///
     /// Appends `prompt` as a user message on the sub-agent's own
-    /// transcript, runs the assistant turn loop, and returns the
+    /// transcript, runs the round loop, and returns the
     /// final assistant text the sub-agent produced.
     pub async fn run_single_turn(&mut self, prompt: String) -> Result<SubAgentOutcome, BoxError> {
         self.run_top_level_turn(Some(AgentMessage::wire(Message::User(UserMessage::text(
@@ -1319,7 +1455,7 @@ impl Agent {
         //
         // NOTE: a returned `Ok` always carries a `Stop` or `Length` terminal.
         // `ToolUse` would only surface as an `Ok` terminal via the
-        // `should_stop_after_turn` hook, which no sub-agent installs. If one
+        // `should_stop_after_round` hook, which no sub-agent installs. If one
         // ever did, this `_ => Completed` and replay's `ToolUse -> Failed`
         // (which reads a `ToolUse` terminal as an interrupted run) would
         // disagree, so a sub-agent must not install that hook.
@@ -1334,18 +1470,16 @@ impl Agent {
         })
     }
 
-    /// Execute one assistant-message turn against the in-memory
+    /// Execute the rounds of one turn against the in-memory
     /// transcript: run inference, process any tool calls, append
-    /// each result, loop until the assistant produces a non-tool
-    /// turn.
+    /// each result, loop until the assistant responds without tool
+    /// calls.
     ///
     /// The turn's writes (assistant message, per-tool user
     /// outputs, tool-result user message) flow out as
     /// [`AgentEvent::MessageEnd`] events. The persistence
     /// listener subscribed on the bus translates them into
-    /// `aj-session` log appends, one JSONL line per
-    /// event, so the on-disk state stays at-most one event behind
-    /// reality.
+    /// `aj-session` log appends, one committed record per event.
     ///
     /// Cancellation is honoured at three checkpoints:
     ///
@@ -1377,18 +1511,18 @@ impl Agent {
         let mut retry_attempt: u32 = 0;
         let mut retry_strategy = None;
 
-        // A turn is one inference plus the tool batch it triggers,
-        // bracketed by `TurnStart` / `TurnEnd`. A transient-error
-        // retry re-enters the loop for the *same* turn, so it must not
-        // re-emit `TurnStart`: `retrying` is set on the retry path and
-        // suppresses the emit on that one re-entry. A fresh turn (the
+        // A round is one inference plus the tool batch it triggers,
+        // bracketed by `RoundStart` / `RoundEnd`. A transient-error
+        // retry re-enters the loop for the *same* round, so it must not
+        // re-emit `RoundStart`: `retrying` is set on the retry path and
+        // suppresses the emit on that one re-entry. A fresh round (the
         // first, or a tool-continuation) emits it.
         let mut retrying = false;
 
         'outer: loop {
             self.check_code_mode_store()?;
             // Pre-iteration cancel check (cheap atomic). Lets us
-            // skip an inference when cancel fired between turns
+            // skip an inference when cancel fired between rounds
             // (e.g. while we were in the tool batch below).
             if self.cancellation.is_cancelled() {
                 return Err(TurnError::Aborted);
@@ -1396,7 +1530,7 @@ impl Agent {
 
             if !retrying {
                 self.bus
-                    .emit(AgentEvent::TurnStart {
+                    .emit(AgentEvent::RoundStart {
                         agent_id: self.agent_id,
                     })
                     .await
@@ -1503,7 +1637,7 @@ impl Agent {
                         // Forward the provider event as a `MessageUpdate` on
                         // the bus. Renderers consume the inner
                         // `AssistantMessageEvent` directly (drives text /
-                        // thinking / tool-call blocks); persistence listeners
+                        // thinking / tool-call blocks); the journal
                         // can ignore these since the finalized
                         // `MessageEnd` event below carries the finalized
                         // after the stream terminates.
@@ -1565,7 +1699,7 @@ impl Agent {
             drop(response_stream);
 
             // Emit `MessageEnd` so renderers can finalize their
-            // assistant slot (close in-flight blocks, mark the turn
+            // assistant slot (close in-flight blocks, mark the message
             // complete). Fires for success, error, and abort
             // terminations alike; the abort branches below consume
             // the message before the retry/recoverable handling.
@@ -1591,7 +1725,7 @@ impl Agent {
                 // 5) drops `stop_reason == Aborted` assistant
                 // messages — and their orphaned `tool_call` IDs —
                 // before sending the next inference, so the model
-                // never sees the half-formed turn.
+                // never sees the half-formed response.
                 self.transcript
                     .push(AgentMessage::wire(Message::Assistant(final_message)));
                 return Err(TurnError::Aborted);
@@ -1615,8 +1749,8 @@ impl Agent {
                 }
                 // Auto-retry the transport-transient categories with
                 // backoff. `Transient` covers a stream that dropped
-                // before its terminal frame (a truncated turn):
-                // retrying re-issues the turn instead of surfacing a
+                // before its terminal frame (a truncated response):
+                // retrying re-issues the request instead of surfacing a
                 // cut-off answer as final.
                 // `Overloaded` (provider 529/503) retries for the same
                 // reason. `RateLimit` is also retryable but
@@ -1681,7 +1815,7 @@ impl Agent {
 
             self.check_code_mode_store()?;
             let response = final_message;
-            let turn_usage = response.usage.clone();
+            let round_usage = response.usage.clone();
 
             // Collect tool calls off the finalized assistant
             // content.
@@ -1709,15 +1843,14 @@ impl Agent {
             self.transcript
                 .push(AgentMessage::wire(Message::Assistant(response.clone())));
 
-            self.account_usage(&turn_usage, UsageAccounting::AssistantTerminal)
-                .await?;
+            self.account_usage(&round_usage).await?;
 
             // Execute tool calls if any
             if has_tool_use {
                 // Partition the batch into contiguous concurrency
                 // groups and run each group through a bounded pool.
                 // `Sequential` tools (file edits) are singleton
-                // barrier groups; a contiguous run of `Parallel` tools
+                // barrier groups; a contiguous sequence of `Parallel` tools
                 // becomes one group that runs concurrently. Groups run
                 // one at a time and each is fully finalized before the
                 // next starts, so a `Sequential` tool never overlaps
@@ -1731,11 +1864,11 @@ impl Agent {
                 });
 
                 let mut aborted = false;
-                // This turn's tool results, collected in call order for
-                // the `TurnEnd` payload below. Only the non-aborted
-                // path reaches `TurnEnd`, so the cancelled-drain branch
+                // This round's tool results, collected in call order for
+                // the `RoundEnd` payload below. Only the non-aborted
+                // path reaches `RoundEnd`, so the cancelled-drain branch
                 // doesn't bother collecting.
-                let mut turn_tool_results: Vec<ToolResultMessage> = Vec::new();
+                let mut round_tool_results: Vec<ToolResultMessage> = Vec::new();
                 for group in groups {
                     if aborted {
                         // An earlier group was cancelled. Synthesize
@@ -1788,11 +1921,11 @@ impl Agent {
                             outcome,
                             aborted: call_aborted,
                         } = result?;
+                        aborted = aborted || call_aborted;
                         let tool_result = self
                             .finalize_tool_result(&call_id, &tool_name, outcome)
                             .await?;
-                        turn_tool_results.push(tool_result);
-                        aborted = aborted || call_aborted;
+                        round_tool_results.push(tool_result);
                     }
                 }
 
@@ -1802,31 +1935,31 @@ impl Agent {
 
                 // Waiting must not suppress the inference that receives sibling
                 // results. Clear a mixed-batch request before any stop hook can
-                // end the run, so it cannot label that end or affect later steps.
-                if turn_tool_results.len() != 1 {
+                // end the turn, so it cannot label that end or affect later steps.
+                if round_tool_results.len() != 1 {
                     self.session_state.lock().wait_requested = false;
                 }
 
-                // The turn (this inference plus its tool batch) is
-                // complete. `TurnEnd` carries the finalized assistant
+                // The round (this inference plus its tool batch) is
+                // complete. `RoundEnd` carries the finalized assistant
                 // message and the batch's tool results. The
                 // should-stop hook below runs after it, mirroring the
                 // documented ordering.
                 self.bus
-                    .emit(AgentEvent::TurnEnd {
+                    .emit(AgentEvent::RoundEnd {
                         agent_id: self.agent_id,
                         message: response,
-                        tool_results: turn_tool_results,
+                        tool_results: round_tool_results,
                     })
                     .await
                     .map_err(TurnError::Fatal)?;
 
-                // Consult the should-stop-after-turn hook (if
+                // Consult the should-stop-after-round hook (if
                 // installed). Returning `true` ends the turn here
                 // with no follow-up inference, even though tool
                 // calls completed successfully. Typical use:
                 // context-window guards, per-turn budget caps.
-                if let Some(hook) = self.should_stop_after_turn.clone() {
+                if let Some(hook) = self.should_stop_after_round.clone() {
                     if hook().await {
                         break;
                     }
@@ -1845,7 +1978,7 @@ impl Agent {
                     return Err(TurnError::Aborted);
                 }
 
-                // Notices that arrived while the tool batch ran reach
+                // Notifications that arrived while the tool batch ran reach
                 // the model immediately before the next inference
                 // step.
                 self.drain_task_notices().await?;
@@ -1858,17 +1991,17 @@ impl Agent {
                 self.drain_context().await?;
                 self.drain_queued_messages(PendingKind::Steering).await?;
 
-                // Continue the conversation loop to get the model's
+                // Continue the round loop to get the model's
                 // response to tool results.
                 continue;
             } else {
                 // We are now ready to finish this turn. Every message
                 // event that belongs to it has already been emitted
-                // individually; there is no per-turn save. `TurnEnd`
-                // closes the turn with the finalized assistant message
-                // and no tool results (this turn called none).
+                // individually; there is no per-turn save. `RoundEnd`
+                // closes the round with the finalized assistant message
+                // and no tool results (this round called none).
                 self.bus
-                    .emit(AgentEvent::TurnEnd {
+                    .emit(AgentEvent::RoundEnd {
                         agent_id: self.agent_id,
                         message: response,
                         tool_results: Vec::new(),
@@ -1882,10 +2015,10 @@ impl Agent {
         Ok(())
     }
 
-    /// Drain this agent's queued task-completion notices into the
+    /// Drain this agent's queued task-task notifications into the
     /// transcript.
     ///
-    /// Each notice becomes one typed
+    /// Each notification becomes one typed
     /// [`AgentMessageKind::TaskNotification`] entry, emitted with the
     /// same `MessageStart` / `MessageEnd` pair the prompt path uses so
     /// it persists and renders like any other message. Only when the
@@ -1901,38 +2034,8 @@ impl Agent {
                     .await?;
             }
         }
-        let notices = self.task_registry.drain_notices(self.agent_id);
-        for notice in notices {
-            let kind = match &notice.kind {
-                TaskKind::Bash { .. } => TaskNotificationKind::Bash,
-                TaskKind::Agent { .. } => TaskNotificationKind::Agent,
-                TaskKind::CodeMode { .. } => TaskNotificationKind::CodeMode,
-            };
-            let outcome = task_outcome(kind, notice.status);
-            let message = AgentMessage::task_notification(TaskNotification::new(
-                notice.label,
-                kind,
-                outcome,
-                // Store the exact model-facing text: trimming the
-                // trailing whitespace here keeps the projected framing
-                // byte-identical to the pre-typed tagged string.
-                notice.body.trim_end().to_string(),
-            ));
-            self.transcript.push(message.clone());
-            self.bus
-                .emit(AgentEvent::MessageStart {
-                    agent_id: self.agent_id,
-                    message: message.clone(),
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
-            self.bus
-                .emit(AgentEvent::MessageEnd {
-                    agent_id: self.agent_id,
-                    message,
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
+        for message in self.task_registry.drain_notice_messages(self.agent_id) {
+            self.record_input(message).await?;
         }
         Ok(())
     }
@@ -1945,9 +2048,12 @@ impl Agent {
         Ok(())
     }
 
+    /// Publish `message` and then take it into the transcript.
+    ///
+    /// The journal commits the message on `MessageEnd` and fails
+    /// the emit when it cannot, so the transcript only ever holds what was
+    /// stored. An assistant message follows the same order.
     async fn record_input(&mut self, message: AgentMessage) -> Result<(), TurnError> {
-        // Transcript ownership precedes publication to renderers and persistence.
-        self.transcript.push(message.clone());
         self.bus
             .emit(AgentEvent::MessageStart {
                 agent_id: self.agent_id,
@@ -1958,10 +2064,12 @@ impl Agent {
         self.bus
             .emit(AgentEvent::MessageEnd {
                 agent_id: self.agent_id,
-                message,
+                message: message.clone(),
             })
             .await
-            .map_err(TurnError::Fatal)
+            .map_err(TurnError::Fatal)?;
+        self.transcript.push(message);
+        Ok(())
     }
 
     /// Drain `kind`'s queued messages for this agent into the
@@ -1973,30 +2081,17 @@ impl Agent {
     /// messages with no `<task-notification>` wrapper: the user typed
     /// them while the agent was busy, so they read like any prompt.
     async fn drain_queued_messages(&mut self, kind: PendingKind) -> Result<bool, TurnError> {
-        let texts = match kind {
+        let inputs = match kind {
             PendingKind::Steering => self.message_queues.drain_steering(self.agent_id),
             PendingKind::FollowUp => self.message_queues.drain_follow_up(self.agent_id),
         };
-        if texts.is_empty() {
+        if inputs.is_empty() {
             return Ok(false);
         }
-        for text in texts {
-            let message = AgentMessage::wire(Message::User(UserMessage::text(text)));
-            self.transcript.push(message.clone());
-            self.bus
-                .emit(AgentEvent::MessageStart {
-                    agent_id: self.agent_id,
-                    message: message.clone(),
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
-            self.bus
-                .emit(AgentEvent::MessageEnd {
-                    agent_id: self.agent_id,
-                    message,
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
+        for input in inputs {
+            // The message keeps the queued input's id, which is what lets a
+            // session store retire its saved copy with this append.
+            self.record_input(input.into_message()).await?;
         }
         // Announce the post-drain queue state so view listeners can
         // clear the pending-message box. Renderers re-read the handle
@@ -2024,7 +2119,7 @@ impl Agent {
     /// outcome was produced.
     ///
     /// Returns the projected [`ToolResultMessage`] so the caller can
-    /// collect a turn's results for its `TurnEnd` payload.
+    /// collect a round's results for its `RoundEnd` payload.
     async fn finalize_tool_result(
         &mut self,
         tool_id: &str,
@@ -2039,8 +2134,7 @@ impl Agent {
         // on the [`ToolResultMessage`] we append to the transcript
         // and emit through `MessageEnd` (for resumed sessions and
         // persistence). The latter is serialized via
-        // `serde_json::to_value` so it survives the on-disk JSONL
-        // round-trip.
+        // `serde_json::to_value` so it survives being stored.
         let details_value = serde_json::to_value(&outcome.details).ok();
         // Snapshot the wire content as an `Arc<[UserContent]>` for the
         // `ToolExecutionEnd` event; cloning the Arc is O(1) and keeps
@@ -2055,22 +2149,8 @@ impl Agent {
             is_error: outcome.is_error,
             timestamp: 0,
         };
-        let tool_result_message = AgentMessage::wire(Message::ToolResult(tool_result.clone()));
-        self.transcript.push(tool_result_message.clone());
-        self.bus
-            .emit(AgentEvent::MessageStart {
-                agent_id: self.agent_id,
-                message: tool_result_message.clone(),
-            })
-            .await
-            .map_err(TurnError::Fatal)?;
-        self.bus
-            .emit(AgentEvent::MessageEnd {
-                agent_id: self.agent_id,
-                message: tool_result_message,
-            })
-            .await
-            .map_err(TurnError::Fatal)?;
+        self.record_input(AgentMessage::wire(Message::ToolResult(tool_result.clone())))
+            .await?;
 
         self.bus
             .emit(AgentEvent::ToolExecutionEnd {
@@ -2279,6 +2359,123 @@ impl Agent {
     }
 }
 
+/// What a session's sub-agents share with the agent that spawns them: its
+/// event bus, working directory and environment overlay, task registry and
+/// message queues. Clones share all of it.
+///
+/// The `agent` and `oracle` tools build a sub-agent through this inside a
+/// tool call. A host takes one from its main agent
+/// ([`Agent::sub_agent_builder`]) to build a sub-agent outside one, as when
+/// it picks a stored run up again.
+#[derive(Clone)]
+pub struct SubAgentBuilder {
+    /// The parent's. A sub-agent takes the working directory and shares the
+    /// environment overlay, and keeps bookkeeping of its own.
+    session_state: SessionState,
+    bus: EventBus,
+    task_registry: TaskRegistry,
+    message_queues: MessageQueues,
+}
+
+/// What one sub-agent is built from.
+pub struct SubAgentConfig {
+    /// The `n` of its [`AgentId::Sub`].
+    pub agent_id: usize,
+    /// Its model, settings, tools and prompt suffix. The prompt-cache key
+    /// in `stream_options` is the session's, and the builder scopes it to
+    /// the sub-agent ([`sub_agent_session_id`]). The goal and wait tools
+    /// are the main agent's and are left out.
+    pub bundle: tool::SpawnAgentConfig,
+    /// Whether the names of `bundle.tools` stay a ceiling for every tool
+    /// catalog the sub-agent is given later ([`Agent::set_tools`]).
+    pub restrict_tools: bool,
+    /// The session's assembled system prompt, which the suffix follows.
+    pub system_prompt: String,
+    pub disabled_tools: Vec<String>,
+    pub block_images: bool,
+    pub code_mode: bool,
+    /// The run a sub-agent continues: its transcript and committed Code
+    /// Mode values. Both empty for a new one.
+    pub transcript: Vec<AgentMessage>,
+    pub code_mode_store: BTreeMap<String, serde_json::Value>,
+}
+
+impl SubAgentBuilder {
+    /// Build the sub-agent `config` describes. It emits on the shared bus
+    /// as `Sub(agent_id)`, owns its tasks and queue slots under that id,
+    /// and holds a cancellation token nothing fires: the caller installs
+    /// the one its run belongs to. The caller also retains it
+    /// ([`SubAgentRegistry`]).
+    pub fn build(&self, config: SubAgentConfig) -> Agent {
+        let SubAgentConfig {
+            agent_id,
+            bundle,
+            restrict_tools,
+            system_prompt,
+            disabled_tools,
+            block_images,
+            code_mode,
+            transcript,
+            code_mode_store,
+        } = config;
+        let allowed_tool_names =
+            restrict_tools.then(|| bundle.tools.iter().map(|tool| tool.name.clone()).collect());
+        let mut tools = bundle.tools;
+        tools.retain(|tool| {
+            !matches!(
+                tool.name.as_str(),
+                "create_goal" | "get_goal" | "update_goal" | "wait"
+            )
+        });
+        // Scoping the cache key keeps the sub-agent's distinct prefix from
+        // colliding with the main thread's or a sibling's. A bundle without
+        // a key (a provider that does not key caching on it) leaves the
+        // sub-agent without one too.
+        let mut stream_options = bundle.stream_options;
+        if let Some(base) = stream_options.session_id.as_deref() {
+            stream_options.session_id = Some(sub_agent_session_id(base, agent_id));
+        }
+        let mut agent = Agent::with_provider(
+            self.session_state.working_directory(),
+            tools,
+            disabled_tools,
+            bundle.provider,
+            bundle.model_info,
+            stream_options,
+            None,
+        );
+        agent.allowed_tool_names = allowed_tool_names;
+        agent.set_agent_id(AgentId::Sub(agent_id));
+        agent.seed_session(AgentSeed {
+            transcript,
+            assembled_system_prompt: Some(format!(
+                "{system_prompt}{}",
+                bundle.system_prompt_suffix
+            )),
+            // A sub-agent spawns none of its own.
+            sub_agent_counter: 0,
+            code_mode_store,
+        });
+        agent.set_block_images(block_images);
+        // Tool subshells read the session's overlay through the sub-agent's
+        // own context, and a later change to it reaches them.
+        agent.session_state.session_env = Arc::clone(&self.session_state.session_env);
+        agent.set_default_thinking(bundle.thinking);
+        agent.set_speed(bundle.speed);
+        agent.set_code_mode(code_mode);
+        // Tasks the sub-agent starts land in the map the host observes,
+        // with notifications scoped to its own id.
+        agent.set_task_registry(self.task_registry.clone());
+        // The user steers or queues for this sub-agent from its view, and
+        // it drains its own `Sub(n)`-keyed slots.
+        agent.set_message_queues(self.message_queues.clone());
+        // Every event the sub-agent emits reaches the listeners registered
+        // on its parent (rendering, persistence), tagged with `Sub(n)`.
+        agent.set_bus(self.bus.clone());
+        agent
+    }
+}
+
 /// A live, re-promptable agent handle shared between the runtime and
 /// the binary. Wrapping in a `tokio::sync::Mutex` lets a turn lock the
 /// agent across `.await` points while other agents run concurrently.
@@ -2292,8 +2489,9 @@ pub type SharedAgent = Arc<tokio::sync::Mutex<Agent>>;
 /// `tokio::sync::Mutex` is what callers lock to drive a turn.
 ///
 /// The binary injects one instance onto the main agent so both share
-/// the same map: the main agent inserts each sub-agent on spawn and the
-/// binary resolves handles to drive continuations. Sub-agents never set
+/// the same map: the main agent inserts each sub-agent on spawn, the
+/// binary inserts the ones it builds from a stored run, and it resolves
+/// handles to drive continuations. Sub-agents never set
 /// one — they can't spawn, since the `agent` tool is filtered out of
 /// their toolset. Callers that never inject one (print mode, tests) get
 /// the default-empty registry; retained sub-agents then live for the
@@ -2309,8 +2507,9 @@ struct RetainedAgent {
 }
 
 impl SubAgentRegistry {
-    /// Retain `agent` under key `n`. `Sub(n)` indices are minted
-    /// monotonically per session, so each key is inserted exactly once.
+    /// Retain `agent` under key `n`, with no foreground assignment. For a
+    /// host that built the agent from a stored run. A handle already
+    /// retained under `n` is replaced.
     pub fn insert(&self, n: usize, agent: SharedAgent) {
         self.inner.lock().expect("registry mutex poisoned").insert(
             n,
@@ -2350,14 +2549,12 @@ impl SubAgentRegistry {
             .collect()
     }
 
-    /// Drop every retained handle, so no `Sub(n)` of the work this registry
-    /// tracked is promptable any more.
+    /// Drop every retained handle.
     ///
-    /// For a host that moves a session's head to another branch: the
-    /// sub-agents of the branch it left must not stay addressable, or a
-    /// prompt to one would grow that branch under the new head's epoch.
-    /// Ids are minted per session and never reused, so a cleared registry
-    /// cannot be repopulated with an id it once held.
+    /// For a host that moves a session's head to another branch: a
+    /// sub-agent the new branch does not show must not stay addressable,
+    /// or a prompt to one would grow the branch that was left. The host
+    /// retains a sub-agent again when it builds it from its stored run.
     pub fn clear(&self) {
         self.inner.lock().expect("registry mutex poisoned").clear();
     }
@@ -2381,6 +2578,17 @@ struct TaskEntry {
     /// flips the status via [`TaskRegistry::finish`].
     cancel: CancellationToken,
     output: Arc<dyn TaskOutputSource>,
+    /// Whether [`TaskRegistry::kill`] asked for this task to be stopped.
+    /// Set before the token is cancelled, so a driver that sees the token
+    /// fire can tell a stop from the registry letting go.
+    kill_requested: bool,
+    /// Whether the session's [`TaskStore`] holds the task (see
+    /// [`TaskRegistry::record`]). A recorded task belongs to its record,
+    /// not to this registry.
+    recorded: bool,
+    /// The id of the task's task notification, once its loss was
+    /// announced (see [`TaskRegistry::announce_loss`]).
+    notice_id: Option<String>,
 }
 
 /// Display snapshot of one task, for the picker and the footer.
@@ -2388,7 +2596,7 @@ struct TaskEntry {
 pub struct TaskSummary {
     /// Task id.
     pub id: TaskId,
-    /// Agent that owns the task and receives its notices.
+    /// Agent that owns the task and receives its notifications.
     pub owner: AgentId,
     /// Tool call that launched the task, which is how its output finds
     /// the cell that started it.
@@ -2406,20 +2614,56 @@ pub struct TaskSummary {
 /// Outcome of [`Agent::wake`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeOutcome {
-    /// The notice queue was empty; nothing ran and no events were
+    /// The notification queue was empty; nothing ran and no events were
     /// emitted.
     Empty,
-    /// Queued notices were drained into the transcript and a turn ran
+    /// Queued notifications were drained into the transcript and a turn ran
     /// against them.
     Ran,
+}
+
+/// A task that outlives the process, as a [`TaskStore`] records it.
+#[derive(Clone, Debug)]
+pub struct RecordedTask {
+    pub id: TaskId,
+    /// The agent that started the work and receives its notification.
+    pub owner: AgentId,
+    /// The tool call that launched the work.
+    pub call_id: String,
+    pub label: String,
+    /// What the tool needs to find the work again in a later process.
+    /// Opaque here.
+    pub state: serde_json::Value,
+}
+
+/// A session's durable record of background tasks. Its methods run on the
+/// calling task's thread and must not block long.
+pub trait TaskStore: Send + Sync {
+    /// Note that task id `id` is taken, so that a later process does not
+    /// mint it again.
+    fn minted(&self, id: TaskId) -> Result<(), BoxError>;
+
+    /// Record a running task that outlives this process. On an error
+    /// nothing is recorded.
+    fn record(&self, task: &RecordedTask) -> Result<(), BoxError>;
+
+    /// Save `notice` for `owner` and drop task `id`'s record, if it has
+    /// one, as one step. On an error neither happened.
+    fn finish(&self, id: TaskId, owner: AgentId, notice: &AgentMessage) -> Result<(), BoxError>;
 }
 
 #[derive(Default)]
 struct TaskRegistryInner {
     entries: BTreeMap<TaskId, TaskEntry>,
-    /// Per-owner completion-notice queues, drained by the owning
+    /// Per-owner task-notification queues, drained by the owning
     /// agent at its drain points in arrival order.
-    notices: HashMap<AgentId, VecDeque<TaskNotice>>,
+    ///
+    /// Each notification is queued as the transcript message it will be delivered
+    /// as, so its id is fixed from the moment the task finishes. The typed
+    /// notification is absent for one restored from a previous process.
+    notices: HashMap<AgentId, VecDeque<(AgentMessage, Option<TaskNotice>)>>,
+    /// Where tasks and their notifications are saved, so they outlive the process.
+    store: Option<Arc<dyn TaskStore>>,
     /// Last minted task id; ids start at 1 and are monotonic per
     /// session.
     last_id: TaskId,
@@ -2453,8 +2697,10 @@ struct TaskDriver {
 /// Cheaply cloneable; all clones share one map. The inner mutex guards
 /// short map operations only and is never held across `.await`. Task
 /// cancel tokens are children of `root_cancel`, which is
-/// session-scoped: the binary cancels it on shutdown so background
-/// tasks survive turn end but not process exit.
+/// session-scoped: the binary cancels it on shutdown, so a background
+/// task survives turn end and its driver does not survive the session.
+/// A task the session's [`TaskStore`] recorded keeps running without its
+/// driver (see [`TaskRegistry::record`]). Every other task ends with it.
 #[derive(Clone, Default)]
 pub struct TaskRegistry {
     inner: Arc<StdMutex<TaskRegistryInner>>,
@@ -2489,6 +2735,20 @@ impl TaskDriverRegistration {
             driver.await;
         });
         registry.arm_driver(task_id, handle.abort_handle());
+    }
+}
+
+impl TaskDriverRegistration {
+    /// Give up a task whose launch failed before anyone was told of it.
+    /// The registry forgets the entry. Its id stays used.
+    pub fn abandon(self) {
+        let mut inner = self
+            .registry
+            .inner
+            .lock()
+            .expect("task registry mutex poisoned");
+        inner.entries.remove(&self.task_id);
+        // Dropping `self` settles the driver record.
     }
 }
 
@@ -2547,9 +2807,99 @@ impl TaskRegistry {
         output: Arc<dyn TaskOutputSource>,
     ) -> (TaskId, CancellationToken) {
         let cancel = self.root_cancel.child_token();
+        let (id, store) = {
+            let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            inner.last_id += 1;
+            let id = inner.last_id;
+            inner.entries.insert(
+                id,
+                TaskEntry {
+                    owner,
+                    call_id,
+                    kind,
+                    label,
+                    status: TaskStatus::Running,
+                    started_at: Instant::now(),
+                    cancel: cancel.clone(),
+                    output,
+                    kill_requested: false,
+                    recorded: false,
+                    notice_id: None,
+                },
+            );
+            (id, inner.store.clone())
+        };
+        // A task that is recorded saves its id with its record. For the
+        // others this is the only save, and a later process could mint the
+        // id again if it fails.
+        if let Some(store) = store
+            && let Err(error) = store.minted(id)
+        {
+            tracing::warn!(task_id = id, "could not save a minted task id: {error}");
+        }
+        (id, cancel)
+    }
+
+    /// Start minting ids above `last`, the highest id an earlier process
+    /// of this session minted.
+    pub fn seed_last_id(&self, last: TaskId) {
         let mut inner = self.inner.lock().expect("task registry mutex poisoned");
-        inner.last_id += 1;
-        let id = inner.last_id;
+        inner.last_id = inner.last_id.max(last);
+    }
+
+    /// Save task `id` in the session's [`TaskStore`], with the `state` its
+    /// tool needs to find the work again. `Ok(true)` means the task is
+    /// recorded. From then on it belongs to its record: only
+    /// [`Self::kill`] stops it, and [`Self::shutdown`] ends its driver and
+    /// leaves the work running. `Ok(false)` means the session has no store, and the task
+    /// ends with this registry. On an error nothing is recorded.
+    pub fn record(&self, id: TaskId, state: serde_json::Value) -> Result<bool, BoxError> {
+        let (store, task) = {
+            let inner = self.inner.lock().expect("task registry mutex poisoned");
+            let Some(store) = inner.store.clone() else {
+                return Ok(false);
+            };
+            let entry = inner.entries.get(&id).ok_or("no such background task")?;
+            let task = RecordedTask {
+                id,
+                owner: entry.owner,
+                call_id: entry.call_id.clone(),
+                label: entry.label.clone(),
+                state,
+            };
+            (store, task)
+        };
+        store.record(&task)?;
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        if let Some(entry) = inner.entries.get_mut(&id) {
+            entry.recorded = true;
+        }
+        Ok(true)
+    }
+
+    /// Register the driver of a task an earlier registry recorded, under
+    /// the id it has. The task started `running_for` ago. `None` when this
+    /// registry already tracks that id.
+    ///
+    /// The registration is consumed as [`Self::register_driver`]'s is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_driver(
+        &self,
+        id: TaskId,
+        owner: AgentId,
+        call_id: String,
+        kind: TaskKind,
+        label: String,
+        running_for: Duration,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> Option<(CancellationToken, TaskDriverRegistration)> {
+        let now = Instant::now();
+        let cancel = self.root_cancel.child_token();
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        if inner.entries.contains_key(&id) {
+            return None;
+        }
+        inner.last_id = inner.last_id.max(id);
         inner.entries.insert(
             id,
             TaskEntry {
@@ -2558,12 +2908,29 @@ impl TaskRegistry {
                 kind,
                 label,
                 status: TaskStatus::Running,
-                started_at: Instant::now(),
+                started_at: now.checked_sub(running_for).unwrap_or(now),
                 cancel: cancel.clone(),
                 output,
+                kill_requested: false,
+                recorded: true,
+                notice_id: None,
             },
         );
-        (id, cancel)
+        inner.drivers.insert(
+            id,
+            TaskDriver {
+                abort: None,
+                force_abort: false,
+            },
+        );
+        drop(inner);
+        Some((
+            cancel,
+            TaskDriverRegistration {
+                registry: self.clone(),
+                task_id: id,
+            },
+        ))
     }
 
     /// Insert a synthetic task entry with no detached driver.
@@ -2640,13 +3007,19 @@ impl TaskRegistry {
         {
             let mut inner = self.inner.lock().expect("task registry mutex poisoned");
             inner.drivers.remove(&id);
-            if let Some(entry) = inner.entries.get_mut(&id)
-                && entry.status == TaskStatus::Running
-            {
+            match inner.entries.get_mut(&id) {
+                // The work goes on under its record. This registry only
+                // stops watching it, and a later one picks it up.
+                Some(entry) if entry.status == TaskStatus::Running && entry.recorded => {
+                    inner.entries.remove(&id);
+                }
                 // An aborted or panicked driver cannot publish its normal
                 // terminal event. The registry still must not report work as
                 // live after the task that owned it is gone.
-                entry.status = TaskStatus::Killed;
+                Some(entry) if entry.status == TaskStatus::Running => {
+                    entry.status = TaskStatus::Killed;
+                }
+                _ => {}
             }
         }
         self.status_changed.notify_waiters();
@@ -2668,9 +3041,10 @@ impl TaskRegistry {
     /// Cancel task `id`'s token. The driver observes the cancellation
     /// and flips the status. Returns `false` for unknown ids.
     pub fn kill(&self, id: TaskId) -> bool {
-        let inner = self.inner.lock().expect("task registry mutex poisoned");
-        match inner.entries.get(&id) {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        match inner.entries.get_mut(&id) {
             Some(entry) => {
+                entry.kill_requested = true;
                 entry.cancel.cancel();
                 true
             }
@@ -2678,10 +3052,21 @@ impl TaskRegistry {
         }
     }
 
+    /// Whether [`Self::kill`] was called for task `id`. The driver of a
+    /// recorded task reads this when its token fires: without a kill, the
+    /// registry is only letting go and the work keeps running.
+    pub fn kill_requested(&self, id: TaskId) -> bool {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner
+            .entries
+            .get(&id)
+            .is_some_and(|entry| entry.kill_requested)
+    }
+
     /// Record task `id`'s new status. No-op for unknown ids.
     ///
     /// A terminating driver goes through [`TaskRegistry::finish`]
-    /// instead, so its notice and its status flip land together.
+    /// instead, so its notification and its status flip land together.
     pub fn set_status(&self, id: TaskId, status: TaskStatus) {
         {
             let mut inner = self.inner.lock().expect("task registry mutex poisoned");
@@ -2692,32 +3077,105 @@ impl TaskRegistry {
         self.status_changed.notify_waiters();
     }
 
-    /// Terminate task `id`: queue `notice` and record `status` under a
-    /// single lock acquisition. No-op on the status for unknown ids,
-    /// the notice is queued regardless (it is keyed by owner, not by
-    /// task).
+    /// Save, before the work goes on, the notification task `id`'s owner gets if
+    /// this host ends before the task does. For a task that lives in the
+    /// host's memory, an agent run or a Code Mode cell: nothing else would
+    /// tell a later host that it existed.
     ///
-    /// The two mutations share the lock because the status flip is
-    /// what releases [`TaskRegistry::wait_terminal`] waiters, and a
-    /// released waiter must always find the notice already queued.
-    /// Otherwise a blocking read could return, its tool batch
-    /// finalize, and the post-batch notice drain run, all before the
-    /// notice existed, stranding it until the next drain point. Like
+    /// `lost` is saved under its own id, and the task's task notification
+    /// takes that id (see [`Self::save_end`]). So the notification the owner
+    /// gets is the announcement while the task is unfinished and its
+    /// completion from the moment that is saved, and never both. A later
+    /// host finds whichever is stored among the owner's pending work.
+    ///
+    /// On an error nothing is saved, and the caller does not start or
+    /// keep the work. A registry without a store saves nothing and
+    /// succeeds: its session is not one a later host opens.
+    pub fn announce_loss(&self, id: TaskId, lost: AgentMessage) -> Result<(), BoxError> {
+        let (store, owner) = {
+            let inner = self.inner.lock().expect("task registry mutex poisoned");
+            let entry = inner.entries.get(&id).ok_or("no such background task")?;
+            (inner.store.clone(), entry.owner)
+        };
+        if let Some(store) = store {
+            store.finish(id, owner, &lost)?;
+        }
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        if let Some(entry) = inner.entries.get_mut(&id) {
+            entry.notice_id = Some(lost.id().to_owned());
+        }
+        Ok(())
+    }
+
+    /// Commit the end of task `id`: save `notice` as the message it is
+    /// delivered as, in the step that removes the task's record or
+    /// replaces its announced loss. Returns that message, for
+    /// [`Self::publish_end`].
+    ///
+    /// On an error nothing has changed: the task still runs as far as the
+    /// store and this registry can tell, so the caller tries again or
+    /// leaves the task to a later host. Nothing is delivered from memory.
+    /// Without a store there is nothing to save.
+    pub fn save_end(&self, id: TaskId, notice: &TaskNotice) -> Result<AgentMessage, BoxError> {
+        let mut message = notice.to_message();
+        let store = {
+            let inner = self.inner.lock().expect("task registry mutex poisoned");
+            if let Some(notice_id) = inner.entries.get(&id).and_then(|e| e.notice_id.clone()) {
+                message.set_id(notice_id);
+            }
+            inner.store.clone()
+        };
+        if let Some(store) = store {
+            store.finish(id, notice.owner, &message)?;
+        }
+        Ok(message)
+    }
+
+    /// Queue the saved end of task `id` for its owner and record `status`.
+    /// `message` is what [`Self::save_end`] returned for `notice`. The
+    /// notification is queued regardless of whether the id is known (it is keyed
+    /// by owner, not by task).
+    ///
+    /// The queue and the status share one lock acquisition because the
+    /// status flip is what releases [`TaskRegistry::wait_terminal`]
+    /// waiters, and a released waiter must always find the notification already
+    /// queued. Otherwise a blocking read could return, its tool batch
+    /// finalize, and the post-batch notification drain run, all before the
+    /// notification existed, stranding it until the next drain point. Like
     /// [`TaskRegistry::set_status`] we notify only after dropping the
     /// lock so a woken waiter never contends on it.
-    pub fn finish(&self, id: TaskId, status: TaskStatus, notice: TaskNotice) {
+    pub fn publish_end(
+        &self,
+        id: TaskId,
+        status: TaskStatus,
+        notice: TaskNotice,
+        message: AgentMessage,
+    ) {
         {
             let mut inner = self.inner.lock().expect("task registry mutex poisoned");
             inner
                 .notices
                 .entry(notice.owner)
                 .or_default()
-                .push_back(notice);
+                .push_back((message, Some(notice)));
             if let Some(entry) = inner.entries.get_mut(&id) {
                 entry.status = status;
             }
         }
         self.status_changed.notify_waiters();
+    }
+
+    /// Terminate task `id`: [`Self::save_end`], then
+    /// [`Self::publish_end`]. On an error neither happened.
+    pub fn finish(
+        &self,
+        id: TaskId,
+        status: TaskStatus,
+        notice: TaskNotice,
+    ) -> Result<(), BoxError> {
+        let message = self.save_end(id, &notice)?;
+        self.publish_end(id, status, notice, message);
+        Ok(())
     }
 
     /// Current status of task `id`, `None` for unknown ids.
@@ -2808,49 +3266,71 @@ impl TaskRegistry {
             .collect()
     }
 
-    /// Forget every tracked task and every queued notice.
+    /// Forget every tracked task and every queued notification.
     ///
-    /// Contract: only valid when nothing is running. A host uses it when a
-    /// session's head moves to another branch, having refused the switch
-    /// while any task was live, so the entries it drops are all terminal and
-    /// belong to the branch being left. The minted-id counter is untouched,
-    /// so a later task cannot reuse an id a client still has output for.
+    /// Contract: only valid when no driver is running. A host uses it when
+    /// a session's head moves to another branch, having refused the switch
+    /// while a task was live or a notification undelivered, so the entries it
+    /// drops are all terminal and belong to the branch being left. The minted-id
+    /// counter is untouched, so a later task cannot reuse an id a client
+    /// still has output for.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().expect("task registry mutex poisoned");
         inner.entries.clear();
         inner.notices.clear();
     }
 
-    /// Queue a completion notice on its owner's queue.
+    /// Queue the task notification of a task this registry does not
+    /// track, without saving it. For fixtures: a task's own end goes
+    /// through [`Self::finish`].
     pub fn push_notice(&self, notice: TaskNotice) {
+        let message = notice.to_message();
+        self.publish_end(notice.task_id, notice.status, notice, message);
+    }
+
+    /// Install the session's [`TaskStore`].
+    pub fn set_store(&self, store: Arc<dyn TaskStore>) {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.store = Some(store);
+    }
+
+    /// Queue a notification a previous process saved but never delivered. It is
+    /// delivered under the id it was saved with, and is not saved again.
+    pub fn restore_notice(&self, owner: AgentId, message: AgentMessage) {
         let mut inner = self.inner.lock().expect("task registry mutex poisoned");
         inner
             .notices
-            .entry(notice.owner)
+            .entry(owner)
             .or_default()
-            .push_back(notice);
+            .push_back((message, None));
     }
 
-    /// Take all queued notices for `owner`, in arrival order.
+    /// Take all queued notifications for `owner` as their delivery messages, in
+    /// arrival order. The owning agent's drain point.
+    pub fn drain_notice_messages(&self, owner: AgentId) -> Vec<AgentMessage> {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        let queue = inner.notices.remove(&owner).unwrap_or_default();
+        queue.into_iter().map(|(message, _)| message).collect()
+    }
+
+    /// Take all queued notifications for `owner` in their typed form, in arrival
+    /// order. Restored notifications have none and are dropped.
     pub fn drain_notices(&self, owner: AgentId) -> Vec<TaskNotice> {
         let mut inner = self.inner.lock().expect("task registry mutex poisoned");
-        inner
-            .notices
-            .remove(&owner)
-            .map(Vec::from)
-            .unwrap_or_default()
+        let queue = inner.notices.remove(&owner).unwrap_or_default();
+        queue.into_iter().filter_map(|(_, notice)| notice).collect()
     }
 
-    /// Whether `owner` has notices queued. The binary's wake triggers
+    /// Whether `owner` has notifications queued. The binary's wake triggers
     /// poll this.
     pub fn has_notices(&self, owner: AgentId) -> bool {
         let inner = self.inner.lock().expect("task registry mutex poisoned");
         inner.notices.get(&owner).is_some_and(|q| !q.is_empty())
     }
 
-    /// Whether any agent has an undelivered task-completion notice.
+    /// Whether any agent has an undelivered task-task notification.
     ///
-    /// A notice lives only here until the agent it belongs to runs again, so a
+    /// A notification lives only here until the agent it belongs to runs again, so a
     /// caller about to drop the registry has to ask: dropping it would discard
     /// a completion the model never saw.
     pub fn has_any_notices(&self) -> bool {
@@ -2858,7 +3338,7 @@ impl TaskRegistry {
         inner.notices.values().any(|queue| !queue.is_empty())
     }
 
-    /// How many notices are queued for `owner`, 0 when it has none.
+    /// How many notifications are queued for `owner`, 0 when it has none.
     /// A frontend polls this to show that finished tasks are waiting
     /// to be delivered.
     pub fn pending_notices(&self, owner: AgentId) -> usize {
@@ -2932,7 +3412,7 @@ impl TaskRegistry {
     /// Used after [`TaskRegistry::abort_drivers`]. Tokio task abortion is
     /// cooperative at await points, while process-owning drivers finish through
     /// their cancellation path. Returning before this barrier would let a
-    /// snapshotted persistence listener or child process outlive its session
+    /// snapshotted journal or child process outlive its session
     /// lock.
     pub async fn wait_for_quiescence(&self) {
         loop {
@@ -2953,7 +3433,7 @@ impl TaskRegistry {
 }
 
 /// Session-scoped state read and mutated by tool calls through
-/// [`ToolContext`], plus the run loop's own turn / usage bookkeeping.
+/// [`ToolContext`], plus the agent loop's own turn / usage bookkeeping.
 ///
 /// A cheaply-cloneable handle over one shared inner, mirroring
 /// [`TaskRegistry`] / [`SubAgentRegistry`] / [`MessageQueues`]: clones
@@ -3264,6 +3744,271 @@ mod task_registry_tests {
         assert_eq!(old, 1, "the fixture really staged an older entry");
     }
 
+    /// A [`TaskStore`] that keeps what it is given and can be made to
+    /// refuse.
+    #[derive(Default)]
+    struct MemoryStore {
+        refuse: std::sync::atomic::AtomicBool,
+        minted: std::sync::Mutex<Vec<TaskId>>,
+        recorded: std::sync::Mutex<Vec<TaskId>>,
+        notices: std::sync::Mutex<Vec<(TaskId, AgentMessage)>>,
+        probe: std::sync::Mutex<Option<TaskRegistry>>,
+    }
+
+    impl MemoryStore {
+        fn refused(&self) -> Result<(), crate::BoxError> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("injected store failure".into());
+            }
+            Ok(())
+        }
+    }
+
+    impl super::TaskStore for MemoryStore {
+        fn minted(&self, id: TaskId) -> Result<(), crate::BoxError> {
+            self.minted.lock().unwrap().push(id);
+            Ok(())
+        }
+
+        fn record(&self, task: &super::RecordedTask) -> Result<(), crate::BoxError> {
+            self.refused()?;
+            self.recorded.lock().unwrap().push(task.id);
+            Ok(())
+        }
+
+        fn finish(
+            &self,
+            id: TaskId,
+            owner: AgentId,
+            notice: &AgentMessage,
+        ) -> Result<(), crate::BoxError> {
+            self.refused()?;
+            if let Some(probe) = &*self.probe.lock().unwrap() {
+                assert!(!probe.has_notices(owner), "saved before it is visible");
+            }
+            self.recorded.lock().unwrap().retain(|task| *task != id);
+            self.notices.lock().unwrap().push((id, notice.clone()));
+            Ok(())
+        }
+    }
+
+    use crate::message::AgentMessage;
+    use crate::tool::TaskId;
+
+    #[test]
+    fn a_notice_is_saved_before_it_is_queued_and_delivered_under_the_saved_id() {
+        let registry = TaskRegistry::default();
+        let store = Arc::new(MemoryStore::default());
+        *store.probe.lock().unwrap() = Some(registry.clone());
+        registry.set_store(Arc::<MemoryStore>::clone(&store));
+        let (id, _) = register(&registry, AgentId::Main, "make");
+        let ended = TaskStatus::Exited(Some(0));
+        registry
+            .finish(id, ended, notice(AgentId::Main, id, "done"))
+            .expect("finish");
+        *store.probe.lock().unwrap() = None;
+        let (_, saved) = store.notices.lock().unwrap().remove(0);
+
+        // What a restart restores is delivered as that same message.
+        let restarted = TaskRegistry::default();
+        restarted.restore_notice(AgentId::Main, saved.clone());
+        for registry in [&registry, &restarted] {
+            assert_eq!(registry.pending_notices(AgentId::Main), 1);
+            let delivered = registry.drain_notice_messages(AgentId::Main);
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].id(), saved.id());
+        }
+    }
+
+    /// A recorded task whose end cannot be saved has not ended: it stays
+    /// running and recorded, and no notification is delivered from memory, so
+    /// the record is still the one account of it.
+    #[test]
+    fn a_recorded_task_does_not_finish_unless_its_end_is_saved() {
+        let registry = TaskRegistry::default();
+        let store = Arc::new(MemoryStore::default());
+        registry.set_store(Arc::<MemoryStore>::clone(&store));
+        let (id, _) = register(&registry, AgentId::Main, "sleep 5");
+        assert_eq!(*store.minted.lock().unwrap(), vec![id]);
+        assert!(registry.record(id, serde_json::json!({})).expect("record"));
+
+        store
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = registry.finish(
+            id,
+            TaskStatus::Exited(Some(0)),
+            notice(AgentId::Main, id, "x"),
+        );
+        assert!(refused.is_err());
+        assert_eq!(registry.status(id), Some(TaskStatus::Running));
+        assert!(!registry.has_notices(AgentId::Main));
+
+        store
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        registry
+            .finish(
+                id,
+                TaskStatus::Exited(Some(0)),
+                notice(AgentId::Main, id, "x"),
+            )
+            .expect("finish");
+        assert_eq!(registry.status(id), Some(TaskStatus::Exited(Some(0))));
+        assert_eq!(registry.pending_notices(AgentId::Main), 1);
+        assert!(store.recorded.lock().unwrap().is_empty());
+    }
+
+    /// A registry without a store records nothing. A refused record leaves
+    /// the task unrecorded. Its end is not accepted either while the store
+    /// refuses it: nothing is delivered from memory for any task.
+    #[test]
+    fn a_task_is_recorded_only_by_a_store_that_accepts_it() {
+        let registry = TaskRegistry::default();
+        let (id, _) = register(&registry, AgentId::Main, "a");
+        assert!(
+            !registry
+                .record(id, serde_json::json!({}))
+                .expect("no store")
+        );
+
+        let store = Arc::new(MemoryStore::default());
+        store
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        registry.set_store(Arc::<MemoryStore>::clone(&store));
+        assert!(registry.record(id, serde_json::json!({})).is_err());
+        let ended = TaskStatus::Exited(Some(0));
+        let finished = registry.finish(id, ended, notice(AgentId::Main, id, "x"));
+        assert!(finished.is_err());
+        assert_eq!(registry.status(id), Some(TaskStatus::Running));
+        assert!(!registry.has_notices(AgentId::Main));
+    }
+
+    /// A task that lives in the host's memory announces its loss before it
+    /// goes on. Its completion is saved under the announcement's id, so the
+    /// store holds one notification for it at any time. A refused announcement
+    /// is an error, and a refused completion leaves the announcement.
+    #[test]
+    fn an_announced_loss_is_replaced_by_the_completion_under_one_id() {
+        let registry = TaskRegistry::default();
+        let store = Arc::new(MemoryStore::default());
+        registry.set_store(Arc::<MemoryStore>::clone(&store));
+        let (id, _) = register(&registry, AgentId::Main, "agent 1");
+        let refuse = |refuse| {
+            store
+                .refuse
+                .store(refuse, std::sync::atomic::Ordering::SeqCst)
+        };
+
+        refuse(true);
+        let lost = crate::interrupted_run_notice(1);
+        assert!(registry.announce_loss(id, lost.clone()).is_err());
+        assert!(store.notices.lock().unwrap().is_empty());
+        refuse(false);
+        registry.announce_loss(id, lost.clone()).expect("announce");
+        assert!(
+            !registry.has_notices(AgentId::Main),
+            "nothing is delivered yet"
+        );
+
+        refuse(true);
+        let ended = TaskStatus::Exited(Some(0));
+        let refused = registry.finish(id, ended, notice(AgentId::Main, id, "report"));
+        assert!(refused.is_err());
+        assert!(!registry.has_notices(AgentId::Main));
+        refuse(false);
+        registry
+            .finish(id, ended, notice(AgentId::Main, id, "report"))
+            .expect("finish");
+
+        let saved = store.notices.lock().unwrap().clone();
+        let ids: Vec<_> = saved.iter().map(|(_, notice)| notice.id()).collect();
+        assert_eq!(ids, [lost.id(), lost.id()], "one id for both saves");
+        let delivered = registry.drain_notice_messages(AgentId::Main);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].id(), lost.id());
+        assert!(format!("{:?}", delivered[0]).contains("report"));
+    }
+
+    /// A shutdown ends a recorded task's driver without a kill and drops
+    /// the entry. A kill is told apart by its flag.
+    #[tokio::test]
+    async fn a_recorded_task_leaves_a_shut_down_registry_without_a_kill() {
+        let mut seen = Vec::new();
+        for kill in [false, true] {
+            let registry = TaskRegistry::default();
+            registry.set_store(Arc::new(MemoryStore::default()));
+            let (id, cancel, driver) = registry.register_driver(
+                AgentId::Main,
+                "call".into(),
+                TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+                "sleep 5".into(),
+                Arc::new(StubOutput),
+            );
+            assert!(registry.record(id, serde_json::json!({})).expect("record"));
+            let (probe, tx) = (registry.clone(), tokio::sync::oneshot::channel());
+            let (tx, rx) = tx;
+            driver.spawn(async move {
+                cancel.cancelled().await;
+                let _ = tx.send(probe.kill_requested(id));
+            });
+            if kill {
+                assert!(registry.kill(id));
+            } else {
+                registry.shutdown();
+            }
+            seen.push(rx.await.expect("driver reports"));
+            assert!(registry.quiesce(Duration::from_secs(5)).await);
+            assert_eq!(registry.status(id), None, "the entry is gone");
+        }
+        assert_eq!(seen, vec![false, true]);
+
+        // An earlier registry's id is taken up as it is, once.
+        let registry = TaskRegistry::default();
+        registry.set_store(Arc::new(MemoryStore::default()));
+        let resumed = registry.resume_driver(
+            7,
+            AgentId::Main,
+            "call".into(),
+            TaskKind::Bash {
+                command: "sleep 5".into(),
+            },
+            "sleep 5".into(),
+            Duration::from_secs(90),
+            Arc::new(StubOutput),
+        );
+        let (_, driver) = resumed.expect("a free id");
+        let age = registry.summary(7).unwrap().started_at.elapsed();
+        assert!(
+            age >= Duration::from_secs(90),
+            "it started earlier: {age:?}"
+        );
+        assert!(
+            registry
+                .resume_driver(
+                    7,
+                    AgentId::Main,
+                    "call".into(),
+                    TaskKind::Bash {
+                        command: "sleep 5".into()
+                    },
+                    "sleep 5".into(),
+                    Duration::ZERO,
+                    Arc::new(StubOutput),
+                )
+                .is_none()
+        );
+        drop(driver);
+        let (next, _) = register(&registry, AgentId::Main, "b");
+        assert_eq!(next, 8, "ids continue above a resumed one");
+        registry.seed_last_id(20);
+        let (next, _) = register(&registry, AgentId::Main, "c");
+        assert_eq!(next, 21);
+    }
+
     #[test]
     fn shutdown_cancels_all_task_tokens() {
         let registry = TaskRegistry::default();
@@ -3310,8 +4055,8 @@ mod task_registry_tests {
     }
 
     /// `read` is a pure observation: an explicit terminal read does
-    /// not consume the completion notice — the lifecycle is
-    /// unconditional (task ends → notice queued → notice drained).
+    /// not consume the task notification — the lifecycle is
+    /// unconditional (task ends → notification queued → notification drained).
     #[test]
     fn terminal_read_does_not_consume_notices() {
         let registry = TaskRegistry::default();
@@ -3487,7 +4232,7 @@ mod task_registry_tests {
 struct SessionContextWrapper {
     code_mode_requested: bool,
     session_state: SessionState,
-    /// The fully-assembled system prompt for the current run,
+    /// The fully-assembled system prompt of the calling agent,
     /// captured at the moment the tool is invoked. Sub-agents
     /// spawned through this wrapper inherit it, optionally with an
     /// explicitly configured suffix.
@@ -3564,6 +4309,15 @@ struct SessionContextWrapper {
 }
 
 impl SessionContextWrapper {
+    fn sub_agents(&self) -> SubAgentBuilder {
+        SubAgentBuilder {
+            session_state: self.session_state.clone(),
+            bus: self.parent_bus.clone(),
+            task_registry: self.task_registry.clone(),
+            message_queues: self.message_queues.clone(),
+        }
+    }
+
     fn spawn_child<'b>(
         &'b mut self,
         task: String,
@@ -3573,10 +4327,8 @@ impl SessionContextWrapper {
         Box<dyn std::future::Future<Output = Result<SpawnResult, BoxError>> + Send + 'b>,
     > {
         Box::pin(async move {
-            let allowed_tool_names = config
-                .as_ref()
-                .map(|config| config.tools.iter().map(|tool| tool.name.clone()).collect());
-            let mut config = config.unwrap_or_else(|| tool::SpawnAgentConfig {
+            let restrict_tools = config.is_some();
+            let config = config.unwrap_or_else(|| tool::SpawnAgentConfig {
                 provider: Arc::clone(&self.provider),
                 model_info: Arc::clone(&self.model_info),
                 stream_options: self.stream_options.clone(),
@@ -3591,19 +4343,13 @@ impl SessionContextWrapper {
                     .collect(),
                 system_prompt_suffix: String::new(),
             });
-            config.tools.retain(|tool| {
-                !matches!(
-                    tool.name.as_str(),
-                    "create_goal" | "get_goal" | "update_goal" | "wait"
-                )
-            });
             // Get the next agent ID
             let agent_id = self.session_state.next_sub_agent_id();
             let child_id = AgentId::Sub(agent_id);
 
             // Mirror sub-agent lifecycle on the parent's bus so a
             // single listener (e.g. the future TUI's event pump,
-            // or the persistence listener that needs to capture
+            // or the journal that needs to capture
             // the parent anchor for the child's first write) can
             // group nested transcripts under the parent's
             // tool-execution component.
@@ -3616,6 +4362,7 @@ impl SessionContextWrapper {
                     child: child_id,
                     task: task.clone(),
                     tool_name: self.tool_name.clone(),
+                    call_id: Some(self.call_id.clone()),
                     background: matches!(mode, SpawnMode::Background),
                     settings: AgentSettings {
                         context_window: config.model_info.context_window,
@@ -3623,7 +4370,7 @@ impl SessionContextWrapper {
                         model_id: config.model_info.id.clone(),
                         thinking: aj_models::thinking_config_name(config.thinking.as_ref())
                             .to_string(),
-                        thinking_display: config.thinking_display,
+                        thinking_display: config.thinking_display.clone(),
                         speed: aj_models::speed_name(config.speed.as_ref()).to_string(),
                         verbosity: aj_models::verbosity_name(config.stream_options.verbosity)
                             .to_string(),
@@ -3631,71 +4378,20 @@ impl SessionContextWrapper {
                 })
                 .await?;
 
-            let disabled_tools = self.disabled_tools.to_vec();
-
-            // Create a new agent rooted in this session's working
-            // directory and tools. Its transcript starts empty; the
-            // prompt the tool invoked us with is appended as the first
-            // user message inside `run_single_turn`. The selected bundle
-            // is retained on the child for later continuations as well.
-            //
-            // Scoping the cache key keeps the child's distinct prefix
-            // from colliding with the main thread's or a sibling's. A
-            // bundle without a key (provider that doesn't key caching
-            // on it) leaves the child without one too.
-            let mut sub_stream_options = config.stream_options;
-            if let Some(base) = sub_stream_options.session_id.as_deref() {
-                sub_stream_options.session_id = Some(sub_agent_session_id(base, agent_id));
-            }
-            let mut sub_agent = Agent::with_provider(
-                self.session_state.working_directory(),
-                config.tools,
-                disabled_tools,
-                config.provider,
-                config.model_info,
-                sub_stream_options,
-                None,
-            );
-            sub_agent.allowed_tool_names = allowed_tool_names;
-            sub_agent.set_agent_id(child_id);
-            // Inherit the assembled prompt plus any explicit suffix. The transcript
-            // and counter parts of the seed stay at their defaults:
-            // the child starts with an empty history and mints no
-            // persisted-id collisions of its own.
-            sub_agent.seed_session(AgentSeed {
-                assembled_system_prompt: Some(format!(
-                    "{}{}",
-                    self.assembled_system_prompt, config.system_prompt_suffix
-                )),
-                ..AgentSeed::default()
+            // The child's transcript starts empty: the prompt the tool
+            // invoked us with is appended as the first user message inside
+            // `run_single_turn`.
+            let mut sub_agent = self.sub_agents().build(SubAgentConfig {
+                agent_id,
+                restrict_tools,
+                bundle: config,
+                system_prompt: self.assembled_system_prompt.clone(),
+                disabled_tools: self.disabled_tools.clone(),
+                block_images: self.block_images,
+                code_mode: self.code_mode_requested,
+                transcript: Vec::new(),
+                code_mode_store: BTreeMap::new(),
             });
-            // Sub-agents inherit the parent's `image_block` setting
-            // so the defense-in-depth gate stays uniform across the
-            // hierarchy.
-            sub_agent.set_block_images(self.block_images);
-            // Tool subshells inherit the session overlay through the child's
-            // own context rather than through its shared tool instances.
-            sub_agent.session_state.session_env = Arc::clone(&self.session_state.session_env);
-            // Keep the selected thinking and speed on the retained child.
-            sub_agent.set_default_thinking(config.thinking);
-            sub_agent.set_speed(config.speed.clone());
-            sub_agent.set_code_mode(self.code_mode_requested);
-            // Share the background-task registry so tasks the
-            // sub-agent starts land in the same map the binary
-            // observes, with notices scoped to the sub-agent's own
-            // id.
-            sub_agent.set_task_registry(self.task_registry.clone());
-            // Share the steering / follow-up queues so the user can
-            // steer or queue for this sub-agent from its view; the
-            // sub-agent drains its own `Sub(n)`-keyed slots.
-            sub_agent.set_message_queues(self.message_queues.clone());
-            // Share the parent's bus: every event the sub-agent emits
-            // during its run reaches the listeners the binary registered
-            // on the parent (rendering, persistence), tagged with
-            // `Sub(n)`. Without this the sub-agent runs on its
-            // own bus and the binary's bridge listener never sees
-            // its activity.
-            sub_agent.set_bus(self.parent_bus.clone());
 
             // Foreground assignment ownership survives an interrupted turn.
             // Background work must outlive the parent's turn, so it hangs off the
@@ -3728,6 +4424,26 @@ impl SessionContextWrapper {
                         format!("agent {agent_id}"),
                         output_dyn,
                     );
+                    // The run lives in this host's memory. Its parent is
+                    // owed one notification whatever becomes of it, so the
+                    // notification for a host that ends first is saved before
+                    // the run starts. A refused save refuses the spawn.
+                    let announced = self
+                        .task_registry
+                        .announce_loss(started.id, interrupted_run_notice(agent_id));
+                    if let Err(error) = announced {
+                        started.driver.abandon();
+                        let report = format!("sub-agent failed: it could not be recorded: {error}");
+                        self.parent_bus
+                            .emit(AgentEvent::SubAgentEnd {
+                                parent: self.agent_id,
+                                child: child_id,
+                                report: report.clone(),
+                                conclusion: SubAgentConclusion::Failed,
+                            })
+                            .await?;
+                        return Err(report.into());
+                    }
                     sub_agent.set_cancellation(started.cancel.clone());
                     Some((started, kind, output))
                 }
@@ -4005,8 +4721,15 @@ struct BackgroundAgentRun {
 }
 
 /// Drive a background agent spawn to completion: announce it with
-/// `TaskStart`, run the child's initial turn, emit `SubAgentEnd`, and
-/// finish the task with the report as the notice body.
+/// `TaskStart`, run the child's initial turn, save the task notification,
+/// emit `SubAgentEnd`, and finish the task. A run the session ends under
+/// emits neither the end nor a notification.
+///
+/// The notification is committed before the end record, and it replaces the
+/// loss announced when the run started. So a host that ends anywhere in
+/// here leaves the parent exactly one notification: the announcement before the
+/// save, the report after it. A save that keeps failing leaves the
+/// announcement and no end record, as a host that ended does.
 async fn drive_background_agent(run: BackgroundAgentRun) {
     let BackgroundAgentRun {
         shared,
@@ -4025,18 +4748,14 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
 
     let result = shared.lock().await.run_single_turn(task).await;
 
-    // Emit `SubAgentEnd` regardless of success — same contract as the
-    // blocking path; listeners need to clean up nested-transcript
-    // framing on errors too. Listener failures are logged and
-    // swallowed like the sink does: a run finishing outside any turn
-    // has no turn to abort.
-    //
-    // NOTE: this emit happens after the child's own `AgentEnd` and
-    // after the lock is released, so a wake on the sub-agent (for a
-    // task it owns itself) can interleave as `AgentEnd(Sub)` →
-    // `AgentStart(Sub)` → `SubAgentEnd`. Benign: the pump's running
-    // set keys off the `Agent*` pair, and persistence tolerates
-    // post-`SubAgentEnd` continuations.
+    // A token that fired without a kill is the session ending under the
+    // run. The run is then left as a host that died leaves it: without an
+    // end record, with its loss announced. A run that completed before the
+    // token fired still ends as completed below.
+    if result.is_err() && cancel.is_cancelled() && !events.kill_requested() {
+        return;
+    }
+
     let (report, conclusion) = match &result {
         Ok(r) => (r.text.clone(), r.conclusion),
         Err(err) => (
@@ -4044,48 +4763,29 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
             SubAgentConclusion::Failed,
         ),
     };
-    let emit_result = parent_bus
-        .emit(AgentEvent::SubAgentEnd {
-            parent,
-            child: AgentId::Sub(agent_id),
-            report: report.clone(),
-            conclusion,
-        })
-        .await;
-    if let Err(err) = emit_result {
-        tracing::warn!(task_id, "sub-agent end listener failed: {err:#}");
-    }
 
     // Status mapping: agent runs have no process exit code, so we
     // borrow the process conventions the shared status rendering
     // reads naturally. A completed run is `Exited(Some(0))`, a
-    // failed one `Exited(Some(1))`, and a run cancelled through the
-    // task token (task_stop / TUI kill / targeted sub-agent cancel /
-    // shutdown) is `Killed`. A run that completed before a late
+    // failed one `Exited(Some(1))`, and a run killed through the
+    // task token (task_stop / TUI kill / targeted sub-agent cancel)
+    // is `Killed`. A run that completed before a late
     // cancel still counts as completed. Any *error* under a fired
     // token classifies as `Killed`. A genuine run failure racing a
     // concurrent kill loses its error text, which is acceptable: the
     // kill was requested and the run is gone either way.
     let (status, report_text) = match &result {
         // A truncated background run still delivers its partial text, but
-        // the completion notice flags it so the parent model does not take
+        // the task notification flags it so the parent model does not take
         // the token-capped text as final. This mirrors the blocking `agent`
-        // tool result. The box's own report (emitted above) stays raw.
+        // tool result. The box's own report (emitted below) stays raw.
         Ok(r) => {
             let text = delivered_report(r.conclusion, &r.text);
             (TaskStatus::Exited(Some(0)), Some(text))
         }
         Err(_) if cancel.is_cancelled() => (TaskStatus::Killed, None),
-        Err(_) => (TaskStatus::Exited(Some(1)), Some(report)),
+        Err(_) => (TaskStatus::Exited(Some(1)), Some(report.clone())),
     };
-    // Store the report before the status flips terminal so a
-    // terminal `task_output` read never observes a finished task
-    // without its report. A killed run stores none — the status line
-    // already says everything.
-    if let Some(text) = &report_text {
-        output.set_report(text.clone());
-    }
-
     let outcome_text = report_text.as_deref().unwrap_or("killed");
     let label = events.label().to_string();
     let notice = TaskNotice {
@@ -4096,7 +4796,42 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
         status,
         body: format!("Background task #{task_id} finished: {label} — {outcome_text}"),
     };
-    events.finished(status, notice).await;
+    let Some(message) = events.save_end(&notice).await else {
+        return;
+    };
+
+    // Emit `SubAgentEnd` for every outcome, the same contract as the
+    // blocking path: listeners need to clean up nested-transcript
+    // framing on errors too. Listener failures are logged and
+    // swallowed like the sink does: a run finishing outside any turn
+    // has no turn to abort.
+    //
+    // NOTE: this emit happens after the child's own `AgentEnd` and
+    // after the lock is released, so a wake on the sub-agent (for a
+    // task it owns itself) can interleave as `AgentEnd(Sub)` →
+    // `AgentStart(Sub)` → `SubAgentEnd`. Benign: the pump's running
+    // set keys off the `Agent*` pair, and persistence tolerates
+    // post-`SubAgentEnd` continuations.
+    let emit_result = parent_bus
+        .emit(AgentEvent::SubAgentEnd {
+            parent,
+            child: AgentId::Sub(agent_id),
+            report,
+            conclusion,
+        })
+        .await;
+    if let Err(err) = emit_result {
+        tracing::warn!(task_id, "sub-agent end listener failed: {err:#}");
+    }
+
+    // Store the report before the status flips terminal so a
+    // terminal `task_output` read never observes a finished task
+    // without its report. A killed run stores none: the status line
+    // already says everything.
+    if let Some(text) = report_text {
+        output.set_report(text);
+    }
+    events.publish_end(status, notice, message).await;
 }
 
 /// Inspect a freshly-seeded transcript for `tool_call` blocks that
@@ -4129,7 +4864,7 @@ fn scan_dangling_tool_uses(transcript: &[AgentMessage]) -> std::collections::Has
     used.difference(&resolved).cloned().collect()
 }
 
-/// Error returned from [`Agent::prompt`] / [`Agent::continue_run`] /
+/// Error returned from [`Agent::prompt`] / [`Agent::continue_turn`] /
 /// [`Agent::run_single_turn`].
 ///
 /// `Recoverable` errors (model API failures, malformed streaming
@@ -4149,7 +4884,7 @@ pub enum TurnError {
     #[error("{0}")]
     Recoverable(BoxError),
     /// A persistent failure (e.g. failed disk write through the
-    /// persistence listener) or an internal invariant violation.
+    /// journal) or an internal invariant violation.
     /// Bubble out to the top level.
     #[error(transparent)]
     Fatal(BoxError),
@@ -4209,7 +4944,7 @@ fn cancelled_tool_outcome(tool_name: &str) -> ToolOutcome {
     }
 }
 
-/// One pending tool call from an assistant turn:
+/// One pending tool call from an assistant message:
 /// `(call_id, tool_name, arguments)`.
 type PendingToolCall = (String, String, serde_json::Value);
 
@@ -4224,13 +4959,13 @@ struct RunToolResult {
     aborted: bool,
 }
 
-/// Partition a turn's tool calls into contiguous concurrency groups.
+/// Partition a round's tool calls into contiguous concurrency groups.
 ///
-/// A maximal contiguous run of tools for which `is_parallel` returns
+/// A maximal contiguous sequence of tools for which `is_parallel` returns
 /// `true` forms one group that runs concurrently; every other tool —
 /// serial, or unknown to `is_parallel` — is its own singleton group
 /// and acts as a barrier. Order is preserved, so a serial tool never
-/// overlaps the parallel runs on either side of it, and finalizing
+/// overlaps the parallel groups on either side of it, and finalizing
 /// groups in order reproduces the model's original call order.
 fn group_tool_calls(
     calls: Vec<PendingToolCall>,
@@ -4239,7 +4974,7 @@ fn group_tool_calls(
     let mut groups: Vec<Vec<PendingToolCall>> = Vec::new();
     // Whether the previous call extended a parallel group we can keep
     // appending to. A serial call leaves this false, so it both stands
-    // alone and breaks the run after it.
+    // alone and breaks the sequence after it.
     let mut extend_previous = false;
     for call in calls {
         let parallel = is_parallel(&call.1);
@@ -4256,13 +4991,13 @@ fn group_tool_calls(
     groups
 }
 
-/// Maximum number of tool calls one turn runs concurrently.
+/// Maximum number of tool calls one round runs concurrently.
 ///
 /// `AJ_MAX_TOOL_CONCURRENCY` overrides the default when set to a
 /// positive integer. The cap guards against a model emitting a large
 /// fan-out that would exhaust file descriptors or provider rate
 /// limits. Groups run one at a time, so this also bounds an agent's
-/// total in-flight tool work per turn.
+/// total in-flight tool work per round.
 fn max_tool_concurrency() -> usize {
     const DEFAULT: usize = 8;
     std::env::var("AJ_MAX_TOOL_CONCURRENCY")
@@ -4305,7 +5040,7 @@ mod event_protocol_tests {
         ToolDefinition, ToolDetails, ToolOutcome,
     };
     use crate::types::TokenUsage;
-    use crate::{Agent, AgentSeed, SubAgentRegistry, TaskRegistry, UsageAccounting, tool};
+    use crate::{Agent, AgentSeed, SubAgentRegistry, TaskRegistry, tool};
 
     /// Trivial tool that returns a fixed string. Implements the
     /// [`ToolDefinition`] trait so the test exercises the same
@@ -4389,7 +5124,7 @@ mod event_protocol_tests {
 
     /// Identity stamped on every scripted [`AssistantMessage`] in this
     /// module. Matches what [`ScriptedProvider`]'s demos use so the
-    /// agent's TUI / persistence listeners see a coherent provider
+    /// agent's TUI listeners and the journal see a coherent provider
     /// identity even in tests.
     const SCRIPT_API: &str = "scripted";
     const SCRIPT_PROVIDER: &str = "scripted";
@@ -4522,9 +5257,9 @@ mod event_protocol_tests {
 
     /// Build a script whose terminal event is a retryable transient
     /// `Error` — the shape a provider emits for a stream that dropped
-    /// before its terminal frame (a truncated turn, via
+    /// before its terminal frame (a truncated response, via
     /// `AssistantMessageEvent::truncated`).
-    /// The agent's retry layer should re-issue the turn rather than
+    /// The agent's retry layer should re-issue the request rather than
     /// surface this as a finished answer.
     fn transient_error_script() -> Vec<AssistantMessageEvent> {
         use aj_models::streaming::ErrorReason;
@@ -4586,7 +5321,7 @@ mod event_protocol_tests {
     enum EventLabel {
         AgentStart(AgentId),
         AgentEnd(AgentId),
-        TurnStart(AgentId),
+        RoundStart(AgentId),
         Notice(AgentId, String),
         Warning(AgentId, String),
         Error(AgentId, String),
@@ -4637,7 +5372,7 @@ mod event_protocol_tests {
         match event {
             AgentEvent::AgentStart { agent_id, .. } => EventLabel::AgentStart(*agent_id),
             AgentEvent::AgentEnd { agent_id, .. } => EventLabel::AgentEnd(*agent_id),
-            AgentEvent::TurnStart { agent_id } => EventLabel::TurnStart(*agent_id),
+            AgentEvent::RoundStart { agent_id } => EventLabel::RoundStart(*agent_id),
             AgentEvent::Notice { agent_id, text } => EventLabel::Notice(*agent_id, text.clone()),
             AgentEvent::Warning { agent_id, text } => EventLabel::Warning(*agent_id, text.clone()),
             AgentEvent::Error { agent_id, text } => EventLabel::Error(*agent_id, text.clone()),
@@ -4691,7 +5426,7 @@ mod event_protocol_tests {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),
             AgentEvent::UsageUpdate { agent_id, .. } => EventLabel::UsageUpdate(*agent_id),
-            AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
+            AgentEvent::RoundEnd { .. } => EventLabel::Other("RoundEnd"),
             AgentEvent::MessageStart { agent_id, message } => EventLabel::Message {
                 agent_id: *agent_id,
                 phase: "start",
@@ -5034,26 +5769,19 @@ mod event_protocol_tests {
             },
         };
 
+        agent.account_usage(&first).await.expect("first accounting");
+        let end = agent.account_compaction(
+            &second,
+            CompactionReason::Manual,
+            200,
+            100,
+            "summary".to_string(),
+        );
         agent
-            .account_usage(&first, UsageAccounting::AssistantTerminal)
-            .await
-            .expect("first accounting");
-        agent
-            .account_usage(
-                &second,
-                UsageAccounting::CommittedCompaction {
-                    reason: CompactionReason::Manual,
-                    tokens_before: 200,
-                    tokens_after: 100,
-                    summary: "summary".to_string(),
-                },
-            )
+            .publish_compaction(end)
             .await
             .expect("compaction accounting");
-        agent
-            .account_usage(&third, UsageAccounting::AssistantTerminal)
-            .await
-            .expect("third accounting");
+        agent.account_usage(&third).await.expect("third accounting");
 
         let updates = updates.lock().unwrap();
         assert_eq!(updates.len(), 3);
@@ -5106,7 +5834,7 @@ mod event_protocol_tests {
         };
 
         let error = agent
-            .account_usage(&delta, UsageAccounting::AssistantTerminal)
+            .account_usage(&delta)
             .await
             .expect_err("listener failure remains fatal");
 
@@ -5137,16 +5865,15 @@ mod event_protocol_tests {
             ..Usage::default()
         };
 
+        let end = agent.account_compaction(
+            &delta,
+            CompactionReason::Manual,
+            200,
+            100,
+            "checkpoint".to_string(),
+        );
         let error = agent
-            .account_usage(
-                &delta,
-                UsageAccounting::CommittedCompaction {
-                    reason: CompactionReason::Manual,
-                    tokens_before: 200,
-                    tokens_after: 100,
-                    summary: "checkpoint".to_string(),
-                },
-            )
+            .publish_compaction(end)
             .await
             .expect_err("listener failure remains fatal");
 
@@ -5196,15 +5923,14 @@ mod event_protocol_tests {
                 ..UsageCost::default()
             },
         };
-        let mut accounting = Box::pin(agent.account_usage(
+        let end = agent.account_compaction(
             &delta,
-            UsageAccounting::CommittedCompaction {
-                reason: CompactionReason::Manual,
-                tokens_before: 200,
-                tokens_after: 100,
-                summary: "checkpoint".to_string(),
-            },
-        ));
+            CompactionReason::Manual,
+            200,
+            100,
+            "checkpoint".to_string(),
+        );
+        let mut accounting = Box::pin(agent.publish_compaction(end));
 
         tokio::select! {
             () = listener_entered.notified() => {}
@@ -5236,8 +5962,8 @@ mod event_protocol_tests {
         let mut agent = build_agent(scripts, vec![ping]);
         // Mirror what `SessionContextWrapper::spawn_agent` does in
         // production: tagging the agent with its sub-agent id keeps
-        // bus events aligned to the [`ThreadKind::Subagent`]
-        // entries the persistence listener would write.
+        // bus events aligned to the [`ThreadKind::Sub`]
+        // entries the journal would write.
         agent.set_agent_id(AgentId::Sub(1));
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
@@ -5256,7 +5982,7 @@ mod event_protocol_tests {
             EventLabel::AgentStart(AgentId::Sub(1)),
             // The sub-agent's user prompt brackets with
             // MessageStart/End around the User wire-message; the
-            // persistence listener subscribes to MessageEnd
+            // journal subscribes to MessageEnd
             // directly.
             EventLabel::Message {
                 agent_id: AgentId::Sub(1),
@@ -5268,7 +5994,7 @@ mod event_protocol_tests {
                 phase: "end",
                 kind: "User",
             },
-            EventLabel::TurnStart(AgentId::Sub(1)),
+            EventLabel::RoundStart(AgentId::Sub(1)),
             // First inference: MessageStart opens the assistant
             // slot, the streaming protocol's Start event flows
             // through MessageUpdate (script step 0 emits Start
@@ -5320,11 +6046,11 @@ mod event_protocol_tests {
                 body: "pong".to_string(),
                 is_error: false,
             },
-            // The tool turn closes with `TurnEnd` (carrying the
+            // The tool round closes with `RoundEnd` (carrying the
             // assistant message + the ping tool result), then the
-            // next turn opens with a fresh `TurnStart`.
-            EventLabel::Other("TurnEnd"),
-            EventLabel::TurnStart(AgentId::Sub(1)),
+            // next round opens with a fresh `RoundStart`.
+            EventLabel::Other("RoundEnd"),
+            EventLabel::RoundStart(AgentId::Sub(1)),
             // Second inference: same Start/stream/End bracket as
             // the first; the model returned plain text this time.
             EventLabel::Message {
@@ -5346,17 +6072,17 @@ mod event_protocol_tests {
                 kind: "Assistant",
             },
             EventLabel::UsageUpdate(AgentId::Sub(1)),
-            EventLabel::Other("TurnEnd"),
+            EventLabel::Other("RoundEnd"),
             EventLabel::AgentEnd(AgentId::Sub(1)),
         ];
         assert_eq!(events, expected, "unexpected event sequence: {events:#?}");
     }
 
     #[tokio::test]
-    async fn turn_end_carries_message_and_results_agent_end_carries_transcript() {
-        // A tool-use turn followed by a text turn. Each `TurnEnd`
-        // carries that turn's finalized assistant message. The tool
-        // turn also carries its one tool result, the text turn none.
+    async fn round_end_carries_message_and_results_agent_end_carries_transcript() {
+        // A tool-use round followed by a text round. Each `RoundEnd`
+        // carries that round's finalized assistant message. The tool
+        // round also carries its one tool result, the text round none.
         // `AgentEnd` carries the full transcript snapshot.
         let scripts = vec![
             finalize_script(finalize_tool_use("tu-1", "ping")),
@@ -5370,7 +6096,7 @@ mod event_protocol_tests {
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             if matches!(
                 event,
-                AgentEvent::TurnEnd { .. } | AgentEvent::AgentEnd { .. }
+                AgentEvent::RoundEnd { .. } | AgentEvent::AgentEnd { .. }
             ) {
                 captured_clone.lock().unwrap().push(event.clone());
             }
@@ -5385,12 +6111,12 @@ mod event_protocol_tests {
         assert_eq!(
             events.len(),
             3,
-            "two TurnEnds then one AgentEnd: {events:#?}"
+            "two RoundEnds then one AgentEnd: {events:#?}"
         );
 
-        // First turn: the tool-use assistant message + the ping result.
+        // First round: the tool-use assistant message + the ping result.
         match &events[0] {
-            AgentEvent::TurnEnd {
+            AgentEvent::RoundEnd {
                 message,
                 tool_results,
                 ..
@@ -5400,31 +6126,31 @@ mod event_protocol_tests {
                         .content
                         .iter()
                         .any(|c| matches!(c, AssistantContent::ToolCall(_))),
-                    "first turn's message carries the tool call"
+                    "first round's message carries the tool call"
                 );
-                assert_eq!(tool_results.len(), 1, "one tool result this turn");
+                assert_eq!(tool_results.len(), 1, "one tool result this round");
                 assert_eq!(tool_results[0].tool_name, "ping");
             }
-            other => panic!("expected TurnEnd, got {other:?}"),
+            other => panic!("expected RoundEnd, got {other:?}"),
         }
 
-        // Second turn: the text reply, no tools.
+        // Second round: the text reply, no tools.
         match &events[1] {
-            AgentEvent::TurnEnd {
+            AgentEvent::RoundEnd {
                 message,
                 tool_results,
                 ..
             } => {
-                assert!(tool_results.is_empty(), "text turn calls no tools");
+                assert!(tool_results.is_empty(), "text round calls no tools");
                 assert!(
                     message
                         .content
                         .iter()
                         .any(|c| matches!(c, AssistantContent::Text(_))),
-                    "second turn's message carries text"
+                    "second round's message carries text"
                 );
             }
-            other => panic!("expected TurnEnd, got {other:?}"),
+            other => panic!("expected RoundEnd, got {other:?}"),
         }
 
         // AgentEnd snapshots the whole transcript: user prompt, the
@@ -5528,7 +6254,7 @@ mod event_protocol_tests {
         // Every tool call produces a `MessageEnd { ToolResult }`
         // event whose `details` field carries the structured
         // [`ToolDetails`] payload serialized to `Value`. A
-        // downstream persistence listener relies on this so the
+        // downstream journal relies on this so the
         // on-disk record can pin both the LLM-facing content (used
         // by the next inference) and the renderer payload (used by
         // resumed sessions to rehydrate diffs / todo snapshots /
@@ -5759,7 +6485,7 @@ mod event_protocol_tests {
     #[tokio::test]
     async fn run_single_turn_brackets_with_agent_lifecycle() {
         // Drives `run_single_turn` (the public sub-agent entry
-        // point) and verifies the bus brackets every run with an
+        // point) and verifies the bus brackets every turn with an
         // `AgentStart` / `AgentEnd` pair tagged with the agent's
         // id.
         let scripts = vec![finalize_script(finalize_text("ok"))];
@@ -5793,7 +6519,7 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "User",
                 },
-                EventLabel::TurnStart(AgentId::Sub(7)),
+                EventLabel::RoundStart(AgentId::Sub(7)),
                 EventLabel::Message {
                     agent_id: AgentId::Sub(7),
                     phase: "start",
@@ -5813,7 +6539,7 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::UsageUpdate(AgentId::Sub(7)),
-                EventLabel::Other("TurnEnd"),
+                EventLabel::Other("RoundEnd"),
                 EventLabel::AgentEnd(AgentId::Sub(7)),
             ],
             "unexpected event sequence: {events:#?}"
@@ -5824,8 +6550,8 @@ mod event_protocol_tests {
     async fn prompt_emits_user_message_lifecycle_events() {
         // The top-level entry point appends the user prompt to the
         // transcript and emits a `MessageStart` / `MessageEnd` pair
-        // for it before the assistant turn loop begins. This is the
-        // contract the binary's persistence listener relies on to
+        // for it before the round loop begins. This is the
+        // contract the journal relies on to
         // write the user's typed input to disk.
         let scripts = vec![finalize_script(finalize_text("done"))];
 
@@ -5857,7 +6583,7 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "User",
                 },
-                EventLabel::TurnStart(AgentId::Main),
+                EventLabel::RoundStart(AgentId::Main),
                 EventLabel::Message {
                     agent_id: AgentId::Main,
                     phase: "start",
@@ -5877,7 +6603,7 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::UsageUpdate(AgentId::Main),
-                EventLabel::Other("TurnEnd"),
+                EventLabel::Other("RoundEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
             "unexpected event sequence: {events:#?}"
@@ -5921,13 +6647,13 @@ mod event_protocol_tests {
 
     #[tokio::test]
     async fn continue_run_drives_existing_transcript_without_appending() {
-        // `continue_run` is the recovery / continuation entry point:
+        // `continue_turn` is the recovery / continuation entry point:
         // the binary uses it after a recoverable error to retry
         // inference against the user message that's already on the
         // transcript, without re-emitting a `MessageStart`/`MessageEnd`
         // for the user prompt (the prior `prompt` call already wrote
         // it). Here we seed a transcript ending in a user-role
-        // message and verify `continue_run` drives one assistant
+        // message and verify `continue_turn` drives one
         // turn without firing any extra User message events.
         let scripts = vec![finalize_script(finalize_text("retried"))];
 
@@ -5949,9 +6675,9 @@ mod event_protocol_tests {
         }));
 
         agent
-            .continue_run(CancellationToken::new())
+            .continue_turn(CancellationToken::new())
             .await
-            .expect("continue_run");
+            .expect("continue_turn");
 
         let events = recorded.lock().unwrap().clone();
         assert_eq!(
@@ -5959,9 +6685,9 @@ mod event_protocol_tests {
             vec![
                 EventLabel::AgentStart(AgentId::Main),
                 // No User-message bracketing here — that's the
-                // distinguishing feature of `continue_run` vs
+                // distinguishing feature of `continue_turn` vs
                 // `prompt`.
-                EventLabel::TurnStart(AgentId::Main),
+                EventLabel::RoundStart(AgentId::Main),
                 EventLabel::Message {
                     agent_id: AgentId::Main,
                     phase: "start",
@@ -5981,7 +6707,7 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::UsageUpdate(AgentId::Main),
-                EventLabel::Other("TurnEnd"),
+                EventLabel::Other("RoundEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
             "unexpected event sequence: {events:#?}"
@@ -5996,7 +6722,7 @@ mod event_protocol_tests {
     async fn continue_run_rejects_assistant_role_last_message() {
         // The wire layer requires the transcript to end in a
         // user-role (or tool-result) message before inference.
-        // `continue_run` enforces that precondition with a fatal
+        // `continue_turn` enforces that precondition with a fatal
         // error rather than letting the model API surface an
         // obscure 4xx.
         // Seed an assistant-role last message.
@@ -6013,9 +6739,9 @@ mod event_protocol_tests {
         );
 
         let err = agent
-            .continue_run(CancellationToken::new())
+            .continue_turn(CancellationToken::new())
             .await
-            .expect_err("continue_run must reject assistant-role last message");
+            .expect_err("continue_turn must reject assistant-role last message");
         assert!(
             matches!(err, crate::TurnError::Fatal(_)),
             "expected Fatal error, got: {err:?}"
@@ -6030,9 +6756,9 @@ mod event_protocol_tests {
         let mut agent = build_agent(Vec::new(), Vec::new());
 
         let err = agent
-            .continue_run(CancellationToken::new())
+            .continue_turn(CancellationToken::new())
             .await
-            .expect_err("continue_run must reject empty transcript");
+            .expect_err("continue_turn must reject empty transcript");
         assert!(
             matches!(err, crate::TurnError::Fatal(_)),
             "expected Fatal error, got: {err:?}"
@@ -6042,11 +6768,11 @@ mod event_protocol_tests {
     #[tokio::test]
     async fn continue_run_accepts_task_notification_last_message() {
         // A task notification has no stored wire message but projects to
-        // a user-role message, so a notice-tailed transcript is a valid
+        // a user-role message, so a notification-tailed transcript is a valid
         // provider request. This is the wake+overflow recovery shape: a
-        // task finishes while idle, its notice is drained as the tail,
+        // task finishes while idle, its notification is drained as the tail,
         // inference overflows, and compaction reseeds a transcript ending
-        // in the notice. `continue_run` must accept it rather than
+        // in the notification. `continue_turn` must accept it rather than
         // fatal-error on the missing stored wire message.
         let scripts = vec![finalize_script(finalize_text("woke up"))];
         let mut agent = build_agent_with_transcript(
@@ -6061,9 +6787,9 @@ mod event_protocol_tests {
         );
 
         agent
-            .continue_run(CancellationToken::new())
+            .continue_turn(CancellationToken::new())
             .await
-            .expect("continue_run must accept a task-notification tail");
+            .expect("continue_turn must accept a task-notification tail");
     }
 
     #[tokio::test]
@@ -6354,11 +7080,11 @@ mod event_protocol_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn truncated_turn_is_retried_then_succeeds() {
+    async fn truncated_response_is_retried_then_succeeds() {
         // A provider stream that drops before its terminal frame
         // surfaces as a transient `Error` (via
         // `AssistantMessageEvent::truncated`). The agent's retry layer
-        // must re-issue the turn rather than accept the truncated turn
+        // must re-issue the request rather than accept the truncated response
         // as final. Strict-mode provider: exactly two inferences are
         // scripted (the truncation, then the recovery), so a missing
         // retry would surface `Recoverable` and a spurious extra
@@ -6393,26 +7119,26 @@ mod event_protocol_tests {
             .collect();
         assert_eq!(retries, vec![1], "expected exactly one stream retry");
 
-        // The retry re-runs the same turn's inference, so it must not
-        // re-bracket the turn: exactly one `TurnStart` and one
-        // `TurnEnd` despite the two inference attempts.
+        // The retry re-runs the same round's inference, so it must not
+        // re-bracket the round: exactly one `RoundStart` and one
+        // `RoundEnd` despite the two inference attempts.
         let recorded = recorded.lock().unwrap();
-        let turn_starts = recorded
+        let round_starts = recorded
             .iter()
-            .filter(|l| matches!(l, EventLabel::TurnStart(_)))
+            .filter(|l| matches!(l, EventLabel::RoundStart(_)))
             .count();
-        let turn_ends = recorded
+        let round_ends = recorded
             .iter()
-            .filter(|l| matches!(l, EventLabel::Other("TurnEnd")))
+            .filter(|l| matches!(l, EventLabel::Other("RoundEnd")))
             .count();
-        assert_eq!(turn_starts, 1, "a retry must not emit a second TurnStart");
+        assert_eq!(round_starts, 1, "a retry must not emit a second RoundStart");
         assert_eq!(
-            turn_ends, 1,
-            "the turn closes once, after the retry succeeds"
+            round_ends, 1,
+            "the round closes once, after the retry succeeds"
         );
         drop(recorded);
 
-        // Only the recovered turn — not the truncated one — landed on
+        // Only the recovered response — not the truncated one — landed on
         // the transcript.
         let messages = agent.messages();
         let last_assistant = match messages.last().and_then(|m| m.as_stored_wire()) {
@@ -6487,7 +7213,7 @@ mod event_protocol_tests {
     /// The load-bearing premise of resume fidelity: a failing sub-agent turn
     /// still emits a `MessageEnd` for its error terminal, carrying
     /// `stop_reason == Error`, even though that message is kept out of the
-    /// in-memory transcript. The persistence listener writes every
+    /// in-memory transcript. The journal writes every
     /// `MessageEnd` to disk, so replay reconstructs `Failed` from this
     /// terminal. If this stopped holding, resume would silently report a
     /// failed sub as `Completed`.
@@ -6784,14 +7510,14 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
-    async fn should_stop_after_turn_hook_ends_turn_before_next_inference() {
+    async fn should_stop_after_round_hook_ends_turn_before_next_inference() {
         // The hook returns `true` so the agent breaks out of the
-        // turn loop after the first tool batch — no second
+        // round loop after the first tool batch — no second
         // inference is run, and the strict-mode scripted provider
         // would panic if a second inference were attempted.
         use std::sync::Arc;
 
-        use crate::hooks::ShouldStopAfterTurnHook;
+        use crate::hooks::ShouldStopAfterRoundHook;
 
         // Only one script: the tool_use. If the hook fails to
         // short-circuit, the loop would call `stream_simple` a
@@ -6799,10 +7525,10 @@ mod event_protocol_tests {
         let scripts = vec![finalize_script(finalize_tool_use("tu-1", "ping"))];
         let mut agent = build_agent(scripts, vec![PingTool.into()]);
 
-        let hook: ShouldStopAfterTurnHook = Arc::new(|| Box::pin(async { true }));
-        agent.set_should_stop_after_turn(Some(hook));
+        let hook: ShouldStopAfterRoundHook = Arc::new(|| Box::pin(async { true }));
+        agent.set_should_stop_after_round(Some(hook));
 
-        // Sanity check: the run completes without panicking.
+        // Sanity check: the turn completes without panicking.
         agent
             .run_single_turn("run ping".to_string())
             .await
@@ -7172,7 +7898,7 @@ mod event_protocol_tests {
         use crate::message::{AgentMessage, AgentMessageKind};
 
         // The parent and the sub-agent share one `ScriptedProvider`,
-        // so scripts are consumed in run order across both:
+        // so scripts are consumed in request order across both:
         //   0. parent emits the `agent` tool call,
         //   1. the sub-agent's single-turn text report,
         //   2. the parent's final text after the tool result.
@@ -7221,7 +7947,7 @@ mod event_protocol_tests {
     async fn re_prompting_retained_sub_agent_extends_its_transcript() {
         use crate::SubAgentRegistry;
 
-        // One shared `ScriptedProvider` serves scripts in run order
+        // One shared `ScriptedProvider` serves scripts in request order
         // across the parent and the sub-agent:
         //   0. parent emits the `agent` tool call,
         //   1. the sub-agent's initial single-turn report,
@@ -7303,12 +8029,12 @@ mod event_protocol_tests {
     /// A background spawn returns a `Started` result with both ids,
     /// retains the handle like a blocking spawn, still emits
     /// `SubAgentEnd`, and delivers the child's report as a completion
-    /// notice.
+    /// notification.
     #[tokio::test]
     async fn background_spawn_delivers_report_notice() {
         use crate::SubAgentRegistry;
 
-        // Script consumption is deterministic: the stop-after-turn
+        // Script consumption is deterministic: the stop-after-round
         // hook ends the parent's turn right after the tool batch, so
         // only the detached child consumes script 1, and the wake
         // afterwards consumes script 2.
@@ -7324,9 +8050,9 @@ mod event_protocol_tests {
         agent.set_sub_agent_registry(sub_registry.clone());
         let tasks = TaskRegistry::default();
         agent.set_task_registry(tasks.clone());
-        let stop_hook: crate::hooks::ShouldStopAfterTurnHook =
+        let stop_hook: crate::hooks::ShouldStopAfterRoundHook =
             Arc::new(|| Box::pin(async { true }));
-        agent.set_should_stop_after_turn(Some(stop_hook));
+        agent.set_should_stop_after_round(Some(stop_hook));
 
         let sub_agent_ends: Arc<Mutex<Vec<(AgentId, AgentId, String)>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -7378,7 +8104,7 @@ mod event_protocol_tests {
         // The handle is retained exactly like a blocking spawn's.
         assert_eq!(sub_registry.ids(), vec![1]);
 
-        // Quiescence includes the driver's notice and terminal bus events,
+        // Quiescence includes the driver's notification and terminal bus events,
         // not just its displayed status.
         assert!(tasks.quiesce(std::time::Duration::from_secs(5)).await);
         assert!(tasks.has_notices(AgentId::Main));
@@ -7402,7 +8128,7 @@ mod event_protocol_tests {
         let (_, read) = tasks.read(1).expect("task readable");
         assert_eq!(read.report.as_deref(), Some("sub report"));
 
-        // Wake drains the notice into the transcript.
+        // Wake drains the notification into the transcript.
         let outcome = agent
             .wake(CancellationToken::new())
             .await
@@ -7439,9 +8165,9 @@ mod event_protocol_tests {
         let mut agent = build_agent(scripts, vec![tool.into()]);
         let tasks = TaskRegistry::default();
         agent.set_task_registry(tasks.clone());
-        let stop_hook: crate::hooks::ShouldStopAfterTurnHook =
+        let stop_hook: crate::hooks::ShouldStopAfterRoundHook =
             Arc::new(|| Box::pin(async { true }));
-        agent.set_should_stop_after_turn(Some(stop_hook));
+        agent.set_should_stop_after_round(Some(stop_hook));
 
         let conclusions: Arc<Mutex<Vec<SubAgentConclusion>>> = Arc::new(Mutex::new(Vec::new()));
         let conclusions_clone = Arc::clone(&conclusions);
@@ -7525,9 +8251,9 @@ mod event_protocol_tests {
         agent.set_sub_agent_registry(sub_registry.clone());
         let tasks = TaskRegistry::default();
         agent.set_task_registry(tasks.clone());
-        let stop_hook: crate::hooks::ShouldStopAfterTurnHook =
+        let stop_hook: crate::hooks::ShouldStopAfterRoundHook =
             Arc::new(|| Box::pin(async { true }));
-        agent.set_should_stop_after_turn(Some(stop_hook));
+        agent.set_should_stop_after_round(Some(stop_hook));
 
         agent
             .prompt("delegate".to_string(), CancellationToken::new())
@@ -7559,7 +8285,7 @@ mod event_protocol_tests {
         assert!(sub_registry.get(1).is_some());
     }
 
-    // ---- Task-notice drain points ----------------------------------------
+    // ---- Task-notification drain points ----------------------------------------
 
     /// The projected user-facing text of an [`AgentMessage`], `None`
     /// for other roles.
@@ -7596,7 +8322,7 @@ mod event_protocol_tests {
         }
     }
 
-    /// Idle drain point: a notice queued while the agent is idle is
+    /// Idle drain point: a notification queued while the agent is idle is
     /// injected as a `<task-notification>` user message *before* the
     /// user's new prompt, with a persistence-shaped `MessageStart` /
     /// `MessageEnd` pair like any other message.
@@ -7642,17 +8368,17 @@ mod event_protocol_tests {
             "hello".to_string(),
         ];
         assert_eq!(*ends.lock().unwrap(), expected);
-        // Every drained notice gets the full MessageStart/MessageEnd
-        // bracket — the same shape the persistence listener consumes.
+        // Every drained notification gets the full MessageStart/MessageEnd
+        // bracket — the same shape the journal consumes.
         assert_eq!(*starts.lock().unwrap(), expected);
 
-        // The queue is consumed and the notice is on the transcript.
+        // The queue is consumed and the notification is on the transcript.
         assert!(!registry.has_notices(AgentId::Main));
         let first = user_text(&agent.messages()[0]).expect("first transcript message is user");
         assert!(first.starts_with("<task-notification>"));
     }
 
-    /// The drained notice is stored as the typed
+    /// The drained notification is stored as the typed
     /// `AgentMessageKind::TaskNotification`, carrying the label, kind,
     /// outcome (mapped from the status), and the trimmed body, rather
     /// than as a tagged user wire message.
@@ -7734,7 +8460,7 @@ mod event_protocol_tests {
         }
     }
 
-    /// Tool that queues a completion notice for `Main` through the
+    /// Tool that queues a task notification for `Main` through the
     /// shared registry, standing in for a background driver finishing
     /// while a tool batch runs.
     #[derive(Clone)]
@@ -7748,7 +8474,7 @@ mod event_protocol_tests {
         }
 
         fn description(&self) -> &'static str {
-            "Test tool that queues a task notice"
+            "Test tool that queues a task notification"
         }
 
         async fn execute(
@@ -7778,7 +8504,7 @@ mod event_protocol_tests {
         }
     }
 
-    /// Mid-run drain point: a notice queued while a tool batch runs is
+    /// Mid-turn drain point: a notification queued while a tool batch runs is
     /// injected after the batch's tool results and before the next
     /// inference step.
     #[tokio::test]
@@ -7856,7 +8582,7 @@ mod event_protocol_tests {
         assert!(!registry.has_notices(AgentId::Main));
     }
 
-    /// Sub-agent runs share the prompt-top drain: notices owned by the
+    /// Sub-agent runs share the prompt-top drain: notifications owned by the
     /// sub-agent land at the start of its run, while other owners'
     /// queues are untouched.
     #[tokio::test]
@@ -7902,9 +8628,9 @@ mod event_protocol_tests {
 
     // ---- Agent::wake ------------------------------------------------------
 
-    /// A wake drains the queued notices and runs a full turn with the
-    /// same event bracketing every top-level run gets: AgentStart,
-    /// the notice's user-message pair, TurnStart, the assistant
+    /// A wake drains the queued notifications and runs a full turn with the
+    /// same event bracketing every turn gets: AgentStart,
+    /// the notification's user-message pair, RoundStart, the assistant
     /// stream, UsageUpdate, AgentEnd.
     #[tokio::test]
     async fn wake_drains_notices_and_runs_bracketed_turn() {
@@ -7945,7 +8671,7 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "TaskNotification",
                 },
-                EventLabel::TurnStart(AgentId::Main),
+                EventLabel::RoundStart(AgentId::Main),
                 EventLabel::Message {
                     agent_id: AgentId::Main,
                     phase: "start",
@@ -7965,13 +8691,13 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::UsageUpdate(AgentId::Main),
-                EventLabel::Other("TurnEnd"),
+                EventLabel::Other("RoundEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
             "unexpected event sequence: {events:#?}"
         );
 
-        // The drained notice is the turn's user-role message.
+        // The drained notification is the turn's user-role message.
         let first = user_text(&agent.messages()[0]).expect("first message is the notice");
         assert!(first.starts_with("<task-notification>\nBackground task #2"));
         assert!(!registry.has_notices(AgentId::Main));
@@ -8130,7 +8856,7 @@ mod event_protocol_tests {
         assert!(!queues.has_pending(AgentId::Main));
     }
 
-    /// Wake delivers a queued follow-up: with no task notices but a
+    /// Wake delivers a queued follow-up: with no task notifications but a
     /// pending follow-up, `wake` runs a bracketed turn whose user
     /// message is the queued text, then the queue is empty. This is the
     /// path the binary's turn-completion trigger drives when a turn
@@ -8250,7 +8976,7 @@ mod event_protocol_tests {
     /// Build a finalized assistant message carrying several `tool_call`
     /// blocks, `stop_reason = ToolUse`. Each `(id, name, args)` becomes
     /// one block, so the parallel-execution tests can put a whole batch
-    /// in one assistant turn.
+    /// in one assistant message.
     fn finalize_tool_uses(calls: &[(&str, &str, serde_json::Value)]) -> AssistantMessage {
         AssistantMessage {
             content: calls

@@ -24,8 +24,8 @@ use serde_json::Value;
 
 use crate::chat::model::{
     AssistantEntry, ChatState, CompactionEntry, EntryId, EntryKind, NoticeEntry, NoticeLevel,
-    SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry, ToolEntry, ToolStatus,
-    TurnUsageEntry, UsageOrigin, UserEntry, joined_user_text,
+    RoundUsageEntry, SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry, ToolEntry,
+    ToolStatus, UsageOrigin, UserEntry, joined_user_text,
 };
 use crate::session::AgentLifecycle;
 
@@ -72,9 +72,8 @@ pub fn reduce(
             assignment_pending,
         } => {
             lifecycle.mark_running(agent_id);
-            // A continuation re-prompt emits no `SubAgentStart`, so
-            // `AgentStart(Sub n)` is what flips a re-prompted box back
-            // to `Running`.
+            // A background sub-agent woken before its run ended shows as
+            // running again. A box whose run ended stays as it is.
             if let AgentId::Sub(n) = agent_id {
                 if let Some(b) = state.sub_box_mut(n) {
                     b.assignment_pending = assignment_pending;
@@ -114,16 +113,16 @@ pub fn reduce(
             state.end_assignments(agent_id);
             Redraw(true)
         }
-        AgentEvent::TurnStart { agent_id } => {
-            // Each new turn opens a fresh assistant entry. NOTE: a turn
-            // that aborts or errors emits no `TurnEnd`, so nothing here
+        AgentEvent::RoundStart { agent_id } => {
+            // Each new round opens a fresh assistant entry. NOTE: a round
+            // that aborts or errors emits no `RoundEnd`, so nothing here
             // may assume balanced brackets.
             if let Some(render) = state.render.get_mut(&agent_id) {
                 render.current_assistant = None;
             }
             Redraw(false)
         }
-        AgentEvent::TurnEnd { .. } => {
+        AgentEvent::RoundEnd { .. } => {
             // The model is built incrementally from the message / tool
             // / usage events, so the finalized snapshot carried here is
             // not needed. The arm stays explicit so the exhaustiveness
@@ -381,7 +380,7 @@ pub fn reduce(
                 .and_then(|render| render.last_usage_origin.as_ref())
                 .and_then(UsageOrigin::source_entry)
                 .map(str::to_string);
-            state.footers.record_turn_usage(agent_id, &usage);
+            state.footers.record_round_usage(agent_id, &usage);
             upsert_usage_row(state, agent_id, usage, source_entry);
             Redraw(true)
         }
@@ -497,6 +496,7 @@ pub fn reduce(
             child,
             task,
             tool_name,
+            call_id: _,
             background,
             settings,
         } => {
@@ -516,6 +516,7 @@ pub fn reduce(
                                 task,
                                 tool_name,
                                 status: SubAgentStatus::Running,
+                                concluded: false,
                                 assignment_pending: !background,
                                 report: None,
                                 started_at: Instant::now(),
@@ -531,9 +532,7 @@ pub fn reduce(
                     // run is in progress and the events after it belong to
                     // it. Re-opening the box is what lets those events land,
                     // the report refresh on the sub's conclusions firing only
-                    // on a `Running` box. Without it a client re-attaching
-                    // during a continuation keeps the previous run's report
-                    // for good.
+                    // on a `Running` box.
                     //
                     // A durable start names a spawn root, and a root is
                     // minted once per run, so re-serving one for a box we
@@ -557,6 +556,7 @@ pub fn reduce(
                 && let Some(b) = state.sub_box_mut(n)
             {
                 b.assignment_pending = false;
+                b.concluded = true;
                 b.status = match conclusion {
                     SubAgentConclusion::Completed => SubAgentStatus::Done,
                     SubAgentConclusion::Truncated => SubAgentStatus::Truncated,
@@ -678,7 +678,7 @@ fn reduce_message_update(
     // BEFORE materializing it. Tool calls render through the dedicated
     // `ToolExecution*` events. `Start` / `Done` / `Error` are
     // lifecycle markers whose bookends are the matching `MessageStart`
-    // / `MessageEnd`. Returning here keeps tool-use-only turns from
+    // / `MessageEnd`. Returning here keeps tool-use-only messages from
     // materializing an empty assistant entry.
     let partial = match event {
         AssistantMessageEvent::TextStart { partial, .. }
@@ -773,7 +773,7 @@ fn reduce_user_end(
 }
 
 /// Handle `MessageEnd { TaskNotification }`: append the typed
-/// task-completion notice entry, which the view renders as an
+/// task-task notification entry, which the view renders as an
 /// outcome-tinted bubble rather than a user prompt.
 fn reduce_task_notification_end(
     state: &mut ChatState,
@@ -927,7 +927,7 @@ fn upsert_usage_row(
         .and_then(|source| indexed_row(state, agent_id, source, usage_origin));
     match existing {
         Some(id) => {
-            if let Some(EntryKind::TurnUsage(row)) = state
+            if let Some(EntryKind::RoundUsage(row)) = state
                 .transcripts
                 .get_mut(&agent_id)
                 .and_then(|transcript| transcript.get_mut(id))
@@ -941,7 +941,7 @@ fn upsert_usage_row(
                 .transcripts
                 .entry(agent_id)
                 .or_default()
-                .append(EntryKind::TurnUsage(TurnUsageEntry {
+                .append(EntryKind::RoundUsage(RoundUsageEntry {
                     agent_id,
                     usage,
                     source_entry,
@@ -953,7 +953,7 @@ fn upsert_usage_row(
 /// Durable identity of a usage row: the assistant or checkpoint it reports on.
 fn usage_origin(kind: &EntryKind) -> Option<&str> {
     match kind {
-        EntryKind::TurnUsage(row) => row.source_entry.as_deref(),
+        EntryKind::RoundUsage(row) => row.source_entry.as_deref(),
         _ => None,
     }
 }
@@ -1027,7 +1027,7 @@ fn reduce_assistant_end(
     //    `MessageUpdate` in between, so no entry exists. We
     //    materialize one from the finalized message, but only when the
     //    payload carries at least one Text / Thinking block:
-    //    tool-use-only turns render entirely through the tool cells,
+    //    tool-use-only messages render entirely through the tool cells,
     //    and an empty assistant entry would add a spurious gap.
     let has_renderable = assistant
         .content
@@ -1119,11 +1119,9 @@ fn reduce_assistant_end(
     // Gating on `Running` keeps that materialize a pure read, so a
     // materialized box renders identically to a freshly resumed one. This
     // matters for a tool-concluding or interleaved sub whose thread-order
-    // last assistant differs from replay's bracket-order report. A live
-    // re-run flips the box back to `Running` via `AgentStart(Sub n)` before
-    // its `MessageEnd`s, so the live path still refreshes, and a backfill
-    // does the same through the re-synthesized `SubAgentStart` that opens
-    // the run's bracket.
+    // last assistant differs from the report its end carries. A prompt
+    // to a sub-agent whose run ended leaves the box as it is, so its
+    // messages do not reach the report either.
     //
     // The report tracks the last assistant text even when empty, mirroring
     // replay's `capture_sub_report`, so a tool-concluding sub shows a thin
@@ -1187,7 +1185,7 @@ fn append_tool_entry(
     if !call_id.is_empty() {
         render.tool_index.insert(call_id, id);
     }
-    // A tool call that arrives mid-turn means the assistant message
+    // A tool call that arrives mid-round means the assistant message
     // that emitted it is finished as far as the stream is concerned.
     // Drop the streaming target so post-tool assistant text opens a
     // fresh entry *after* the tool.
@@ -1250,7 +1248,7 @@ mod tests {
     use aj_models::types::{
         AssistantError, TextContent, ThinkingContent, ToolCall, Usage, UserMessage,
     };
-    use aj_session::ConversationPersistence;
+    use aj_session::ProjectSessions;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -1467,6 +1465,7 @@ mod tests {
             child: AgentId::Sub(n),
             task: format!("task {n}"),
             tool_name: "agent".into(),
+            call_id: None,
             background: false,
             settings: sub_settings(provider, model_id),
         }
@@ -1478,23 +1477,6 @@ mod tests {
         AgentEvent::MessageEnd {
             agent_id: AgentId::Sub(n),
             message: AgentMessage::wire(Message::Assistant(text_partial(text))),
-        }
-    }
-
-    /// A sub-agent assistant `MessageEnd` whose only content is a tool call,
-    /// the shape a tool-concluding sub-agent's final turn takes: no Text
-    /// blocks, so its concluding report is empty.
-    fn sub_tool_only_end(n: usize, call_id: &str, tool: &str) -> AgentEvent {
-        AgentEvent::MessageEnd {
-            agent_id: AgentId::Sub(n),
-            message: AgentMessage::wire(Message::Assistant(partial_with(vec![
-                AssistantContent::ToolCall(ToolCall {
-                    is_raw: false,
-                    id: call_id.into(),
-                    name: tool.into(),
-                    arguments: serde_json::json!({}),
-                }),
-            ]))),
         }
     }
 
@@ -2248,6 +2230,65 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_to_a_finished_sub_agent_leaves_its_box_alone() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "first result".into(),
+                conclusion: SubAgentConclusion::Completed,
+            },
+        );
+
+        // The user talks to the sub-agent again. Nothing of that reaches
+        // the parent, so the box keeps standing for the delegated run.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+                assignment_pending: false,
+            },
+        );
+        assert!(
+            life.is_running(AgentId::Sub(1)),
+            "the sub-agent reads as busy"
+        );
+        assert_eq!(s.sub_box_mut(1).expect("box").status, SubAgentStatus::Done);
+        apply(&mut s, &mut life, sub_assistant_end(1, "second result"));
+        // So does the start a backfill synthesizes for a run in progress.
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+            None,
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                assignment_pending: false,
+                messages: Vec::new(),
+                waiting: false,
+            },
+        );
+        let b = s.sub_box_mut(1).expect("box");
+        assert_eq!(b.status, SubAgentStatus::Done);
+        assert_eq!(b.report.as_deref(), Some("first result"));
+    }
+
+    #[test]
     fn sub_agent_end_conclusion_drives_the_box_status() {
         // Each conclusion maps to a distinct box status. On the live path
         // `AgentEnd(Sub n)` fires first and marks the still-running box
@@ -2337,264 +2378,6 @@ mod tests {
             s.sub_box_mut(1).expect("box").status,
             SubAgentStatus::Failed,
         );
-    }
-
-    #[test]
-    fn continuation_refreshes_the_box_report_from_the_latest_conclusion() {
-        // The box renders `report`. A continuation re-run completes through
-        // `AgentEnd(Sub n)`, which carries no report, so the report is kept
-        // fresh from the sub's latest assistant conclusion. Without that the
-        // box would keep showing the first run's report.
-        let mut s = state();
-        let mut life = AgentLifecycle::default();
-        apply(
-            &mut s,
-            &mut life,
-            sub_agent_start(1, "scripted", "scripted"),
-        );
-
-        // First run: concludes and ends via `SubAgentEnd`.
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-            },
-        );
-        apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::SubAgentEnd {
-                parent: AgentId::Main,
-                child: AgentId::Sub(1),
-                report: "first result".into(),
-                conclusion: aj_agent::events::SubAgentConclusion::Completed,
-            },
-        );
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentEnd {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-                messages: Vec::new(),
-                waiting: false,
-            },
-        );
-        assert_eq!(
-            s.sub_box_mut(1).expect("box").report.as_deref(),
-            Some("first result"),
-        );
-
-        // Continuation re-run: a fresh conclusion, then `AgentEnd` with NO
-        // `SubAgentEnd`.
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-            },
-        );
-        apply(&mut s, &mut life, sub_assistant_end(1, "second result"));
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentEnd {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-                messages: Vec::new(),
-                waiting: false,
-            },
-        );
-
-        let b = s.sub_box_mut(1).expect("box");
-        assert_eq!(b.status, SubAgentStatus::Done);
-        assert_eq!(
-            b.report.as_deref(),
-            Some("second result"),
-            "the box report tracks the latest run's conclusion",
-        );
-    }
-
-    #[test]
-    fn continuation_with_a_tool_concluding_run_blanks_the_box_report() {
-        // A tool-concluding (or aborted) final turn carries no Text blocks, so
-        // its concluding report is empty. The box report must track that empty
-        // text rather than keep the previous run's conclusion, because replay's
-        // `capture_sub_report` overwrites unconditionally and would show an
-        // empty report on a later resume. Diverging here would break parity.
-        let mut s = state();
-        let mut life = AgentLifecycle::default();
-        apply(
-            &mut s,
-            &mut life,
-            sub_agent_start(1, "scripted", "scripted"),
-        );
-
-        // First run: a prose conclusion, ends via `SubAgentEnd`.
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-            },
-        );
-        apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::SubAgentEnd {
-                parent: AgentId::Main,
-                child: AgentId::Sub(1),
-                report: "first result".into(),
-                conclusion: aj_agent::events::SubAgentConclusion::Completed,
-            },
-        );
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentEnd {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-                messages: Vec::new(),
-                waiting: false,
-            },
-        );
-        assert_eq!(
-            s.sub_box_mut(1).expect("box").report.as_deref(),
-            Some("first result"),
-        );
-
-        // Continuation re-run whose final assistant turn is tool-only, then
-        // `AgentEnd` with no `SubAgentEnd`.
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-            },
-        );
-        apply(&mut s, &mut life, sub_tool_only_end(1, "c1", "read_file"));
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentEnd {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-                messages: Vec::new(),
-                waiting: false,
-            },
-        );
-
-        let b = s.sub_box_mut(1).expect("box");
-        assert_eq!(b.status, SubAgentStatus::Done);
-        assert_eq!(
-            b.report.as_deref(),
-            Some(""),
-            "the box report tracks the empty conclusion, not the prior run",
-        );
-        // The empty turn does not blank the last meaningful activity line.
-        assert_eq!(b.latest_activity.as_deref(), Some("first result"));
-    }
-
-    #[test]
-    fn a_resynthesized_sub_agent_start_reopens_a_concluded_box() {
-        // The state a client holds once a run of `Sub(1)` has finished: box
-        // `Done`, carrying that run's report.
-        let concluded = || {
-            let mut s = state();
-            let mut life = AgentLifecycle::default();
-            apply(
-                &mut s,
-                &mut life,
-                sub_agent_start(1, "scripted", "scripted"),
-            );
-            apply(
-                &mut s,
-                &mut life,
-                AgentEvent::AgentStart {
-                    agent_id: AgentId::Sub(1),
-                    assignment_pending: false,
-                },
-            );
-            apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
-            apply(
-                &mut s,
-                &mut life,
-                AgentEvent::SubAgentEnd {
-                    parent: AgentId::Main,
-                    child: AgentId::Sub(1),
-                    report: "first result".into(),
-                    conclusion: SubAgentConclusion::Completed,
-                },
-            );
-            apply(
-                &mut s,
-                &mut life,
-                AgentEvent::AgentEnd {
-                    agent_id: AgentId::Sub(1),
-                    assignment_pending: false,
-                    messages: Vec::new(),
-                    waiting: false,
-                },
-            );
-            (s, life)
-        };
-
-        // A re-attach during a continuation: the backfill carries no
-        // `AgentStart(Sub 1)` (nothing persists one), so the entry-less
-        // start it synthesizes to bracket the continuation's entries is the
-        // only signal that the run is under way.
-        let (mut s, mut life) = concluded();
-        let _ = reduce(
-            &mut s,
-            &mut life,
-            sub_agent_start(1, "scripted", "scripted"),
-            None,
-        );
-        {
-            let b = s.sub_box_mut(1).expect("box");
-            assert_eq!(
-                b.status,
-                SubAgentStatus::Running,
-                "the glue marks the run it brackets in progress",
-            );
-            assert!(b.finished_at.is_none(), "and the runtime clock runs again");
-        }
-        // Which is what lets the bracketed entries refresh the report.
-        apply(&mut s, &mut life, sub_assistant_end(1, "second result"));
-        assert_eq!(
-            s.sub_box_mut(1).expect("box").report.as_deref(),
-            Some("second result"),
-        );
-
-        // A durable start names the spawn root of the run this box already
-        // stands for, so re-serving it is a pure read.
-        let (mut s, mut life) = concluded();
-        let root = "e-spawn-root".to_string();
-        let _ = reduce(
-            &mut s,
-            &mut life,
-            sub_agent_start(1, "scripted", "scripted"),
-            Some(&aj_wire::DurableEvent {
-                seq: 1,
-                entry_id: root.clone(),
-                branch_settings: None,
-            }),
-        );
-        let b = s.sub_box_mut(1).expect("box");
-        assert_eq!(
-            b.status,
-            SubAgentStatus::Done,
-            "a re-served spawn root does not resurrect a concluded box",
-        );
-        assert!(b.finished_at.is_some(), "its runtime clock stays frozen");
-        assert_eq!(b.report.as_deref(), Some("first result"));
     }
 
     #[test]
@@ -2785,45 +2568,6 @@ mod tests {
     }
 
     #[test]
-    fn continuation_rerun_restarts_the_runtime_clock() {
-        let mut s = state();
-        let mut life = AgentLifecycle::default();
-        apply(
-            &mut s,
-            &mut life,
-            sub_agent_start(1, "scripted", "scripted"),
-        );
-        let spawn_start = Instant::now() - Duration::from_secs(10);
-        s.sub_box_mut(1).expect("box").started_at = spawn_start;
-
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentEnd {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-                messages: Vec::new(),
-                waiting: false,
-            },
-        );
-        assert!(s.sub_box_mut(1).expect("box").finished_at.is_some());
-
-        // Idle, then a continuation re-run. The clock restarts (start advances,
-        // end cleared) so the runtime times the new run, not the idle gap.
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
-                assignment_pending: false,
-            },
-        );
-        let b = s.sub_box_mut(1).expect("box");
-        assert!(b.finished_at.is_none(), "re-run clears the frozen end");
-        assert!(b.started_at > spawn_start, "re-run resets the start");
-    }
-
-    #[test]
     fn agents_flag_background_subs_from_the_spawn_event() {
         let mut s = state();
         let mut life = AgentLifecycle::default();
@@ -2843,6 +2587,7 @@ mod tests {
                 child: AgentId::Sub(2),
                 task: "task 2".into(),
                 tool_name: "agent".into(),
+                call_id: None,
                 background: true,
                 settings: sub_settings("scripted", "scripted"),
             },
@@ -3437,7 +3182,7 @@ mod tests {
             },
         );
         match &entries(&s, AgentId::Main)[0].kind {
-            EntryKind::TurnUsage(u) => {
+            EntryKind::RoundUsage(u) => {
                 assert_eq!(u.agent_id, AgentId::Main);
                 assert_eq!(
                     u.line(),
@@ -3487,12 +3232,12 @@ mod tests {
         let redraw = reduce(
             &mut s,
             &mut life,
-            AgentEvent::TurnStart {
+            AgentEvent::RoundStart {
                 agent_id: AgentId::Main,
             },
             None,
         );
-        assert!(!redraw.0, "TurnStart is bookkeeping only");
+        assert!(!redraw.0, "RoundStart is bookkeeping only");
     }
 
     /// End-to-end: drive a real scripted agent, record its bus events,
@@ -3504,7 +3249,7 @@ mod tests {
         use crate::test_support::finalized_text_message;
 
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![finalized_text_message("hello from scripted")]);
         let (mut agent, _log, _persistence) = build_test_agent(&persistence, &run_config);
 
@@ -3755,10 +3500,10 @@ mod tests {
             },
         );
 
-        let rows: Vec<&TurnUsageEntry> = entries(&s, AgentId::Main)
+        let rows: Vec<&RoundUsageEntry> = entries(&s, AgentId::Main)
             .iter()
             .filter_map(|e| match &e.kind {
-                EntryKind::TurnUsage(u) => Some(u),
+                EntryKind::RoundUsage(u) => Some(u),
                 _ => None,
             })
             .collect();
@@ -3883,11 +3628,11 @@ mod tests {
             .collect()
     }
 
-    fn usage_rows(state: &ChatState, id: AgentId) -> Vec<&TurnUsageEntry> {
+    fn usage_rows(state: &ChatState, id: AgentId) -> Vec<&RoundUsageEntry> {
         entries(state, id)
             .iter()
             .filter_map(|e| match &e.kind {
-                EntryKind::TurnUsage(u) => Some(u),
+                EntryKind::RoundUsage(u) => Some(u),
                 _ => None,
             })
             .collect()

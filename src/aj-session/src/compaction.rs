@@ -1,12 +1,12 @@
 //! Pure compaction planning: token estimation, cut-point selection,
-//! conversation serialization, summary prompt templates, and file-op
+//! message serialization, summary prompt templates, and file-op
 //! extraction.
 //!
-//! Everything here operates on `&[ConversationEntry]` / `&[Message]`
+//! Everything here operates on `&[LogEntry]` / `&[Message]`
 //! and returns a plan; there is no provider, no async, and no I/O. The
 //! host (`aj`) calls [`prepare_compaction`] to compute a
 //! [`CompactionPlan`], generates the summary against its model, and
-//! records the result with `ConversationLog::append_compaction`.
+//! records the result with `SessionLog::append_compaction`.
 
 use std::collections::BTreeSet;
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_models::types::{AssistantContent, Message, UserContent, UserMessage};
 
-use crate::log::{Conversation, ConversationEntry, ConversationEntryKind, EntryId};
+use crate::log::{BranchView, EntryId, LogEntry, LogEntryKind};
 use crate::tool_details::expand_message;
 
 /// Files touched in a summarized range, surfaced so the model knows
@@ -202,15 +202,15 @@ fn assistant_usage_anchor(assistant: &aj_models::types::AssistantMessage) -> Opt
 /// assistant anchor then predates the summary, so its `usage` still
 /// reflects the old, pre-compaction prompt — the full summarized prefix
 /// included — rather than the reduced projection that will actually be
-/// sent next. Once a real assistant turn reports nonzero usage after the
-/// compaction, that turn measures the reduced context and the anchor is
-/// trustworthy again. Zero-usage turns do not revive an older pre-compaction
+/// sent next. Once a real assistant message reports nonzero usage after the
+/// compaction, that message measures the reduced context and the anchor is
+/// trustworthy again. Zero-usage messages do not revive an older pre-compaction
 /// anchor.
-fn usage_anchor_is_stale(entries: &[ConversationEntry]) -> bool {
+fn usage_anchor_is_stale(entries: &[LogEntry]) -> bool {
     for entry in entries.iter().rev() {
         match &entry.entry {
-            ConversationEntryKind::Compaction { .. } => return true,
-            ConversationEntryKind::Message { message }
+            LogEntryKind::Compaction { .. } => return true,
+            LogEntryKind::Message { message }
                 if matches!(
                     message.as_stored_wire(),
                     Some(Message::Assistant(assistant))
@@ -225,11 +225,11 @@ fn usage_anchor_is_stale(entries: &[ConversationEntry]) -> bool {
     false
 }
 
-/// Estimate context occupancy for a linearized conversation, honoring
+/// Estimate context occupancy for a branch, honoring
 /// compaction.
 ///
 /// Like [`estimate_context_tokens`] but compaction-aware. When a
-/// compaction sits at the head (no assistant turn has run since it),
+/// compaction sits at the head (no assistant message follows it),
 /// the retained tail's most recent assistant `usage` predates the
 /// summary and would over-report by the entire summarized prefix; we
 /// then estimate the projected messages (summary plus retained tail)
@@ -238,10 +238,10 @@ fn usage_anchor_is_stale(entries: &[ConversationEntry]) -> bool {
 ///
 /// Both compaction `tokens_before` / `tokens_after` and the resumed
 /// footer occupancy go through here, so the reported numbers match what
-/// the next turn will actually send.
-pub fn estimate_conversation_context(conversation: &Conversation) -> ContextEstimate {
-    let messages = conversation.messages();
-    if usage_anchor_is_stale(conversation.entries()) {
+/// the next request will actually send.
+pub fn estimate_branch_context(branch: &BranchView) -> ContextEstimate {
+    let messages = branch.messages();
+    if usage_anchor_is_stale(branch.entries()) {
         ContextEstimate {
             tokens: messages.iter().map(estimate_message_tokens).sum(),
             last_usage_index: None,
@@ -262,9 +262,9 @@ pub fn should_compact(context_tokens: u64, context_window: u64, threshold: f64) 
 /// Borrow the wire [`Message`] an entry literally stores, if it is a
 /// `Message` entry with a stored wire form. Settings / compaction /
 /// system-prompt entries and task notifications yield `None`.
-fn entry_wire(entry: &ConversationEntry) -> Option<&Message> {
+fn entry_wire(entry: &LogEntry) -> Option<&Message> {
     match &entry.entry {
-        ConversationEntryKind::Message { message } => message.as_stored_wire(),
+        LogEntryKind::Message { message } => message.as_stored_wire(),
         _ => None,
     }
 }
@@ -273,49 +273,45 @@ fn entry_wire(entry: &ConversationEntry) -> Option<&Message> {
 /// a `Message` entry. A task notification projects to its framed user
 /// message here, so it counts toward token budgets and feeds summaries;
 /// non-message entries yield `None`.
-fn entry_projected_wire(entry: &ConversationEntry) -> Option<Message> {
+fn entry_projected_wire(entry: &LogEntry) -> Option<Message> {
     match &entry.entry {
-        ConversationEntryKind::Message { message } => message.to_projected_wire(),
+        LogEntryKind::Message { message } => message.to_projected_wire(),
         _ => None,
     }
 }
 
-fn is_user_message(entry: &ConversationEntry) -> bool {
+fn is_user_message(entry: &LogEntry) -> bool {
     matches!(entry_wire(entry), Some(Message::User(_)))
 }
 
-fn is_assistant_message(entry: &ConversationEntry) -> bool {
+fn is_assistant_message(entry: &LogEntry) -> bool {
     matches!(entry_wire(entry), Some(Message::Assistant(_)))
 }
 
-/// Whether the entry is a task-completion notice (a typed
+/// Whether the entry is a task notification (a typed
 /// [`AgentMessageKind::TaskNotification`]).
-fn is_task_notification(entry: &ConversationEntry) -> bool {
+fn is_task_notification(entry: &LogEntry) -> bool {
     matches!(
         &entry.entry,
-        ConversationEntryKind::Message { message }
+        LogEntryKind::Message { message }
             if matches!(message.kind, AgentMessageKind::TaskNotification(_))
     )
 }
 
-/// Whether the entry starts a turn: a user prompt or a task notice.
+/// Whether the entry starts a turn: a user prompt or a task notification.
 ///
 /// A notice is followed by the assistant wake response, a coherent
 /// unit we do not want to split at a cut. `is_assistant_message` stays
 /// separate: an assistant message is a valid cut point but never a
 /// turn start.
-fn is_turn_start(entry: &ConversationEntry) -> bool {
+fn is_turn_start(entry: &LogEntry) -> bool {
     is_user_message(entry) || is_task_notification(entry)
 }
 
 /// Walk backward from `cut_index` (exclusive) down to `boundary_start`
-/// (inclusive) for the nearest turn start (user prompt or task notice),
+/// (inclusive) for the nearest turn start (user prompt or task notification),
 /// the turn that the cut lands inside.
-fn find_turn_start(
-    entries: &[ConversationEntry],
-    cut_index: usize,
-    boundary_start: usize,
-) -> Option<usize> {
+fn find_turn_start(entries: &[LogEntry], cut_index: usize, boundary_start: usize) -> Option<usize> {
     let mut i = cut_index;
     while i > boundary_start {
         i -= 1;
@@ -328,7 +324,7 @@ fn find_turn_start(
 
 /// Choose the first retained entry given a `keep_recent_tokens` budget.
 ///
-/// Valid cut points are turn starts (user prompts or task notices) and
+/// Valid cut points are turn starts (user prompts or task notifications) and
 /// assistant-message starts in `boundary_start..entries.len()`; a
 /// `tool_result` is never a cut point, because keeping a result whose
 /// call was summarized away would orphan it on the wire. The walk
@@ -338,7 +334,7 @@ fn find_turn_start(
 /// on an assistant message mid-turn, `turn_start_index` carries the turn's
 /// start (its user prompt or notice) for a separate prefix summary.
 pub fn find_cut_point(
-    entries: &[ConversationEntry],
+    entries: &[LogEntry],
     boundary_start: usize,
     keep_recent_tokens: u64,
 ) -> Option<CutPoint> {
@@ -351,7 +347,7 @@ pub fn find_cut_point(
 }
 
 fn find_tail_cut(
-    entries: &[ConversationEntry],
+    entries: &[LogEntry],
     boundary_start: usize,
     tail_tokens: u64,
     reserved_users: &BTreeSet<usize>,
@@ -408,7 +404,7 @@ fn find_tail_cut(
 
 /// Prefer whole recent user messages across the active ancestry. Task notices
 /// are not user requests, even though their provider projection uses that role.
-fn reserve_user_messages(entries: &[ConversationEntry], budget: u64) -> (BTreeSet<usize>, u64) {
+fn reserve_user_messages(entries: &[LogEntry], budget: u64) -> (BTreeSet<usize>, u64) {
     let mut remaining = budget;
     let mut selected = BTreeSet::new();
     for (index, entry) in entries.iter().enumerate().rev() {
@@ -431,7 +427,7 @@ fn reserve_user_messages(entries: &[ConversationEntry], budget: u64) -> (BTreeSe
 /// summarizer flattened text instead of the raw message list keeps the
 /// request from tripping provider tool-call/tool-result pairing rules
 /// and avoids re-sending image bytes.
-pub fn serialize_conversation(messages: &[Message]) -> String {
+pub fn serialize_messages(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(messages.len());
     for message in messages {
         match message {
@@ -512,9 +508,9 @@ fn append_custom_focus(prompt: &mut String, custom: Option<&str>) {
 }
 
 /// Build the prompt for the first compaction on a thread.
-pub fn initial_summary_prompt(conversation_text: &str, custom: Option<&str>) -> String {
+pub fn initial_summary_prompt(messages_text: &str, custom: Option<&str>) -> String {
     let mut prompt = format!(
-        "<conversation>\n{conversation_text}\n</conversation>\n\nCreate a continuation checkpoint from this conversation.\n\n{SUMMARY_CONTENT_GUIDANCE}"
+        "<conversation>\n{messages_text}\n</conversation>\n\nCreate a continuation checkpoint from this conversation.\n\n{SUMMARY_CONTENT_GUIDANCE}"
     );
     append_custom_focus(&mut prompt, custom);
     prompt
@@ -524,12 +520,12 @@ pub fn initial_summary_prompt(conversation_text: &str, custom: Option<&str>) -> 
 /// the previous summary, preserving everything still relevant. The
 /// previous summary is source material, not a required output format.
 pub fn update_summary_prompt(
-    conversation_text: &str,
+    messages_text: &str,
     previous_summary: &str,
     custom: Option<&str>,
 ) -> String {
     let mut prompt = format!(
-        "<conversation>\n{conversation_text}\n</conversation>\n\n<previous-summary>\n{previous_summary}\n</previous-summary>\n\n{UPDATE_SUMMARY_INSTRUCTION}\n\n{SUMMARY_CONTENT_GUIDANCE}"
+        "<conversation>\n{messages_text}\n</conversation>\n\n<previous-summary>\n{previous_summary}\n</previous-summary>\n\n{UPDATE_SUMMARY_INSTRUCTION}\n\n{SUMMARY_CONTENT_GUIDANCE}"
     );
     append_custom_focus(&mut prompt, custom);
     prompt
@@ -537,9 +533,9 @@ pub fn update_summary_prompt(
 
 /// Build the prompt for summarizing a split-turn prefix into a short
 /// summary that gives the retained suffix its setup.
-pub fn turn_prefix_summary_prompt(conversation_text: &str) -> String {
+pub fn turn_prefix_summary_prompt(messages_text: &str) -> String {
     format!(
-        "<conversation>\n{conversation_text}\n</conversation>\n\nThese messages are the earlier part of an ongoing turn. Later messages will be retained separately and are not shown here. Summarize the request and progress shown here, with the context needed to understand the later work. Do not infer or reconstruct those later messages.\n\n{SUMMARY_CONTENT_GUIDANCE}"
+        "<conversation>\n{messages_text}\n</conversation>\n\nThese messages are the earlier part of an ongoing turn. Later messages will be retained separately and are not shown here. Summarize the request and progress shown here, with the context needed to understand the later work. Do not infer or reconstruct those later messages.\n\n{SUMMARY_CONTENT_GUIDANCE}"
     )
 }
 
@@ -595,11 +591,8 @@ pub fn extract_file_ops(
 /// root. Up to half the retention budget selects original user messages
 /// across the full ancestry. The remaining budget keeps a tool-safe suffix,
 /// charging selected users only once. This does not call the model.
-pub fn prepare_compaction(
-    conversation: &Conversation,
-    keep_recent_tokens: u64,
-) -> Option<CompactionPlan> {
-    let entries = conversation.entries();
+pub fn prepare_compaction(branch: &BranchView, keep_recent_tokens: u64) -> Option<CompactionPlan> {
+    let entries = branch.entries();
     if entries.is_empty() {
         return None;
     }
@@ -608,8 +601,8 @@ pub fn prepare_compaction(
             .iter()
             .rev()
             .map(|e| &e.entry)
-            .find(|entry| !matches!(entry, ConversationEntryKind::CompactionFailed { .. })),
-        Some(ConversationEntryKind::Compaction { .. })
+            .find(|entry| !matches!(entry, LogEntryKind::CompactionFailed { .. })),
+        Some(LogEntryKind::Compaction { .. })
     ) {
         return None;
     }
@@ -622,7 +615,7 @@ pub fn prepare_compaction(
         .enumerate()
         .rev()
         .find_map(|(c, e)| match &e.entry {
-            ConversationEntryKind::Compaction {
+            LogEntryKind::Compaction {
                 summary,
                 first_kept_entry_id,
                 details,
@@ -648,7 +641,7 @@ pub fn prepare_compaction(
     };
 
     // `tokens_before` is the current (compaction-aware) occupancy.
-    let tokens_before = estimate_conversation_context(conversation).tokens;
+    let tokens_before = estimate_branch_context(branch).tokens;
 
     let (reserved_users, user_tokens) = reserve_user_messages(entries, keep_recent_tokens / 2);
     let cut = find_tail_cut(
@@ -666,7 +659,7 @@ pub fn prepare_compaction(
     let mut messages_to_summarize: Vec<Message> = entries[boundary_start..history_end]
         .iter()
         .filter_map(|e| match &e.entry {
-            ConversationEntryKind::Message { message } => {
+            LogEntryKind::Message { message } => {
                 expand_message(message.clone()).to_projected_wire()
             }
             _ => None,
@@ -677,7 +670,7 @@ pub fn prepare_compaction(
         Some(turn_start) => entries[turn_start..cut.first_kept_index]
             .iter()
             .filter_map(|e| match &e.entry {
-                ConversationEntryKind::Message { message } => {
+                LogEntryKind::Message { message } => {
                     expand_message(message.clone()).to_projected_wire()
                 }
                 _ => None,
@@ -714,21 +707,21 @@ pub fn prepare_compaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log::{ConversationEntry, ConversationEntryKind, ThreadKind};
+    use crate::log::{LogEntry, LogEntryKind, ThreadKind};
     use aj_models::types::{
         AssistantContent, AssistantMessage, TextContent, ToolCall, ToolResultMessage, Usage,
         UserContent, UserMessage,
     };
     use serde_json::json;
 
-    fn msg_entry(id: &str, message: Message) -> ConversationEntry {
-        ConversationEntry {
+    fn msg_entry(id: &str, message: Message) -> LogEntry {
+        LogEntry {
             id: id.to_string(),
             parent_id: None,
             timestamp: None,
-            thread: ThreadKind::User,
+            thread: ThreadKind::Main,
             agent_id: None,
-            entry: ConversationEntryKind::Message {
+            entry: LogEntryKind::Message {
                 message: AgentMessage::wire(message),
             },
         }
@@ -764,15 +757,15 @@ mod tests {
         })
     }
 
-    fn notification_entry(id: &str, body: &str) -> ConversationEntry {
+    fn notification_entry(id: &str, body: &str) -> LogEntry {
         use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
-        ConversationEntry {
+        LogEntry {
             id: id.to_string(),
             parent_id: None,
             timestamp: None,
-            thread: ThreadKind::User,
+            thread: ThreadKind::Main,
             agent_id: None,
-            entry: ConversationEntryKind::Message {
+            entry: LogEntryKind::Message {
                 message: AgentMessage::task_notification(TaskNotification::new(
                     "cargo build".to_string(),
                     TaskNotificationKind::Bash,
@@ -783,14 +776,14 @@ mod tests {
         }
     }
 
-    fn compaction_entry(id: &str, first_kept: &str, summary: &str) -> ConversationEntry {
-        ConversationEntry {
+    fn compaction_entry(id: &str, first_kept: &str, summary: &str) -> LogEntry {
+        LogEntry {
             id: id.to_string(),
             parent_id: None,
             timestamp: None,
-            thread: ThreadKind::User,
+            thread: ThreadKind::Main,
             agent_id: None,
-            entry: ConversationEntryKind::Compaction {
+            entry: LogEntryKind::Compaction {
                 summary: summary.to_string(),
                 first_kept_entry_id: first_kept.to_string(),
                 retained_user_entry_ids: Vec::new(),
@@ -817,9 +810,9 @@ mod tests {
         Message::ToolResult(ToolResultMessage::text(id, name, body, false))
     }
 
-    /// A two-turn conversation: a large first turn, then a tool-using
+    /// A two-turn branch: a large first turn, then a tool-using
     /// second turn (user, tool_call, tool_result, assistant).
-    fn sample_entries() -> Vec<ConversationEntry> {
+    fn sample_entries() -> Vec<LogEntry> {
         vec![
             msg_entry("0", user(&"x".repeat(400))),           // 100 tokens
             msg_entry("1", assistant_text(&"y".repeat(400))), // 100 tokens
@@ -858,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_conversation_context_ignores_stale_usage_after_compaction() {
+    fn estimate_branch_context_ignores_stale_usage_after_compaction() {
         // A compaction at the head: the retained tail's assistant still
         // carries the pre-compaction 100k usage. That anchor is stale
         // (it counts the now-summarized prefix), so the estimate must
@@ -871,8 +864,8 @@ mod tests {
             msg_entry("3", assistant_with_usage("recent reply", 100_000)),
             compaction_entry("4", "2", "SUMMARY"),
         ];
-        let conv = Conversation::from_entries("t".to_string(), entries);
-        let est = estimate_conversation_context(&conv);
+        let conv = BranchView::from_entries("t".to_string(), entries);
+        let est = estimate_branch_context(&conv);
         assert_eq!(est.last_usage_index, None);
         assert!(
             est.tokens < 1_000,
@@ -882,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_conversation_context_uses_usage_after_post_compaction_turn() {
+    fn estimate_branch_context_uses_usage_after_post_compaction_turn() {
         // A real turn ran after the compaction; its 5k usage measures
         // the reduced context and is authoritative again.
         let entries = vec![
@@ -892,8 +885,8 @@ mod tests {
             msg_entry("3", user("new request")),
             msg_entry("4", assistant_with_usage("new reply", 5_000)),
         ];
-        let conv = Conversation::from_entries("t".to_string(), entries);
-        let est = estimate_conversation_context(&conv);
+        let conv = BranchView::from_entries("t".to_string(), entries);
+        let est = estimate_branch_context(&conv);
         assert!(est.last_usage_index.is_some());
         assert!(
             (5_000..6_000).contains(&est.tokens),
@@ -942,7 +935,7 @@ mod tests {
 
     #[test]
     fn find_cut_point_treats_notice_as_turn_start() {
-        // A task notice followed by its wake response. The notice is a
+        // A task notification followed by its wake response. The notice is a
         // valid cut point and a turn start, so a cut landing on it keeps
         // the notice-plus-wake unit intact and sets no split turn.
         let entries = vec![
@@ -973,9 +966,9 @@ mod tests {
             msg_entry("3", user(&"r".repeat(400))), // 100 tokens (recent)
             msg_entry("4", assistant_text(&"s".repeat(400))), // 100 tokens
         ];
-        let conv = Conversation::from_entries("t".to_string(), entries);
+        let conv = BranchView::from_entries("t".to_string(), entries);
         let plan = prepare_compaction(&conv, 10).expect("plan");
-        let joined = serialize_conversation(&plan.messages_to_summarize);
+        let joined = serialize_messages(&plan.messages_to_summarize);
         assert!(
             joined.contains("<task-notification>") && joined.contains("TASK_MARKER"),
             "notice text must feed the summary, got {joined:?}"
@@ -993,11 +986,11 @@ mod tests {
             msg_entry("5", tool_result("c1", "read_file", &"x".repeat(4000))),
             msg_entry("6", assistant_text("recent work")),
         ];
-        let conv = Conversation::from_entries("t".to_string(), entries);
+        let conv = BranchView::from_entries("t".to_string(), entries);
         let plan =
             prepare_compaction(&conv, 100).expect("the active turn has a summarizable prefix");
         assert_eq!(plan.previous_summary.as_deref(), Some("prior checkpoint"));
-        let input = serialize_conversation(&plan.messages_to_summarize);
+        let input = serialize_messages(&plan.messages_to_summarize);
         assert!(input.contains("active request") && input.contains("[tool call: read_file"));
         assert!(!input.contains("earlier task") && !input.contains("recent work"));
         assert!(
@@ -1020,8 +1013,8 @@ mod tests {
             msg_entry("6", assistant_text(&"z".repeat(800))),
             msg_entry("7", assistant_text("tail")),
         ];
-        let conversation = Conversation::from_entries("t".into(), entries);
-        let plan = prepare_compaction(&conversation, 100).unwrap();
+        let branch = BranchView::from_entries("t".into(), entries);
+        let plan = prepare_compaction(&branch, 100).unwrap();
         assert_eq!(plan.retained_user_entry_ids, ["2", "5"]);
         assert_eq!(plan.first_kept_entry_id, "7");
     }
@@ -1037,8 +1030,8 @@ mod tests {
                 msg_entry("4", tool_result("c", "read_file", &"y".repeat(tail_chars))),
                 msg_entry("5", assistant_text("done")),
             ];
-            let conversation = Conversation::from_entries("t".into(), entries);
-            let plan = prepare_compaction(&conversation, 100).unwrap();
+            let branch = BranchView::from_entries("t".into(), entries);
+            let plan = prepare_compaction(&branch, 100).unwrap();
             assert_eq!(
                 plan.first_kept_entry_id, "2",
                 "the recent tool exchange fits"
@@ -1048,7 +1041,7 @@ mod tests {
                 ["0"],
                 "the user in the tail is not repeated"
             );
-            let kept: u64 = conversation
+            let kept: u64 = branch
                 .entries()
                 .iter()
                 .filter(|entry| entry.id == "0" || entry.id.as_str() >= "2")
@@ -1072,12 +1065,12 @@ mod tests {
             msg_entry("2", user(&huge)),
             msg_entry("3", assistant_text("tail")),
         ];
-        let conversation = Conversation::from_entries("t".into(), entries);
+        let branch = BranchView::from_entries("t".into(), entries);
         for (budget, expected) in [(2400, vec![]), (2500, vec!["0"])] {
-            let plan = prepare_compaction(&conversation, budget).unwrap();
+            let plan = prepare_compaction(&branch, budget).unwrap();
             assert_eq!(plan.retained_user_entry_ids, expected);
             assert_eq!(plan.first_kept_entry_id, "3");
-            let prefix = serialize_conversation(&plan.turn_prefix_messages);
+            let prefix = serialize_messages(&plan.turn_prefix_messages);
             assert!(
                 prefix.contains(&huge),
                 "oversized user content still reaches the summarizer"
@@ -1109,15 +1102,15 @@ mod tests {
                 .enumerate()
                 .map(|(i, message)| msg_entry(&format!("tail-{i}"), message.clone())),
         );
-        let conversation = Conversation::from_entries("t".into(), entries.clone());
-        let plan = prepare_compaction(&conversation, 100).expect("the request can be summarized");
+        let branch = BranchView::from_entries("t".into(), entries.clone());
+        let plan = prepare_compaction(&branch, 100).expect("the request can be summarized");
         assert_eq!(plan.first_kept_entry_id, "tail-0");
         entries.push(compaction_entry(
             "checkpoint",
             &plan.first_kept_entry_id,
             "summary",
         ));
-        let projected = Conversation::from_entries("t".into(), entries).messages();
+        let projected = BranchView::from_entries("t".into(), entries).messages();
         assert_eq!(
             serde_json::to_value(&projected[projected.len() - tail.len()..]).unwrap(),
             serde_json::to_value(tail).unwrap()
@@ -1128,17 +1121,16 @@ mod tests {
     fn occupancy_counts_a_notice() {
         // `messages()` projects the notice, so occupancy estimation sees
         // its tokens rather than dropping it.
-        let with_notice = Conversation::from_entries(
+        let with_notice = BranchView::from_entries(
             "t".to_string(),
             vec![
                 msg_entry("0", user("hi")),
                 notification_entry("1", &"z".repeat(400)),
             ],
         );
-        let without = Conversation::from_entries("t".to_string(), vec![msg_entry("0", user("hi"))]);
+        let without = BranchView::from_entries("t".to_string(), vec![msg_entry("0", user("hi"))]);
         assert!(
-            estimate_conversation_context(&with_notice).tokens
-                > estimate_conversation_context(&without).tokens,
+            estimate_branch_context(&with_notice).tokens > estimate_branch_context(&without).tokens,
             "the notice must contribute to occupancy"
         );
     }
@@ -1170,13 +1162,13 @@ mod tests {
     }
 
     #[test]
-    fn serialize_conversation_inlines_tool_calls_and_results() {
+    fn serialize_messages_inlines_tool_calls_and_results() {
         let messages = vec![
             user("hello"),
             tool_call("c1", "read_file", json!({"path": "/x"})),
             tool_result("c1", "read_file", "file body"),
         ];
-        let text = serialize_conversation(&messages);
+        let text = serialize_messages(&messages);
         assert!(text.contains("User:"));
         assert!(text.contains("hello"));
         assert!(text.contains("[tool call: read_file"));
@@ -1186,19 +1178,19 @@ mod tests {
     }
 
     #[test]
-    fn serialize_conversation_notes_images() {
+    fn serialize_messages_notes_images() {
         let img = Message::User(UserMessage::new(vec![UserContent::image(
             "base64data",
             "image/png",
         )]));
-        let text = serialize_conversation(&[img]);
+        let text = serialize_messages(&[img]);
         assert!(text.contains("[image: image/png]"));
     }
 
     #[test]
-    fn serialize_conversation_truncates_large_tool_results() {
+    fn serialize_messages_truncates_large_tool_results() {
         let big = "z".repeat(10_000);
-        let text = serialize_conversation(&[tool_result("c1", "read_file", &big)]);
+        let text = serialize_messages(&[tool_result("c1", "read_file", &big)]);
         assert!(text.contains("more characters truncated"));
         // The body is bounded near the cap, well under the original size.
         assert!(text.chars().count() < TOOL_RESULT_MAX_CHARS + 200);

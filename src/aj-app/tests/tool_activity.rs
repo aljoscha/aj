@@ -13,9 +13,7 @@ use aj_app::session::AgentLifecycle;
 use aj_models::types::{
     AssistantContent, AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage,
 };
-use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener, project_suffix,
-};
+use aj_session::{Journal, ProjectSessions, SessionLog, ThreadFilter, project_suffix};
 use aj_wire::{DecodedFrame, DurableEvent, Frame};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -23,10 +21,10 @@ use tokio::sync::Mutex;
 #[tokio::test]
 async fn tool_activity_persists_replays_and_stays_out_of_model_context() {
     let dir = tempfile::TempDir::new().unwrap();
-    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-    let log = Arc::new(Mutex::new(ConversationLog::create(&persistence).unwrap()));
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
+    let log = Arc::new(Mutex::new(SessionLog::create(&persistence).unwrap()));
     let bus = EventBus::new();
-    let _subscription = bus.subscribe(persistence_listener(Arc::clone(&log)));
+    bus.set_committer(Journal::new(Arc::clone(&log)).committer());
     let body = "nested output, not model input\n".repeat(30);
     let details = ToolDetails::Text {
         summary: "nested read".into(),
@@ -106,26 +104,26 @@ async fn tool_activity_persists_replays_and_stays_out_of_model_context() {
         let _ = reduce(&mut live, &mut lifecycle, event, None);
     }
     let guard = log.lock().await;
-    let raw = std::fs::read_to_string(guard.path()).unwrap();
+    let stored = persistence.read_entries(guard.session_id()).unwrap();
+    let raw = serde_json::to_string(&stored).unwrap();
     assert!(
         raw.contains("body_ref"),
         "fixture must exercise detail hydration"
     );
-    let mut resumed = ConversationLog::resume(&persistence, guard.session_id()).unwrap();
+    let mut resumed = SessionLog::resume(&persistence, guard.session_id()).unwrap();
     drop(guard);
-    let head = resumed.latest_leaf(ThreadFilter::USER).unwrap();
-    let conversation = resumed.linearize(&head, ThreadFilter::USER);
-    assert_eq!(conversation.agent_messages().len(), 4);
-    assert_eq!(conversation.messages().len(), 1);
-    assert!(matches!(&conversation.messages()[0], Message::User(_)));
-    let model_messages =
-        aj_agent::projection::transcript_to_messages(&conversation.agent_messages());
+    let head = resumed.latest_leaf(ThreadFilter::MAIN).unwrap();
+    let branch = resumed.linearize(&head, ThreadFilter::MAIN);
+    assert_eq!(branch.agent_messages().len(), 4);
+    assert_eq!(branch.messages().len(), 1);
+    assert!(matches!(&branch.messages()[0], Message::User(_)));
+    let model_messages = aj_agent::projection::transcript_to_messages(&branch.agent_messages());
     assert_eq!(
         serde_json::to_value(model_messages).unwrap(),
-        serde_json::to_value(conversation.messages()).unwrap(),
+        serde_json::to_value(branch.messages()).unwrap(),
         "the agent's inference projection of the resume seed excludes audit data"
     );
-    for audit in conversation.agent_messages().iter().skip(1) {
+    for audit in branch.agent_messages().iter().skip(1) {
         assert!(audit.as_stored_wire().is_none());
         assert!(audit.to_projected_wire().is_none());
     }
@@ -203,7 +201,7 @@ async fn tool_activity_persists_replays_and_stays_out_of_model_context() {
 
     resumed
         .append_compaction(
-            ThreadFilter::USER,
+            ThreadFilter::MAIN,
             "summary".into(),
             call_entry,
             vec![],
@@ -212,10 +210,10 @@ async fn tool_activity_persists_replays_and_stays_out_of_model_context() {
             Default::default(),
         )
         .unwrap();
-    let resumed = ConversationLog::resume(&persistence, resumed.session_id()).unwrap();
-    let head = resumed.latest_leaf(ThreadFilter::USER).unwrap();
-    let conversation = resumed.linearize(&head, ThreadFilter::USER);
-    let messages = aj_agent::projection::transcript_to_messages(&conversation.agent_messages());
+    let resumed = SessionLog::resume(&persistence, resumed.session_id()).unwrap();
+    let head = resumed.latest_leaf(ThreadFilter::MAIN).unwrap();
+    let branch = resumed.linearize(&head, ThreadFilter::MAIN);
+    let messages = aj_agent::projection::transcript_to_messages(&branch.agent_messages());
     assert_eq!(
         messages.len(),
         1,

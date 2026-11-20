@@ -319,6 +319,23 @@ impl Control {
         }
     }
 
+    /// One page of `agent`'s history before log position `before` (see
+    /// [`aj_wire::HistoryPage`]).
+    pub(crate) async fn history(
+        &self,
+        session: &str,
+        agent: AgentId,
+        before: u64,
+        limit: u64,
+    ) -> Result<aj_wire::HistoryPage, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.history(session, agent, before, limit).await?),
+            Self::Remote(remote) => {
+                Ok(remote.client.history(session, agent, before, limit).await?)
+            }
+        }
+    }
+
     /// Export the host's complete log, not the client's attached transcript.
     pub(crate) async fn export_html(
         &self,
@@ -699,6 +716,7 @@ fn wire_command(command: Command) -> RemoteCommand {
         }
         Command::KillAgent { agent } => RemoteCommand::KillAgent(KillAgentRequest { agent }),
         Command::KillTask { task } => RemoteCommand::KillTask(task),
+        Command::Continue => RemoteCommand::Continue,
     }
 }
 
@@ -880,7 +898,7 @@ impl Stream {
 pub(crate) mod history_tests {
     use super::*;
     use crate::remote::tests::{
-        HostHandles, addr, bounded, history_updates, scripted, scripted_host,
+        HostHandles, addr, bounded, history_updates, host_setup, scripted, snapshot,
     };
     use crate::remote::{IdentityGate, RemoteServer};
     use std::time::Duration;
@@ -895,6 +913,7 @@ pub(crate) mod history_tests {
                 "{}",
                 serde_json::json!({
                     "id": i.to_string(), "thread": "user", "type": "message",
+                    "parent_id": i.checked_sub(1).map(|parent| parent.to_string()),
                     "timestamp": chrono::DateTime::from_timestamp_millis(*time).unwrap(),
                     "message": { "role": "user", "timestamp": time,
                         "content": [{"type": "text", "text": text}] }
@@ -918,52 +937,75 @@ pub(crate) mod history_tests {
         let mut prompts = bulk.iter().map(|s| (s.as_str(), 3)).collect::<Vec<_>>();
         prompts.push(("shared", 10000));
         write_prompts(&other, "z", &prompts);
-        let host = scripted_host(
+        let persistence = aj_session::ProjectSessions::for_project(
+            dir.path().join("sessions.sqlite3"),
+            store.clone(),
+            "sessions".into(),
+        );
+        let other_persistence = aj_session::ProjectSessions::for_project(
+            persistence.sqlite_path(),
+            other.clone(),
+            "other-workspace".into(),
+        );
+        let mut setup = host_setup(
             &dir,
-            scripted(vec![], 0, Duration::ZERO),
+            snapshot(scripted(vec![], 0, Duration::ZERO)),
             HostHandles::new(&dir),
             None,
         );
+        setup.persistence = persistence.clone();
+        let host = aj_app::host::SessionHost::new(setup).unwrap();
         let server = RemoteServer::bind(host.clone(), addr("127.0.0.1:0"), IdentityGate::local())
             .await
             .unwrap();
         let client = RemoteClient::new(&server.url()).unwrap();
         let local = Control::local(host.clone());
         let remote = Control::remote(client);
-        for session in [Some("a"), None] {
-            let left = bounded(
-                "local history",
-                local.prompt_history(session, history_updates()),
-            )
-            .await
-            .unwrap();
-            let right = bounded(
-                "HTTP history",
-                remote.prompt_history(session, history_updates()),
-            )
-            .await
-            .unwrap();
-            assert_eq!(left, right);
-            assert!(right.incomplete.is_empty());
-            if session.is_some() {
-                assert_eq!(
-                    right
-                        .prompts
-                        .iter()
-                        .map(|p| p.text.as_str())
-                        .collect::<Vec<_>>(),
-                    [&text, "shared", "workspace-only"]
-                );
-                assert!(right.prompts.iter().all(|p| p.project.is_none()));
-            } else {
-                assert_eq!(right.prompts.len(), aj_wire::PROMPT_HISTORY_LIMIT);
-                assert_eq!(right.prompts[0].text, "shared");
-                assert_eq!(right.prompts[0].project.as_deref(), Some("other-workspace"));
-                assert_eq!(right.prompts[1].text, text);
-                assert_eq!(
-                    right.prompts.iter().filter(|p| p.text == "shared").count(),
-                    1
-                );
+        for sqlite in [false, true] {
+            if sqlite {
+                persistence.migrate_jsonl("a").unwrap();
+                other_persistence.migrate_jsonl("z").unwrap();
+                // A stale JSONL or intermediate database must not hide committed
+                // global history. Both adapters must still return the same prompts.
+                std::fs::write(store.join("a.jsonl"), b"stale source\n").unwrap();
+                std::fs::write(other.join("z.jsonl"), b"stale source\n").unwrap();
+                std::fs::write(store.join("sessions.sqlite3"), b"ignored intermediate").unwrap();
+            }
+            for session in [Some("a"), None] {
+                let left = bounded(
+                    "local history",
+                    local.prompt_history(session, history_updates()),
+                )
+                .await
+                .unwrap();
+                let right = bounded(
+                    "HTTP history",
+                    remote.prompt_history(session, history_updates()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(left, right);
+                assert!(right.incomplete.is_empty());
+                if session.is_some() {
+                    assert_eq!(
+                        right
+                            .prompts
+                            .iter()
+                            .map(|p| p.text.as_str())
+                            .collect::<Vec<_>>(),
+                        [&text, "shared", "workspace-only"]
+                    );
+                    assert!(right.prompts.iter().all(|p| p.project.is_none()));
+                } else {
+                    assert_eq!(right.prompts.len(), aj_wire::PROMPT_HISTORY_LIMIT);
+                    assert_eq!(right.prompts[0].text, "shared");
+                    assert_eq!(right.prompts[0].project.as_deref(), Some("other-workspace"));
+                    assert_eq!(right.prompts[1].text, text);
+                    assert_eq!(
+                        right.prompts.iter().filter(|p| p.text == "shared").count(),
+                        1
+                    );
+                }
             }
         }
         assert!(
@@ -1013,19 +1055,19 @@ mod preview_tests {
     async fn preview_adapters_read_archived_and_locked_cold_logs_without_materializing() {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
-        use aj_session::log::{ConversationEntryKind, ThreadKind};
-        use aj_session::{ConversationLog, ConversationPersistence, SessionLock};
+        use aj_session::log::{LogEntryKind, ThreadKind};
+        use aj_session::{ProjectSessions, SessionLock, SessionLog};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let text = format!("{} search-tail", "long prompt ".repeat(1000));
-        let mut log = ConversationLog::create(&persistence).expect("log");
+        let mut log = SessionLog::create(&persistence).expect("log");
         let id = log.session_id().to_string();
         log.append(
             None,
-            ThreadKind::User,
+            ThreadKind::Main,
             None,
-            ConversationEntryKind::Message {
+            LogEntryKind::Message {
                 message: AgentMessage::wire(Message::User(UserMessage::text(&text))),
             },
         )
@@ -1036,10 +1078,11 @@ mod preview_tests {
         let _lock = SessionLock::try_acquire(&persistence, &id, "other-writer")
             .expect("lock")
             .expect("not held");
-        let empty = ConversationLog::create(&persistence).expect("empty");
-        // Empty files can exist in the store even though creation alone is lazy.
-        std::fs::write(empty.path(), b"").expect("empty log file");
-        drop(empty);
+        // An empty JSONL file left in the store is a session too.
+        let empty = persistence
+            .sessions_dir()
+            .join("2000-01-01-00-00-00-000.jsonl");
+        std::fs::write(empty, b"").expect("empty log file");
         let host = scripted_host(
             &dir,
             scripted(vec![], 0, Duration::ZERO),
@@ -1099,7 +1142,7 @@ mod preview_tests {
         serde_json::json!({
             "session_id": id, "modified": "2026-01-01T00:00:00Z",
             "created_at": "2026-01-01T00:00:00Z", "last_message_at": "2026-01-01T00:00:00Z",
-            "size_bytes": 0, "message_count": 0, "first_user_message": null,
+            "message_count": 0, "first_user_message": null,
             "tag": null, "archived": false
         })
     }

@@ -205,7 +205,7 @@ impl FocusedTranscript {
                         self.push(entry.id, Part::Body);
                     }
                 }
-                EntryKind::TurnUsage(_) if group.is_some() => {
+                EntryKind::RoundUsage(_) if group.is_some() => {
                     if group.as_ref().is_some_and(|g| g.open) {
                         self.push(entry.id, Part::Body);
                     }

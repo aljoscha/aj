@@ -14,7 +14,7 @@
 //! - **Demos / `--scripted` CLI mode.** The binary plugs `ScriptedProvider`
 //!   in place of the real provider so users can eyeball the TUI's rendering
 //!   of thinking blocks, tool calls, errors, retries, etc., without a
-//!   network round-trip. Demos run for an unknown number of turns (the
+//!   network round-trip. Demos run for an unknown number of rounds (the
 //!   user can chat freely after the canned script finishes), so the
 //!   provider defaults to a lenient end-of-turn fallback
 //!   ([`ExhaustedBehavior::EndTurn`]) once the script queue is exhausted.

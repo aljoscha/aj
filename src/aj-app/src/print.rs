@@ -3,7 +3,7 @@
 //! The same `aj` binary can run
 //! without a TUI: it subscribes to the agent's event bus and writes
 //! plain text (or JSONL with `--format json`) to stdout, exiting when
-//! `Agent::prompt` returns. Same code path lets callers script the
+//! the prompt's turn returns. Same code path lets callers script the
 //! agent or embed it in a parent process.
 //!
 //! Two output formats:
@@ -25,7 +25,7 @@
 //!   writer; both observe the same event sequence.
 //!
 //! Print mode opens (or for `continue`, resumes) a
-//! [`ConversationLog`](aj_session::ConversationLog) the same way
+//! [`SessionLog`](aj_session::SessionLog) the same way
 //! interactive mode does, so a `aj --print "do X"` invocation leaves a
 //! resumable session on disk.
 //!
@@ -33,12 +33,12 @@
 //! session id), the resume flow does the same disk handshake as the
 //! interactive resume: open the session, reuse the persisted system
 //! prompt, repair any interrupted tool calls, then seed the agent's
-//! in-memory transcript from the linearized user thread. In JSON
+//! in-memory transcript from the linearized main thread. In JSON
 //! output mode the persisted history is streamed through the JSONL
 //! sink in [`aj_session::replay`] order *before* the new prompt
 //! runs, so consumers see the full event trace (historical and
 //! live) in emit order; in text mode the historical events are
-//! suppressed and only the new assistant turn's visible text is
+//! suppressed and only the new turn's visible text is
 //! printed, matching the one-shot text contract.
 //!
 //! Print mode always requires a positional `prompt` argument — it's
@@ -59,7 +59,7 @@ use aj_conf::{Config, Severity};
 use aj_models::auth::AuthStorage;
 #[cfg(test)]
 use aj_models::provider::Provider;
-use aj_session::{ConversationPersistence, ThreadFilter, persistence_listener, replay};
+use aj_session::{Journal, ProjectSessions, ThreadFilter, replay};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
@@ -111,15 +111,14 @@ pub async fn run(args: Args) -> Result<()> {
     // against it, and the `--api-key` override below targets it.
     let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
-    let sessions_dir = Config::get_sessions_dir_path()?;
-    let conversation_persistence = ConversationPersistence::new(sessions_dir);
+    let persistence = crate::current_project_persistence()?;
     let cwd = std::env::current_dir().unwrap_or_default();
 
     run_inner(
         args,
         config,
         auth,
-        conversation_persistence,
+        persistence,
         cwd,
         Arc::new(Mutex::new(io::stdout())),
         |_| {},
@@ -133,7 +132,7 @@ pub async fn run(args: Args) -> Result<()> {
 /// The flow mirrors interactive mode's session setup through the
 /// shared [`crate::session_setup`] primitives (resolve the run config
 /// with CLI > env > config precedence, open + repair the
-/// [`ConversationLog`](aj_session::ConversationLog), build the agent,
+/// [`SessionLog`](aj_session::SessionLog), build the agent,
 /// freeze + seed) but skips the
 /// readline loop: a single [`Agent::prompt`] runs to completion, then
 /// the function either prints the final assistant text (text mode) or
@@ -144,7 +143,7 @@ pub async fn run(args: Args) -> Result<()> {
 /// requested session (or "latest for this project") rather than
 /// creating a fresh log. On resume the persisted system prompt is
 /// reused, any dangling tool_use ids are repaired, the agent's
-/// transcript is seeded from the linearized user thread, and in JSON
+/// transcript is seeded from the linearized main thread, and in JSON
 /// mode the historical events from [`replay`] are drained through the
 /// JSON sink before the new turn begins so the consumer sees the full
 /// event trace in emit order.
@@ -156,7 +155,7 @@ async fn run_inner<W: Write + Send + 'static>(
     args: Args,
     config: Config,
     auth: AuthStorage,
-    conversation_persistence: ConversationPersistence,
+    persistence: ProjectSessions,
     cwd: PathBuf,
     out: Arc<Mutex<W>>,
     configure_model: impl FnOnce(&mut crate::session_setup::ModelConfig),
@@ -176,6 +175,10 @@ async fn run_inner<W: Write + Send + 'static>(
         Some(Command::ListSessions)
         | Some(Command::CompactSessions { .. })
         | Some(Command::Version)
+        | Some(Command::MigrateSession { .. })
+        | Some(Command::ExportSession { .. })
+        | Some(Command::ImportSession { .. })
+        | Some(Command::Doctor)
         | Some(Command::UpdateModels)
         | Some(Command::Serve)
         | Some(Command::Gateway { .. })
@@ -243,10 +246,10 @@ async fn run_inner<W: Write + Send + 'static>(
         Some(Some(id)) => SessionSource::Resume {
             session_id: id.clone(),
         },
-        Some(None) => match conversation_persistence.get_latest_session_id()? {
+        Some(None) => match persistence.get_latest_session_id()? {
             Some(latest) => SessionSource::Resume { session_id: latest },
             None => bail!(
-                "no conversation sessions to resume; invoke `aj --print \"...\"` \
+                "no sessions to resume; invoke `aj --print \"...\"` \
                  without `continue` to start a fresh session"
             ),
         },
@@ -255,26 +258,37 @@ async fn run_inner<W: Write + Send + 'static>(
         },
     };
 
+    // Print mode is a writer too. Acquire before resume can import or append,
+    // so migration and interactive hosts cannot race this one-shot run.
+    let mut session_lock = match &source {
+        SessionSource::Resume { session_id } => Some(
+            aj_session::SessionLock::try_acquire(&persistence, session_id, "print")?
+                .ok_or_else(|| anyhow!("session {session_id} is in use"))?,
+        ),
+        SessionSource::Create { .. } => None,
+    };
+
     // Resolve + repair the log and, on a resume, restore its recorded
     // settings into the run config before the agent is built off it.
     // The log stays unwrapped until after the system-prompt freeze
-    // below; it moves behind an `Arc<TokioMutex<_>>` once the
-    // persistence listener takes a stake in it.
+    // below. It then moves behind an `Arc<TokioMutex<_>>` and the journal
+    // writes it.
     let PreparedLog {
         mut log,
-        transcript,
+        mut recovered,
         restore_notices,
-        recovery_notice,
         session_env,
-    } = prepare_log(
-        &conversation_persistence,
-        &source,
-        &run_config,
-        restore_context.as_ref(),
-    )?;
-    let goal = crate::host::driver::restore_goal(&mut log)?;
-    let has_goal_history = crate::host::driver::has_goal_history(&log);
-    if let Some(notice) = &recovery_notice {
+    } = prepare_log(&persistence, &source, &run_config, restore_context.as_ref())?;
+    if session_lock.is_none() {
+        session_lock = Some(
+            aj_session::SessionLock::try_acquire(&persistence, log.session_id(), "print")?
+                .ok_or_else(|| anyhow!("session {} is in use", log.session_id()))?,
+        );
+    }
+    let turn = log.turn_state();
+    let goal = recovered.goal.take();
+    let has_goal_history = recovered.goal_history;
+    for notice in &recovered.notices {
         eprintln!("aj: {notice}");
     }
     let oracle_run = run_config
@@ -293,16 +307,25 @@ async fn run_inner<W: Write + Send + 'static>(
     for notice in &restore_notices {
         eprintln!("aj: {notice}");
     }
+    // The resume policy has an interrupted turn wait for the user. Here the
+    // user's prompt follows it, as a prompt typed after the notice would.
+    if recovered
+        .interrupted
+        .contains(&aj_agent::events::AgentId::Main)
+    {
+        eprintln!("aj: {}", crate::recovery::TURN_INTERRUPTED_NOTICE);
+    }
     if matches!(source, SessionSource::Resume { .. }) && args.has_launch_env() {
         eprintln!("aj: warning: {ENV_WITHOUT_A_CREATE}");
     }
 
-    // `--tag` labels the session a run creates. The sidecar is written
-    // straight here rather than through a command: print mode owns the log it
-    // just minted and no other writer knows its id yet.
+    // `--tag` labels the session a run creates. The label is set straight on
+    // the log rather than through a command: print mode owns the log it just
+    // minted and no other writer knows its id yet. The log stores it with
+    // the session's first input.
     match (&launch_tag, &source) {
-        (Some(tag), SessionSource::Create { .. }) => conversation_persistence
-            .write_tag(log.session_id(), Some(tag))
+        (Some(tag), SessionSource::Create { .. }) => log
+            .set_tag(Some(tag))
             .with_context(|| format!("failed to tag session {}", log.session_id()))?,
         (Some(_), SessionSource::Resume { .. }) => {
             eprintln!("aj: warning: {TAG_WITHOUT_A_CREATE}");
@@ -313,15 +336,18 @@ async fn run_inner<W: Write + Send + 'static>(
     // JSON mode: replay the persisted history through the JSON sink
     // **before** subscribing any listeners, so the consumer sees the
     // full historical trace in emit order without double-firing the
-    // persistence listener (events already on disk would otherwise be
+    // journal (events already on disk would otherwise be
     // re-written). Text mode skips the historical events: callers
     // piping the binary's stdout into another process want a clean
-    // final answer, not the prior conversation re-stamped.
+    // final answer, not the earlier messages re-stamped.
     if matches!(source, SessionSource::Resume { .. })
         && matches!(args.format, PrintFormat::Json)
-        && log.latest_leaf(ThreadFilter::USER).is_some()
+        && log.latest_leaf(ThreadFilter::MAIN).is_some()
     {
         let json = json_event_listener(Arc::clone(&out));
+        // The trace is the whole history, tool outputs included.
+        log.load_all()
+            .context("failed to read the session history for replay")?;
         for event in replay(&log) {
             json(&event).await.map_err(|e| {
                 anyhow::Error::msg(e)
@@ -380,18 +406,52 @@ async fn run_inner<W: Write + Send + 'static>(
     freeze_and_seed(
         &mut log,
         &mut agent,
-        transcript,
+        &mut recovered.main,
         &env,
         include_skills,
         source.creation_env(),
         &run_config.lock().expect("run config mutex poisoned"),
     )?;
 
+    // Install what the open recovered, as a host does, less what a
+    // one-shot run of the main agent has no use for:
+    //
+    // - The task records still running are not watched. Watching
+    //   needs a store to save their ends in, and this run would stop
+    //   watching at its exit anyway. They stay recorded, and the next host
+    //   takes them up.
+    // - No sub-agent is built, so a sub-agent's pending input and notices
+    //   stay stored. Only the main agent runs a turn here, and theirs are
+    //   delivered by a turn of their own, which a host starts.
+    //
+    // The main agent's pending input and notices are installed. The turn
+    // below takes them with the prompt, which joins a pending message.
+    task_registry.seed_last_id(recovered.last_task_id);
+    let restored_input = !recovered.main.inputs.is_empty();
+    for (kind, input) in std::mem::take(&mut recovered.main.inputs) {
+        agent
+            .message_queues()
+            .restore(aj_agent::events::AgentId::Main, kind, input);
+    }
+    for notice in std::mem::take(&mut recovered.main.task_notifications) {
+        task_registry.restore_notice(aj_agent::events::AgentId::Main, notice);
+    }
+
+    let pending = log.pending();
+    // From here the journal writes the log, as it does for a hosted session.
+    let log = Arc::new(TokioMutex::new(log));
+    let journal = Journal::new(Arc::clone(&log));
+
     if let Some(selection) = args.account_selection() {
         crate::model::validate_account_selection(&auth, &model_key.0, selection.name.as_deref())
             .await
             .map_err(anyhow::Error::msg)?;
-        log.append_account_change(&model_key.0, selection.name.as_deref())?;
+        journal
+            .record(|log| {
+                log.append_account_change(&model_key.0, selection.name.as_deref())?;
+                Ok(((), Vec::new()))
+            })
+            .await?;
         run_config
             .lock()
             .expect("run config mutex poisoned")
@@ -399,14 +459,11 @@ async fn run_inner<W: Write + Send + 'static>(
             .set(&model_key.0, selection.name);
     }
 
-    let log = Arc::new(TokioMutex::new(log));
+    // The bus commits an event before any listener sees it, so stdout
+    // only ever shows what is stored. A refused commit ends the turn, and
+    // our outer error handler prints it.
+    agent.set_committer(journal.committer());
 
-    // Register the JSONL listener BEFORE the persistence listener so
-    // that when persistence errors out (which the listener surfaces
-    // as a fatal `Err`), the user has already seen every event up
-    // to (but not including) the failure on stdout. Persistence
-    // errors get printed by our outer error handler.
-    //
     // On a resume the replayed historical events were already
     // drained through the JSONL sink above (and never reached the
     // bus), so the listener here only ever observes live events
@@ -423,8 +480,6 @@ async fn run_inner<W: Write + Send + 'static>(
         PrintFormat::Json => Some(agent.subscribe(json_event_listener(Arc::clone(&out)))),
         PrintFormat::Text => None,
     };
-
-    let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
 
     // Drive a single prompt, then map its outcome to the process exit
     // status (`finish_result` below documents the error buckets).
@@ -454,18 +509,37 @@ async fn run_inner<W: Write + Send + 'static>(
             .then_some(config.compact_threshold),
         keep_recent: config.compact_keep_recent,
     };
+    // The prompt is accepted as a hosted session accepts one: saved as the
+    // agent's pending input, which the turn takes and appends. Accepting
+    // the first one of a new session creates the session with it.
+    let main = aj_agent::events::AgentId::Main;
+    let queues = agent.message_queues().clone();
+    crate::session::accept_prompt(&journal, &pending, &queues, main, &content).await?;
+    // A process that dies inside the turn leaves it marked working.
+    turn.set(main, aj_session::TurnState::Working)?;
     let prompt_result = crate::turn::drive_turn(
         &mut agent,
-        &log,
-        // Print mode has no tagged event stream, so nothing reads what a
-        // compaction files here.
-        &aj_session::AppendHandoff::default(),
+        &journal,
         move || policy,
-        crate::turn::TurnStart::Content(content),
+        crate::turn::TurnStart::Wake,
         |_| {},
         turn_cancel,
     )
     .await;
+    if queues.has_pending(main) && !restored_input {
+        // The turn failed before it took the prompt. This run answers with
+        // its exit status, so the prompt is not left for a later open to
+        // find pending. A message an earlier host accepted is not this
+        // run's to withdraw: it stays pending, with the prompt that joined
+        // it.
+        let withdraw = aj_agent::queue::QueueEdit::Withdraw;
+        if let Err(error) = crate::session::edit_pending(&pending, &queues, main, withdraw) {
+            tracing::warn!("could not withdraw the prompt the turn did not take: {error}");
+        }
+    }
+    if let Err(error) = turn.set(aj_agent::events::AgentId::Main, aj_session::TurnState::Idle) {
+        tracing::warn!("could not record that the turn ended: {error}");
+    }
     // Stop listening for SIGINT before we return so a stray Ctrl+C
     // during shutdown doesn't trigger a phantom cancel.
     ctrl_c_handler.abort();
@@ -473,7 +547,15 @@ async fn run_inner<W: Write + Send + 'static>(
     // Kill the background-task tree and reap the process groups
     // before observing the prompt result, so the early error returns
     // below can't orphan tasks.
-    crate::shutdown_background_tasks(&task_registry).await;
+    crate::shutdown_background_tasks_owned(&task_registry).await;
+    // Every sub-agent's turn has ended with them: it was nested in the
+    // turn above or was a background run stopped just now.
+    for sub_agent in turn.working_subs() {
+        let ended = aj_agent::events::AgentId::Sub(sub_agent);
+        if let Err(error) = turn.set(ended, aj_session::TurnState::Idle) {
+            tracing::warn!("could not record that sub-agent {sub_agent}'s turn ended: {error}");
+        }
+    }
 
     finish_result(prompt_result)?;
 
@@ -486,6 +568,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // Make sure the sink is flushed before exit so callers piping into
     // another process don't lose buffered bytes.
     flush_output(&out)?;
+    drop(session_lock);
     Ok(agent)
 }
 
@@ -507,13 +590,11 @@ fn flush_output<W: Write>(out: &Arc<Mutex<W>>) -> Result<()> {
 fn finish_result(prompt_result: Result<(), TurnError>) -> Result<()> {
     match prompt_result {
         Ok(()) => Ok(()),
-        Err(TurnError::Aborted) => Err(anyhow!("agent run cancelled (sigint)")),
+        Err(TurnError::Aborted) => Err(anyhow!("turn cancelled (sigint)")),
         Err(TurnError::Recoverable(err)) => {
-            Err(anyhow::Error::msg(err).context("agent run failed (recoverable)"))
+            Err(anyhow::Error::msg(err).context("turn failed (recoverable)"))
         }
-        Err(TurnError::Fatal(err)) => {
-            Err(anyhow::Error::msg(err).context("agent run failed (fatal)"))
-        }
+        Err(TurnError::Fatal(err)) => Err(anyhow::Error::msg(err).context("turn failed (fatal)")),
     }
 }
 
@@ -591,7 +672,7 @@ mod account_tests;
 #[cfg(test)]
 mod tests {
     use aj_models::auth::AuthStorage;
-    use aj_session::ConversationLog;
+    use aj_session::SessionLog;
     use tempfile::TempDir;
 
     use super::*;
@@ -739,7 +820,7 @@ mod tests {
     /// is the execution boundary for assertions about what print actually ran,
     /// rather than what it independently wrote to the session log.
     async fn run_capture_with_config(
-        persistence: &ConversationPersistence,
+        persistence: &ProjectSessions,
         cli: &[&str],
         config: Config,
         provider_override: Option<Arc<dyn Provider>>,
@@ -772,7 +853,7 @@ mod tests {
     }
 
     /// The default-config form used by tests that only need print output.
-    async fn run_capture(persistence: &ConversationPersistence, cli: &[&str]) -> String {
+    async fn run_capture(persistence: &ProjectSessions, cli: &[&str]) -> String {
         run_capture_with_config(persistence, cli, Config::default(), None)
             .await
             .0
@@ -785,7 +866,7 @@ mod tests {
         use aj_models::types::{AssistantContent, StopReason, ToolCall};
 
         let sessions = TempDir::new().unwrap();
-        let persistence = ConversationPersistence::new(sessions.path().join("sessions"));
+        let persistence = ProjectSessions::new(sessions.path().join("sessions"));
         let provider = |messages| -> Arc<dyn Provider> {
             Arc::new(
                 ScriptedProvider::from_messages(messages, 0, std::time::Duration::ZERO)
@@ -856,9 +937,9 @@ mod tests {
     /// captured output plus the persistence handle and its backing
     /// tempdir (returned so the persisted log outlives on-disk
     /// assertions).
-    async fn drive(cli: &[&str]) -> (String, ConversationPersistence, TempDir) {
+    async fn drive(cli: &[&str]) -> (String, ProjectSessions, TempDir) {
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
         let out = run_capture(&persistence, cli).await;
         (out, persistence, sessions)
     }
@@ -868,9 +949,9 @@ mod tests {
     async fn drive_with_config(
         cli: &[&str],
         config: Config,
-    ) -> (String, Agent, ConversationPersistence, TempDir) {
+    ) -> (String, Agent, ProjectSessions, TempDir) {
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
         let (out, agent) = run_capture_with_config(&persistence, cli, config, None).await;
         (out, agent, persistence, sessions)
     }
@@ -914,14 +995,14 @@ mod tests {
         );
 
         // The turn round-tripped to disk: a resumable session exists
-        // with a user-thread leaf.
+        // with a main-thread leaf.
         let id = persistence
             .get_latest_session_id()
             .expect("read latest session")
             .expect("a session was written");
-        let log = ConversationLog::resume(&persistence, &id).expect("resume the written log");
+        let log = SessionLog::resume(&persistence, &id).expect("resume the written log");
         assert!(
-            log.latest_leaf(ThreadFilter::USER).is_some(),
+            log.latest_leaf(ThreadFilter::MAIN).is_some(),
             "the driven turn was persisted"
         );
     }
@@ -950,6 +1031,134 @@ mod tests {
         );
     }
 
+    /// A print run that resumes a session recovers it as a host does: the
+    /// main agent's pending input and notices are delivered once, with the
+    /// prompt, a task record that ended is reported, and an
+    /// interrupted background run is closed and its parent told. What print
+    /// mode leaves out stays stored: a sub-agent's pending input.
+    #[tokio::test]
+    async fn print_continue_recovers_the_session_as_a_host_does() {
+        use aj_agent::events::AgentId;
+        use aj_agent::queue::{PendingInput, PendingKind};
+        use aj_models::types::UserContent;
+
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ProjectSessions::new(sessions.path().join("sessions"));
+        run_capture(
+            &persistence,
+            &["--print", "--scripted", "streaming-text", "one"],
+        )
+        .await;
+        let id = persistence.get_latest_session_id().unwrap().unwrap();
+
+        // What a host that died left: accepted input, a task record
+        // that has since exited, and a background sub-agent in its run
+        // with input of its own.
+        let exit_path = sessions.path().join("task.exit");
+        std::fs::write(&exit_path, "0\n").unwrap();
+        let output_path = sessions.path().join("task.log");
+        std::fs::write(&output_path, "built\n").unwrap();
+        let mut log = SessionLog::resume(&persistence, &id).unwrap();
+        let head = log.head().cloned().unwrap();
+        let settings = aj_agent::events::AgentSettings {
+            context_window: 0,
+            provider: "p".into(),
+            model_id: "m".into(),
+            thinking: "off".into(),
+            thinking_display: String::new(),
+            speed: "default".into(),
+            verbosity: "default".into(),
+        };
+        log.append_subagent_spawn(1, head, "look into it", "agent", None, true, &settings)
+            .unwrap();
+        let pending = log.pending();
+        let input = |text: &str| PendingInput::new(vec![UserContent::text(text)]);
+        let follow_up = PendingKind::FollowUp;
+        pending
+            .save_input(AgentId::Main, follow_up, &input("left waiting"))
+            .unwrap();
+        pending
+            .save_input(AgentId::Sub(1), follow_up, &input("for the sub-agent"))
+            .unwrap();
+        log.task_records()
+            .start(&aj_session::TaskRecord {
+                id: 1,
+                owner: AgentId::Main,
+                call_id: "call-bash".into(),
+                command: "make".into(),
+                // No process has this pid, and the exit file says it ended.
+                pid: u32::MAX - 1,
+                process_start: 1,
+                output_path,
+                exit_path,
+                started_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        drop((pending, log));
+        assert_eq!(persistence.recorded_tasks(&id).len(), 1);
+
+        let cli = [
+            "--print",
+            "--scripted",
+            "streaming-text",
+            "continue",
+            &id,
+            "two",
+        ];
+        let (_, agent) = run_capture_with_config(&persistence, &cli, Config::default(), None).await;
+        let told = format!("{:?}", agent.messages());
+        for (text, what) in [
+            ("left waiting", "the pending input"),
+            ("two", "the prompt"),
+            (
+                "Background task #1 finished: make",
+                "the ended command's notice",
+            ),
+            (
+                "Background agent 1 was interrupted",
+                "the interrupted run's notice",
+            ),
+        ] {
+            assert_eq!(told.matches(text).count(), 1, "{what} once: {told}");
+        }
+        assert!(persistence.recorded_tasks(&id).is_empty());
+        let rows = persistence.stored_rows(&id);
+        let queued: Vec<_> = rows
+            .iter()
+            .filter(|row| row.starts_with("pending"))
+            .collect();
+        assert_eq!(
+            queued.len(),
+            1,
+            "only the sub-agent's input waits: {rows:?}"
+        );
+        assert!(queued[0].contains("for the sub-agent"), "{rows:?}");
+        assert!(
+            rows.iter().all(|row| !row.ends_with("working")),
+            "no turn is left working: {rows:?}"
+        );
+        let stored = serde_json::to_string(&persistence.read_entries(&id).unwrap()).unwrap();
+        assert_eq!(stored.matches("sub_agent_end").count(), 1, "{stored}");
+
+        // A second run finds nothing left to deliver.
+        let cli = [
+            "--print",
+            "--scripted",
+            "streaming-text",
+            "continue",
+            &id,
+            "three",
+        ];
+        let (_, agent) = run_capture_with_config(&persistence, &cli, Config::default(), None).await;
+        let told = format!("{:?}", agent.messages());
+        assert_eq!(told.matches("left waiting").count(), 1, "{told}");
+        assert_eq!(
+            told.matches("Background agent 1 was interrupted").count(),
+            1
+        );
+        assert_eq!(told.matches("Background task #1 finished").count(), 1);
+    }
+
     #[tokio::test]
     async fn print_fresh_and_continue_use_the_log_env_not_the_resumers_flag() {
         const KEY: &str = "AJ_SESSION_ENV_TEST_IDENTITY";
@@ -958,7 +1167,7 @@ mod tests {
             "the process env would mask an absent overlay"
         );
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
 
         let (_fresh_out, fresh_agent) = run_capture_with_config(
             &persistence,
@@ -983,7 +1192,7 @@ mod tests {
             .get_latest_session_id()
             .expect("read latest session")
             .expect("fresh print session");
-        let initial = ConversationLog::resume(&persistence, &id).expect("fresh log");
+        let initial = SessionLog::resume(&persistence, &id).expect("fresh log");
         assert_eq!(
             initial.session_env(),
             Some(&std::collections::BTreeMap::from([(
@@ -1015,15 +1224,12 @@ mod tests {
                 && !resumed_messages.contains("identity=other"),
             "the resumer's launch env replaced recorded identity: {resumed_messages}"
         );
-        let resumed = ConversationLog::resume(&persistence, &id).expect("resumed log");
+        let resumed = SessionLog::resume(&persistence, &id).expect("resumed log");
         assert_eq!(
             resumed
                 .entries_in_order()
                 .iter()
-                .filter(|entry| matches!(
-                    entry.entry,
-                    aj_session::ConversationEntryKind::EnvChange { .. }
-                ))
+                .filter(|entry| matches!(entry.entry, aj_session::LogEntryKind::EnvChange { .. }))
                 .count(),
             1,
             "print continue appended a second creation identity"
@@ -1038,7 +1244,7 @@ mod tests {
             "the process env would mask an absent overlay"
         );
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
         // Only scripted setup runs under virtual time. The resumed turn below
         // executes a real Bash child and must use the wall clock.
         tokio::time::pause();
@@ -1079,7 +1285,7 @@ mod tests {
             !format!("{:?}", agent.messages()).contains("identity=backfill"),
             "launch env backfilled an env-less legacy session"
         );
-        let resumed = ConversationLog::resume(&persistence, &id).expect("legacy log");
+        let resumed = SessionLog::resume(&persistence, &id).expect("legacy log");
         assert_eq!(resumed.session_env(), None);
     }
 
@@ -1107,10 +1313,10 @@ mod tests {
             .get_latest_session_id()
             .expect("read latest session")
             .expect("a session was written");
-        let log = ConversationLog::resume(&persistence, &id).expect("resume the written log");
+        let log = SessionLog::resume(&persistence, &id).expect("resume the written log");
         let head = log.head().expect("the print turn wrote a head");
         assert_eq!(
-            log.linearize(head, ThreadFilter::USER)
+            log.linearize(head, ThreadFilter::MAIN)
                 .settings()
                 .thinking
                 .as_deref(),
@@ -1144,10 +1350,10 @@ mod tests {
             .get_latest_session_id()
             .expect("read latest session")
             .expect("a session was written");
-        let log = ConversationLog::resume(&persistence, &id).expect("resume the written log");
+        let log = SessionLog::resume(&persistence, &id).expect("resume the written log");
         let head = log.head().expect("the print turn wrote a head");
         assert_eq!(
-            log.linearize(head, ThreadFilter::USER)
+            log.linearize(head, ThreadFilter::MAIN)
                 .settings()
                 .thinking
                 .as_deref(),
@@ -1173,7 +1379,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bare_print_continue_resumes_the_newest_unarchived_session() {
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
 
         run_capture(
             &persistence,
@@ -1186,15 +1392,18 @@ mod tests {
             .expect("a session was written");
 
         // Minted by hand rather than driven, because ids come from the clock
-        // and two runs inside one test can collide. A file has to exist for
-        // the id to list, and a fresh log writes nothing until its first append.
+        // and two runs inside one test can collide. A JSONL copy of the
+        // first session under a younger id lists as a session of its own.
         let newer = "2999-01-01-00-00-00-000";
-        let log_path = |id: &str| persistence.sessions_dir().join(format!("{id}.jsonl"));
-        std::fs::copy(log_path(&older), log_path(newer)).expect("a younger session");
+        let copy = persistence
+            .export_jsonl(&older, &sessions.path().join("exported"))
+            .expect("export the first session");
+        std::fs::copy(copy, sessions.path().join(format!("{newer}.jsonl")))
+            .expect("a younger session");
         persistence.write_archived(newer, true).expect("archive it");
 
         let entries = |id: &str| {
-            ConversationLog::resume(&persistence, id)
+            SessionLog::resume(&persistence, id)
                 .expect("resume for inspection")
                 .entries_in_order()
                 .len()
@@ -1236,7 +1445,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bare_print_continue_refuses_when_every_session_is_archived() {
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
         let auth_dir = TempDir::new().expect("auth tempdir");
         let cwd = TempDir::new().expect("cwd tempdir");
 
@@ -1270,7 +1479,7 @@ mod tests {
         .err()
         .expect("nothing to resume once every session is archived");
         assert!(
-            format!("{error:#}").contains("no conversation sessions to resume"),
+            format!("{error:#}").contains("no sessions to resume"),
             "the archived session is passed over, not resumed: {error:#}"
         );
         assert_eq!(
@@ -1286,7 +1495,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn print_resumes_an_archived_session_when_the_id_is_named() {
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
 
         run_capture(
             &persistence,
@@ -1306,7 +1515,7 @@ mod tests {
         );
 
         let entries = || {
-            ConversationLog::resume(&persistence, &id)
+            SessionLog::resume(&persistence, &id)
                 .expect("resume for inspection")
                 .entries_in_order()
                 .len()
@@ -1339,11 +1548,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn print_holds_the_writer_lock_until_its_run_finishes() {
+        use aj_models::registry::ModelInfo;
+        use aj_models::streaming::AssistantMessageEventStream;
+        use aj_models::types::{Context, SimpleStreamOptions, StreamOptions};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CheckingProvider {
+            inner: aj_models::scripted::ScriptedProvider,
+            store: ProjectSessions,
+            session: String,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Provider for CheckingProvider {
+            fn stream(
+                &self,
+                _: &ModelInfo,
+                _: &Context,
+                _: &StreamOptions,
+            ) -> AssistantMessageEventStream {
+                panic!("the runtime supplies simple stream options")
+            }
+            fn stream_simple(
+                &self,
+                model: &ModelInfo,
+                context: &Context,
+                options: &SimpleStreamOptions,
+            ) -> AssistantMessageEventStream {
+                assert!(aj_session::SessionLock::is_held(&self.store, &self.session).unwrap());
+                assert!(matches!(
+                    self.store.migrate_jsonl(&self.session),
+                    Err(aj_session::SessionError::MigrationBusy(_))
+                ));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.stream_simple(model, context, options)
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let store = ProjectSessions::new(dir.path().into());
+        run_capture(&store, &["--print", "--scripted", "streaming-text", "seed"]).await;
+        let session = store.get_latest_session_id().unwrap().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CheckingProvider {
+            inner: aj_models::scripted::ScriptedProvider::from_messages(
+                vec![crate::test_support::finalized_text_message("done")],
+                0,
+                std::time::Duration::ZERO,
+            ),
+            store: store.clone(),
+            session: session.clone(),
+            calls: Arc::clone(&calls),
+        });
+        run_capture_with_config(
+            &store,
+            &[
+                "--print",
+                "--scripted",
+                "streaming-text",
+                "continue",
+                &session,
+                "more",
+            ],
+            Config::default(),
+            Some(provider),
+        )
+        .await;
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "the check ran at actual inference"
+        );
+        assert!(!aj_session::SessionLock::is_held(&store, &session).unwrap());
+        assert_eq!(
+            store.migrate_jsonl(&session).unwrap(),
+            aj_session::persistence::MigrationResult::AlreadyImported
+        );
+    }
+
     /// An illegal label refuses the run before a log is minted.
     #[tokio::test(start_paused = true)]
     async fn an_illegal_tag_refuses_a_print_run_and_creates_nothing() {
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
         let auth_dir = TempDir::new().expect("auth tempdir");
         let cwd = TempDir::new().expect("cwd tempdir");
 
@@ -1408,7 +1695,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn json_resume_replays_history_before_the_new_turn() {
         let sessions = TempDir::new().expect("sessions tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let persistence = ProjectSessions::new(sessions.path().to_path_buf());
 
         // First session: a text-mode turn that persists the user prompt
         // plus the demo reply. Its output goes nowhere we assert on.

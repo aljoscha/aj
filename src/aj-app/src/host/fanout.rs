@@ -579,6 +579,7 @@ mod tests {
     /// apart from its neighbours by `revision`, carried as the context window.
     fn lossy(revision: u64) -> Frame {
         Frame::State {
+            turn_interrupted: false,
             session: SESSION.to_string(),
             epoch: EPOCH.to_string(),
             opens_block: false,
@@ -606,6 +607,7 @@ mod tests {
             last_seq,
             tasks: Default::default(),
             queues: Default::default(),
+            history_start: None,
         }
     }
 

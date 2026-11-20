@@ -63,7 +63,7 @@ keep the scope explicit.
 
 By default the call waits for the final report. Set run_in_background: true to
 keep working while Oracle runs. The call then returns a task id, and its report
-arrives as a completion notice. Do not wait by sleeping in the foreground:
+arrives as a task notification. Do not wait by sleeping in the foreground:
 no notice can arrive while a foreground command is running."
     }
 

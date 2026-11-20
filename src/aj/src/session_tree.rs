@@ -42,7 +42,7 @@ pub(crate) struct TreeRow {
     /// truncated segment label.
     pub display: String,
     /// The dim right-column suffix (message count + age) for a leaf segment.
-    /// Empty for a fork.
+    /// Empty for a branch.
     pub description: String,
     /// The untruncated segment label, so typing the branch text matches even
     /// past the display truncation.
@@ -335,7 +335,7 @@ mod tests {
         );
     }
 
-    /// A fork with a deeper active sub-fork exercises every connector, the
+    /// A branch with a deeper active sub-fork exercises every connector, the
     /// active-first sibling ordering, and the row->head key mapping.
     #[test]
     fn fork_rows_carry_connectors_active_first_and_keys() {
@@ -380,7 +380,7 @@ mod tests {
             display[4]
         );
 
-        // Leaf rows carry the suffix; the fork rows do not.
+        // Leaf rows carry the suffix; the branch rows do not.
         assert!(rows[0].description.is_empty(), "fork has no suffix");
         assert!(rows[2].description.contains("msg"), "leaf has a suffix");
 

@@ -9,6 +9,7 @@ aj-models = { path = "../aj-models" }
 chrono = { workspace = true, features = ["serde"] }
 nix = { workspace = true }
 rand = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The tag sidecar is written through a temporary file in the same directory and
@@ -19,7 +20,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+aj-session = { path = ".", features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [features]
 # Exposes deterministic append-writer fault fixtures to composed tests in

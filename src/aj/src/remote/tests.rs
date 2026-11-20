@@ -48,7 +48,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, Context, Message, SimpleStreamOptions, StopReason,
     StreamOptions, ToolCall,
 };
-use aj_session::ConversationPersistence;
+use aj_session::ProjectSessions;
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame,
     ErrorResponse, Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput,
@@ -603,7 +603,7 @@ pub(crate) fn host_setup(
         catalog: Arc::new(vec![catalog_model()]),
         defaults: aj_app::session_setup::RunConfigDefaults::fixed(run_config),
         restore: None,
-        persistence: ConversationPersistence::new(dir.path().join("sessions")),
+        persistence: ProjectSessions::new(dir.path().join("sessions")),
         auth: handles.auth,
         working_directory: dir.path().to_path_buf(),
         name: name.map(str::to_string),
@@ -1214,7 +1214,7 @@ fn running_tool_and_sub_turn(report: &str, command: &str) -> Vec<AssistantMessag
         // Whoever asks next, which is the sub-agent.
         finalized_text_message(report),
         finalized_text_message("both of those are done"),
-        // The background sub's completion notice wakes the parent, which runs
+        // The background sub's task notification wakes the parent, which runs
         // one more inference to acknowledge it.
         finalized_text_message("noted, thanks"),
     ]
@@ -1823,8 +1823,8 @@ async fn hello_reports_the_protocol_the_working_directory_and_the_name() {
 }
 
 /// Shared headless/interactive teardown stops the listener before it waits on
-/// host work. A held final flush keeps that ordering observable instead of
-/// letting both phases finish in one scheduler tick.
+/// host work. A command parked on a held log keeps that ordering observable
+/// instead of letting both phases finish in one scheduler tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frontend_shutdown_stops_accepting_before_host_teardown_finishes() {
     let fixture = Fixture::new(Vec::new()).await;
@@ -1837,10 +1837,18 @@ async fn frontend_shutdown_stops_accepting_before_host_teardown_finishes() {
         .expect("live session")
         .log;
     let held = log.lock().await;
-    assert!(
-        log.try_lock().is_err(),
-        "the fixture holds the final flush before shutdown"
-    );
+    // The driver runs commands in turn, so its teardown waits behind this
+    // one, which waits for the log.
+    let (command_host, command_session) = (fixture.host.clone(), session.clone());
+    let parked = tokio::spawn(async move {
+        let change = Command::Env {
+            key: "PARKED".to_string(),
+            value: Some("1".to_string()),
+        };
+        command_host.command(&command_session, change).await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!parked.is_finished(), "the command is parked on the log");
     let address = fixture.server.local_addr();
     let Fixture {
         _dir,
@@ -1872,6 +1880,10 @@ async fn frontend_shutdown_stops_accepting_before_host_teardown_finishes() {
     );
 
     drop(held);
+    bounded("the parked command", parked)
+        .await
+        .expect("command task")
+        .expect("the command finished before teardown");
     bounded("frontend shutdown", shutdown)
         .await
         .expect("shutdown task");
@@ -2195,8 +2207,8 @@ async fn control_never_drops_env_from_a_remote_create() {
         assert_eq!(handles.log.lock().await.session_env(), env.as_ref());
     }
     fixture.host.shutdown().await;
-    let persistence = ConversationPersistence::new(fixture._dir.path().join("sessions"));
-    let log = aj_session::ConversationLog::resume(&persistence, &remote)
+    let persistence = ProjectSessions::new(fixture._dir.path().join("sessions"));
+    let log = aj_session::SessionLog::resume(&persistence, &remote)
         .expect("persisted log after the turn");
     assert_eq!(log.session_env(), Some(&env));
     fixture.shutdown().await;
@@ -2206,7 +2218,7 @@ async fn control_never_drops_env_from_a_remote_create() {
 async fn invalid_create_environment_maps_mint_nothing() {
     let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
-    let persistence = ConversationPersistence::new(fixture._dir.path().join("sessions"));
+    let persistence = ProjectSessions::new(fixture._dir.path().join("sessions"));
     for env in [
         serde_json::json!({"BAD=KEY": "private-value"}),
         serde_json::json!({"": "private-value"}),
@@ -2286,6 +2298,54 @@ async fn a_list_value_the_host_does_not_know_is_refused() {
         "a misspelt opt-out would otherwise be served every directory",
     );
     fixture.shutdown().await;
+}
+
+/// A history page reads the same in process and over a connection, for the
+/// main agent and, by the `agent` parameter, for a sub-agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
+async fn history_pages_read_the_same_locally_and_remotely_per_agent() {
+    let fixture = Fixture::new(sub_agent_turn()).await;
+    let session = fixture.create().await;
+    let mut remote = fixture.remote(&session).await;
+    fixture.prompt(&session, "delegate").await;
+    remote.settle().await;
+
+    let (local, remote) = (
+        Control::local(fixture.host.clone()),
+        Control::remote(fixture.client()),
+    );
+    let mut pages = Vec::new();
+    let mut agents = vec![AgentId::Main];
+    while let Some(agent) = agents.pop() {
+        let page = local.history(&session, agent, u64::MAX, 100).await;
+        let page = serde_json::to_value(page.expect("local page")).unwrap();
+        let over = remote.history(&session, agent, u64::MAX, 100).await;
+        assert_eq!(
+            page,
+            serde_json::to_value(over.expect("remote page")).unwrap()
+        );
+        assert_eq!(page["start"], 1);
+        assert!(
+            !page["frames"].as_array().unwrap().is_empty(),
+            "{agent:?} {page}"
+        );
+        pages.push(page.to_string());
+        // The main page names the sub-agent whose page is read next.
+        if let Some((_, child)) = pages[0].split_once("\"child\":{\"sub\":")
+            && pages.len() == 1
+        {
+            let index = child.split('}').next().unwrap().parse().unwrap();
+            agents.push(AgentId::Sub(index));
+        }
+    }
+    assert_eq!(pages.len(), 2);
+    // The sub-agent's box is in the main agent's page only, and what it
+    // said is in its own.
+    assert!(pages[1].contains("the sub found nothing") && !pages[1].contains("\"child\""));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3095,95 +3155,6 @@ async fn a_session_is_created_with_its_label() {
     fixture.shutdown().await;
 }
 
-/// A label the store will not write does not fail the create it was asked
-/// for: the session exists, so the route answers 200 with its id and says
-/// what did not land, and the client retags rather than creating a second
-/// session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_label_the_store_cannot_write_still_answers_a_created_session() {
-    let fixture = Fixture::new(Vec::new()).await;
-    // The sidecar directory's own path, taken by a file, so no tag write
-    // can land.
-    let meta = fixture._dir.path().join("sessions").join("meta");
-    std::fs::write(&meta, b"not a directory").expect("block the sidecar directory");
-
-    let created = fixture
-        .client
-        .create_session(CreateSessionRequest {
-            tag: Some("fix-auth".to_string()),
-            ..CreateSessionRequest::default()
-        })
-        .await
-        .expect("a create that minted a session is not a failed create");
-    let incomplete = created
-        .incomplete
-        .as_deref()
-        .expect("the response says the label did not land");
-    assert!(
-        incomplete.contains("created, tag not applied"),
-        "the host's own words for what did not stick: {incomplete}",
-    );
-    assert!(
-        fixture
-            .client
-            .sessions()
-            .await
-            .expect("the sessions read")
-            .sessions
-            .iter()
-            .any(|entry| entry.id == created.id && entry.live),
-        "the session the create minted is live and in the directory",
-    );
-    assert_eq!(
-        remote_tag(&fixture, &created.id).await,
-        None,
-        "a label the store would not take is not published as if it had",
-    );
-    fixture.shutdown().await;
-}
-
-/// Both control arms report the same thing about a create whose label did
-/// not stick: a session that exists, named by id, not a create that failed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn both_control_arms_report_a_created_session_whose_label_did_not_stick() {
-    let fixture = Fixture::new(Vec::new()).await;
-    let meta = fixture._dir.path().join("sessions").join("meta");
-    std::fs::write(&meta, b"not a directory").expect("block the sidecar directory");
-
-    for control in [
-        Control::local(fixture.host.clone()),
-        Control::remote(fixture.client()),
-    ] {
-        let err = control
-            .create(None, None, None, Some("fix-auth".to_string()), None)
-            .await
-            .expect_err("the sidecar write cannot land");
-        assert!(
-            !err.conflict() && !err.invalid() && !err.unknown_entry(),
-            "a create that happened is none of the peer's refusals: {err}",
-        );
-        let ControlError::PartialCreate { session, message } = err else {
-            panic!("a created session is not a refusal: {err}");
-        };
-        assert!(
-            message.contains(&session) && message.contains("created, tag not applied"),
-            "the message names the session that exists: {message}",
-        );
-        assert!(
-            fixture
-                .client
-                .sessions()
-                .await
-                .expect("the sessions read")
-                .sessions
-                .iter()
-                .any(|entry| entry.id == session && entry.live),
-            "the session {session} the create minted is live and in the directory",
-        );
-    }
-    fixture.shutdown().await;
-}
-
 // ---------------------------------------------------------------------------
 // The status vocabulary
 // ---------------------------------------------------------------------------
@@ -3528,7 +3499,7 @@ async fn a_head_switch_before_an_entry_resolves_over_http() {
             .find(|entry| {
                 matches!(
                     &entry.entry,
-                    aj_session::ConversationEntryKind::Message { message }
+                    aj_session::LogEntryKind::Message { message }
                         if matches!(
                             message.as_stored_wire(),
                             Some(aj_models::types::Message::User(_))
@@ -4854,6 +4825,19 @@ async fn probe_every_route(
                 "POST /v1/sessions/{id}/steer" => Some((2, "steer reply")),
                 _ => None,
             };
+            if probe.route == "POST /v1/sessions/{id}/compact" {
+                // The compaction is a turn of a session that is not stored
+                // yet, and a prompt cannot queue behind one. Let it end: it
+                // says there is nothing to compact, then the session is idle.
+                attached
+                    .pump_until("the compaction's verdict", |frame| {
+                        matches!(frame, Frame::Event { event, .. }
+                            if matches!(event.known(), Some(AgentEvent::Notice { text, .. })
+                                if text.starts_with("Nothing to compact")))
+                    })
+                    .await;
+                finish_scripted_turn(attached).await;
+            }
             if let Some((expected, reply)) = expected {
                 // Earlier probes can leave idle states in the stream. Establish
                 // this request's reply before waiting for its idle tail, so the
@@ -5263,7 +5247,7 @@ impl CutScenario {
         }
     }
 
-    /// Independent expected conversation content keeps two equally broken
+    /// Independent expected transcript content keeps two equally broken
     /// folds from satisfying the convergence comparison.
     fn assert_completed(self, state: &CanonicalState) {
         let (answers, tools): (&[&str], &[&str]) = match self {
@@ -5701,7 +5685,7 @@ async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
 )]
 async fn a_task_that_ended_while_away_reads_as_ended_from_caught_up() {
     let mut script = background_task_turn();
-    // The kill's completion notice wakes the agent for one more turn.
+    // The kill's task notification wakes the agent for one more turn.
     script.push(finalized_text_message("noted the kill"));
     let fixture = Fixture::new(script).await;
     let session = fixture.create().await;
@@ -5757,24 +5741,21 @@ async fn a_task_that_ended_while_away_reads_as_ended_from_caught_up() {
     fixture.shutdown().await;
 }
 
-/// The named sharp edge: a re-attach where zero durable entries follow the
-/// cursor, yet a sub-agent concluded in the gap. Its `SubAgentEnd` is
-/// reliable-transient, so what has to conclude the client's box is the block
-/// itself: the host concludes every sub it knows to be idle after `caught_up`.
+/// A sub-agent's run ends while a client is away. The end is an entry in
+/// the log, so the client's cursor covers it and the re-attach serves it like
+/// any other entry: the box the client came back with is concluded by the
+/// block, with the run's report.
 ///
-/// The gap is real here: the client's box is `Running` when it comes back. The
-/// parent stays blocked on a slow command while the sub finishes, which is what
-/// keeps a durable entry from landing behind the cursor and turning this into an
-/// ordinary incremental resume. Two mechanisms then carry the conclusion, the
-/// bracketing the projection closes for a run the host knows is finished, and
-/// the post-`caught_up` sweep, and the test pins both: the first concludes the
-/// box, the second lands on it without disturbing it.
+/// The parent stays blocked on a slow command while the sub finishes, so the
+/// end record is the only entry behind the cursor. The host also concludes
+/// every idle sub after `caught_up`, and that sweep lands on the concluded
+/// box without disturbing it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: remote catch-up quiet window"
 )]
-async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
+async fn a_reattach_serves_the_end_of_a_run_that_finished_while_away() {
     use futures::StreamExt;
 
     let mut bash = BashGate::new().await;
@@ -5814,8 +5795,7 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
         "the box is open when the connection dies",
     );
 
-    // The sub concludes while this client is away. `SubAgentEnd` is
-    // reliable-transient, so nothing replays it.
+    // The sub concludes while this client is away.
     oracle
         .pump_until("the sub-agent to conclude", |frame| {
             matches!(frame, Frame::Event { event, .. }
@@ -5823,40 +5803,22 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
         })
         .await;
 
-    // The session's high-water mark, read off the host's own bookkeeping,
-    // under the epoch the fold adopted. The client applied every entry up to
-    // it, it only held the last one back from its committed cursor, so this is
-    // the boundary the reattach below has to be served at. A client may not
-    // turn a position it read in the directory into a cursor, the
-    // test is reading ground truth to build the case.
-    let epoch = remote.client.cursor().expect("a committed cursor").epoch;
-    let last_seq = fixture
-        .client
-        .sessions()
-        .await
-        .expect("the sessions read")
-        .sessions
-        .iter()
-        .find(|entry| entry.id == session)
-        .expect("the session")
-        .last_seq
-        .expect("a live session's row reports its position");
+    let cursor = remote.client.cursor().expect("a committed cursor");
+    let block = remote.reattach_at(Some(cursor)).await;
 
-    let block = remote
-        .reattach_at(Some(Cursor {
-            epoch,
-            seq: last_seq,
-        }))
-        .await;
-
+    let served_end = block.iter().any(|frame| {
+        frame.durable_seq().is_some()
+            && matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::SubAgentEnd { .. })))
+    });
     assert!(
-        !block.iter().any(|frame| frame.durable_seq().is_some()),
-        "the suffix at the high-water mark is empty: {block:?}",
+        served_end,
+        "the run's end is an entry of the suffix: {block:?}"
     );
     assert_eq!(
         sub_box(&remote.canonical(), 1).0,
         SubAgentStatus::Done,
-        "the block's bracketing closed the box the client came back with: {block:?}",
+        "which concluded the box the client came back with: {block:?}",
     );
     let sweep = remote
         .pump_until("the conclusion sweep", |frame| {

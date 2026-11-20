@@ -71,7 +71,7 @@ fn test_host(
         catalog: Arc::new(Vec::new()),
         defaults: RunConfigDefaults::fixed(run),
         restore: None,
-        persistence: aj_session::ConversationPersistence::new(dir.path().join("sessions")),
+        persistence: aj_session::ProjectSessions::new(dir.path().join("sessions")),
         auth: aj_models::auth::AuthStorage::new(dir.path().join("auth.json")),
         working_directory: dir.path().to_path_buf(),
         name: None,
@@ -173,7 +173,7 @@ async fn compaction_settings_edits_apply_at_the_next_tool_batch_boundary() {
             assert_eq!(requests.lock().unwrap().len(), 1);
 
             // Hold the completed real tool before the compaction check, so the
-            // edit is acknowledged while the same run is still active.
+            // edit is acknowledged while the same turn is still active.
             let (completed, tool_completed) = oneshot::channel();
             let (release, proceed) = oneshot::channel();
             let barrier = Mutex::new(Some((completed, proceed)));

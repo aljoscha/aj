@@ -24,7 +24,7 @@ use serde::Serialize;
 /// by occupancy.
 ///
 /// `tokens.None` means "not yet known" — typically a fresh session
-/// before the first assistant turn — and renders as `?`. A
+/// before the first assistant response — and renders as `?`. A
 /// `context_window` of `0` suppresses the indicator entirely so the
 /// footer stays silent for models with no published window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -160,7 +160,7 @@ struct AgentFooter {
     settings: AgentSettings,
     /// Prompt size of the agent's most recent turn, `None` until
     /// the first `UsageUpdate` arrives.
-    last_turn_context_tokens: Option<u64>,
+    last_round_context_tokens: Option<u64>,
 }
 
 /// Per-agent footer store: the single source of truth for "what
@@ -177,16 +177,16 @@ pub struct AgentFooters {
 
 impl AgentFooters {
     /// Build a store seeded with the Main agent's settings and
-    /// context window. Main's `last_turn_context_tokens` starts as
+    /// context window. Main's `last_round_context_tokens` starts as
     /// `None` so the footer initially renders `?/<window>` until
-    /// the first assistant turn lands.
+    /// the first assistant response lands.
     pub fn new(main_settings: AgentSettings) -> Self {
         let mut agents = HashMap::new();
         agents.insert(
             AgentId::Main,
             AgentFooter {
                 settings: main_settings,
-                last_turn_context_tokens: None,
+                last_round_context_tokens: None,
             },
         );
         Self { agents }
@@ -194,18 +194,18 @@ impl AgentFooters {
 
     /// Insert or replace the settings identity (and context-window
     /// denominator) for `id`, preserving an existing entry's
-    /// `last_turn_context_tokens` — a model swap doesn't erase what
+    /// `last_round_context_tokens` — a model swap doesn't erase what
     /// the last prompt cost.
     pub fn note_settings(&mut self, id: AgentId, settings: AgentSettings) {
-        let last_turn_context_tokens = self
+        let last_round_context_tokens = self
             .agents
             .get(&id)
-            .and_then(|entry| entry.last_turn_context_tokens);
+            .and_then(|entry| entry.last_round_context_tokens);
         self.agents.insert(
             id,
             AgentFooter {
                 settings,
-                last_turn_context_tokens,
+                last_round_context_tokens,
             },
         );
     }
@@ -227,7 +227,7 @@ impl AgentFooters {
     ///
     /// A missing entry is created defensively with empty settings
     /// and an unknown window.
-    pub fn record_turn_usage(&mut self, id: AgentId, usage: &TokenUsage) {
+    pub fn record_round_usage(&mut self, id: AgentId, usage: &TokenUsage) {
         let entry = self.agents.entry(id).or_insert_with(|| AgentFooter {
             settings: AgentSettings {
                 context_window: 0,
@@ -238,11 +238,11 @@ impl AgentFooters {
                 speed: String::new(),
                 verbosity: String::new(),
             },
-            last_turn_context_tokens: None,
+            last_round_context_tokens: None,
         });
         let prompt = usage.turn_input + usage.turn_cache_read + usage.turn_cache_write;
         if prompt > 0 {
-            entry.last_turn_context_tokens = Some(prompt);
+            entry.last_round_context_tokens = Some(prompt);
         }
     }
 
@@ -251,7 +251,7 @@ impl AgentFooters {
     pub fn context_usage(&self, id: AgentId) -> ContextUsage {
         let entry = self.resolve(id);
         ContextUsage {
-            tokens: entry.last_turn_context_tokens,
+            tokens: entry.last_round_context_tokens,
             context_window: entry.settings.context_window,
         }
     }
@@ -262,7 +262,7 @@ impl AgentFooters {
     /// A missing entry is left untouched (nothing to display against yet).
     pub fn set_context_tokens(&mut self, id: AgentId, tokens: u64) {
         if let Some(entry) = self.agents.get_mut(&id) {
-            entry.last_turn_context_tokens = Some(tokens);
+            entry.last_round_context_tokens = Some(tokens);
         }
     }
 
@@ -290,12 +290,19 @@ impl AgentFooters {
     ///
     /// Used when a client rebuilds its fold from scratch
     /// ([`ChatState::reset`](crate::chat::ChatState::reset)): the
-    /// sub-agents and the measured turns belong to the history it dropped,
+    /// sub-agents and the measured responses belong to the history it dropped,
     /// while Main's settings identity was never stream-derived and stays.
+    /// Take `other`'s entry for every agent this store has none for.
+    pub fn adopt_missing(&mut self, other: AgentFooters) {
+        for (id, footer) in other.agents {
+            self.agents.entry(id).or_insert(footer);
+        }
+    }
+
     pub fn retain_main(&mut self) {
         self.agents.retain(|id, _| *id == AgentId::Main);
         if let Some(main) = self.agents.get_mut(&AgentId::Main) {
-            main.last_turn_context_tokens = None;
+            main.last_round_context_tokens = None;
         }
     }
 
@@ -313,10 +320,10 @@ mod tests {
     use super::*;
 
     /// Build a `TokenUsage` snapshot carrying the supplied
-    /// per-turn deltas. The `accumulated_*` fields are zeroed —
+    /// per-response deltas. The `accumulated_*` fields are zeroed —
     /// matching the wire-level pre-add semantic for an agent that
     /// hasn't run any prior turns — but
-    /// [`AgentFooters::record_turn_usage`] only reads `turn_*`, so
+    /// [`AgentFooters::record_round_usage`] only reads `turn_*`, so
     /// the accumulator value is irrelevant to the tests below and
     /// we keep it constant for clarity.
     fn token_usage(input: u64, output: u64, cache_write: u64, cache_read: u64) -> TokenUsage {
@@ -356,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn record_turn_usage_folds_per_agent() {
+    fn record_round_usage_folds_per_agent() {
         let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
             context_window: 200_000,
             ..settings("opus", "high")
@@ -369,16 +376,16 @@ mod tests {
             },
         );
 
-        f.record_turn_usage(AgentId::Sub(1), &token_usage(1_000, 0, 50, 200));
+        f.record_round_usage(AgentId::Sub(1), &token_usage(1_000, 0, 50, 200));
         assert_eq!(f.context_usage(AgentId::Main).tokens, None);
         assert_eq!(f.context_usage(AgentId::Sub(1)).tokens, Some(1_250));
 
-        f.record_turn_usage(AgentId::Main, &token_usage(3_000, 0, 0, 0));
+        f.record_round_usage(AgentId::Main, &token_usage(3_000, 0, 0, 0));
         assert_eq!(f.context_usage(AgentId::Main).tokens, Some(3_000));
         assert_eq!(f.context_usage(AgentId::Sub(1)).tokens, Some(1_250));
 
         // Last-wins per agent.
-        f.record_turn_usage(AgentId::Sub(1), &token_usage(2_000, 0, 100, 300));
+        f.record_round_usage(AgentId::Sub(1), &token_usage(2_000, 0, 100, 300));
         assert_eq!(f.context_usage(AgentId::Sub(1)).tokens, Some(2_400));
         assert_eq!(f.context_usage(AgentId::Main).tokens, Some(3_000));
     }
@@ -389,7 +396,7 @@ mod tests {
             context_window: 200_000,
             ..settings("opus", "high")
         });
-        f.record_turn_usage(AgentId::Main, &token_usage(1_000, 0, 0, 0));
+        f.record_round_usage(AgentId::Main, &token_usage(1_000, 0, 0, 0));
         f.note_settings(
             AgentId::Main,
             aj_agent::events::AgentSettings {
@@ -408,8 +415,8 @@ mod tests {
             context_window: 200_000,
             ..settings("opus", "high")
         });
-        f.record_turn_usage(AgentId::Main, &token_usage(20_000, 0, 0, 0));
-        f.record_turn_usage(AgentId::Main, &token_usage(0, 0, 0, 0));
+        f.record_round_usage(AgentId::Main, &token_usage(20_000, 0, 0, 0));
+        f.record_round_usage(AgentId::Main, &token_usage(0, 0, 0, 0));
         assert_eq!(f.context_usage(AgentId::Main).tokens, Some(20_000));
     }
 
@@ -419,7 +426,7 @@ mod tests {
             context_window: 200_000,
             ..settings("opus", "high")
         });
-        f.record_turn_usage(AgentId::Main, &token_usage(1_000, 0, 0, 0));
+        f.record_round_usage(AgentId::Main, &token_usage(1_000, 0, 0, 0));
         let cu = f.context_usage(AgentId::Sub(7));
         assert_eq!(cu.tokens, Some(1_000));
         assert_eq!(cu.context_window, 200_000);
@@ -436,7 +443,7 @@ mod tests {
         assert_eq!(f.model_line(AgentId::Sub(3)).as_deref(), Some("opus high"));
         // An entry created defensively by usage has an empty
         // model_id and yields no line.
-        f.record_turn_usage(AgentId::Sub(1), &token_usage(1, 0, 0, 0));
+        f.record_round_usage(AgentId::Sub(1), &token_usage(1, 0, 0, 0));
         assert_eq!(f.model_line(AgentId::Sub(1)), None);
     }
 

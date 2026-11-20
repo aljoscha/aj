@@ -23,8 +23,8 @@ const EVENT_TYPES: &[&str] = &[
     "code_mode_store",
     "agent_start",
     "agent_end",
-    "turn_start",
-    "turn_end",
+    "round_start",
+    "round_end",
     "message_start",
     "message_update",
     "message_end",
@@ -88,6 +88,29 @@ fn fixture(name: &str) -> Value {
         _ => panic!("unknown fixture {name}"),
     })
     .expect("fixture is valid JSON")
+}
+
+/// `call_id` on `sub_agent_start` is optional. An event from a peer that
+/// predates it decodes, names no call, and encodes as it arrived.
+#[test]
+fn a_sub_agent_start_without_a_call_id_decodes() {
+    let fixtures = fixture("agent_events");
+    let events = fixtures.as_array().unwrap().iter();
+    let mut start = events
+        .into_iter()
+        .find(|event| event["type"] == "sub_agent_start")
+        .expect("a spawn fixture")
+        .clone();
+    assert_eq!(
+        start.as_object_mut().unwrap().remove("call_id"),
+        Some(json!("call-1"))
+    );
+    let decoded: DecodedAgentEvent = serde_json::from_value(start.clone()).unwrap();
+    assert!(matches!(
+        decoded.known(),
+        Some(AgentEvent::SubAgentStart { call_id: None, .. })
+    ));
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), start);
 }
 
 #[test]
@@ -715,14 +738,14 @@ fn settings_use_the_cli_selection_triple_and_create_round_trips() {
     // not land rides along beside it.
     let partial = SessionCreated {
         id: "session-1".into(),
-        incomplete: Some("session session-1 created, tag not applied: nope".into()),
+        incomplete: Some("session session-1 created, first prompt not applied: nope".into()),
     };
     let encoded = serde_json::to_value(&partial).unwrap();
     assert_eq!(
         encoded,
         json!({
             "id":"session-1",
-            "incomplete":"session session-1 created, tag not applied: nope"
+            "incomplete":"session session-1 created, first prompt not applied: nope"
         })
     );
     assert_eq!(
@@ -809,6 +832,7 @@ fn state_frame_carries_display_settings_and_credential_warning() {
         verbosity: "medium".into(),
     };
     let frame = Frame::State {
+        turn_interrupted: false,
         session: "session-1".into(),
         epoch: "epoch-1".into(),
         opens_block: true,
@@ -846,6 +870,7 @@ fn state_round_trips_independent_oracle_settings() {
     };
     for oracle_settings in [Some(oracle), None] {
         let frame = Frame::State {
+            turn_interrupted: false,
             session: "session-1".into(),
             epoch: "epoch-1".into(),
             opens_block: false,
@@ -2934,8 +2959,8 @@ fn agent_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::CodeModeStore { .. } => "code_mode_store",
         AgentEvent::AgentStart { .. } => "agent_start",
         AgentEvent::AgentEnd { .. } => "agent_end",
-        AgentEvent::TurnStart { .. } => "turn_start",
-        AgentEvent::TurnEnd { .. } => "turn_end",
+        AgentEvent::RoundStart { .. } => "round_start",
+        AgentEvent::RoundEnd { .. } => "round_end",
         AgentEvent::MessageStart { .. } => "message_start",
         AgentEvent::MessageUpdate { .. } => "message_update",
         AgentEvent::MessageEnd { .. } => "message_end",
@@ -3005,6 +3030,7 @@ fn local_frames() -> Vec<Frame> {
             event: DecodedAgentEvent::from(notice),
         },
         Frame::State {
+            turn_interrupted: false,
             session: "old".to_string(),
             epoch: "epoch-1".to_string(),
             opens_block: false,
@@ -3029,6 +3055,7 @@ fn local_frames() -> Vec<Frame> {
             last_seq: 7,
             tasks: Default::default(),
             queues: Default::default(),
+            history_start: None,
         },
         Frame::List {
             sessions: Vec::new(),

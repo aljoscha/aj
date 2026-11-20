@@ -4,7 +4,9 @@ use aj_agent::tool::{ErasedToolDefinition, SpawnAgentConfig};
 use aj_conf::Config;
 use aj_tools::{OracleTool, builtin_tools_for_model};
 
-use crate::session_setup::{RunConfigSnapshot, builtin_tool_options, thinking_display_name};
+use crate::session_setup::{
+    ModelConfig, RunConfigSnapshot, builtin_tool_options, thinking_display_name,
+};
 
 /// Oracle defaults use the ordinary model resolver, never the main agent's choices.
 pub fn defaults(config: &Config) -> Config {
@@ -28,7 +30,16 @@ pub(crate) fn configure_tool(
     let Some(tool) = tools.iter_mut().find(|tool| tool.name == "oracle") else {
         return;
     };
-    let model = &run.oracle;
+    *tool = OracleTool::new(child_config(config, &run.oracle, run.session_id.clone())).into();
+}
+
+/// What an Oracle child running `model` is built from: its read-only tools
+/// and advisory prompt. `session_id` is the session's prompt-cache key.
+pub(crate) fn child_config(
+    config: &Config,
+    model: &ModelConfig,
+    session_id: Option<String>,
+) -> SpawnAgentConfig {
     let mut child_tools = builtin_tools_for_model(
         &builtin_tool_options(config),
         &config.disabled_tools,
@@ -41,8 +52,8 @@ pub(crate) fn configure_tool(
         )
     });
     let mut stream_options = model.stream_options.clone();
-    stream_options.session_id = run.session_id.clone();
-    *tool = OracleTool::new(SpawnAgentConfig {
+    stream_options.session_id = session_id;
+    SpawnAgentConfig {
         provider: std::sync::Arc::clone(&model.provider),
         model_info: std::sync::Arc::clone(&model.model_info),
         stream_options,
@@ -51,8 +62,7 @@ pub(crate) fn configure_tool(
         thinking_display: thinking_display_name(model.thinking_display).to_string(),
         tools: child_tools,
         system_prompt_suffix: aj_tools::tools::oracle::ORACLE_PROMPT.to_string(),
-    })
-    .into();
+    }
 }
 
 /// Check Oracle's provider credentials without repeating Main's warning.

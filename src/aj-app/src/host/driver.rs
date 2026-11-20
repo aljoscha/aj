@@ -11,10 +11,12 @@
 //!
 //! It is also the session's single publisher. Frames leave here in one
 //! order, which is what makes "live durable frames reach a stream in
-//! strictly increasing seq order" a property of the code rather than a
-//! hope: the event stream is already in append order (the forwarder sends
-//! under the guard that appended), and a frame this task emits itself is
-//! published only after the stream has been drained up to that append.
+//! strictly increasing seq order" true by construction. Every append to a
+//! hosted log goes through the session's journal, which sends what the
+//! append publishes under the lock that appended. This task learns of an
+//! entry only from that stream, in [`Driver::on_committed`], so it
+//! publishes positions in the order they were committed. A write this task
+//! makes itself (a settings change, a goal record) takes the same path.
 //!
 //! **Request ordering.** Requests are answered one at a time in arrival
 //! order: the loop awaits a command's completion before taking the next.
@@ -26,15 +28,14 @@
 //! independent reads bypass this task entirely.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::queue::QueueEdit;
 use aj_agent::tool::{TaskId, TaskStatus};
 use aj_models::types::UserContent;
 use aj_session::{
-    EntryRef, PersistenceFailure, SessionMetadata, TaggedEvent, ThreadFilter,
-    repair_interrupted_tool_uses,
+    Committed, PersistenceFailure, TaggedEvent, ThreadFilter, TurnState, turn_unanswered,
 };
 use aj_wire::{DurableEvent, Frame};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -54,7 +55,7 @@ mod goal;
 
 #[cfg(test)]
 mod compaction_tests;
-pub(crate) use goal::{context as goal_context, has_goal_history, restore_goal};
+pub(crate) use goal::context as goal_context;
 
 /// Resolve a head target against `log` to the entry the head moves to.
 ///
@@ -64,37 +65,44 @@ pub(crate) use goal::{context as goal_context, has_goal_history, restore_goal};
 /// branching before a root would leave the session with no history at all,
 /// and no transcript gesture can legitimately ask for it.
 pub(super) fn resolve_head_target(
-    log: &aj_session::ConversationLog,
+    log: &aj_session::SessionLog,
     target: &HeadTarget,
 ) -> Result<String, HostError> {
+    let known = |id: &String| Ok::<_, HostError>(log.find(id).map_err(internal)?.is_some());
     let entry = match target {
         HeadTarget::Entry(entry) => Ok(entry.clone()),
-        HeadTarget::Before(entry) => match log.parent_of(entry) {
-            Some(parent) if log.contains(parent) => Ok(parent.clone()),
-            // The client named a real entry, so a parent id the log does not
-            // hold is a torn log rather than a bad request.
-            Some(parent) => Err(HostError::Internal(
-                format!("entry {entry} names parent {parent}, which the log does not hold").into(),
-            )),
-            None if log.contains(entry) => Err(HostError::Invalid(format!(
-                "entry {entry} starts the session, so there is nothing before it"
-            ))),
+        // The entry may be one a client paged back to, which the log does
+        // not hold in memory.
+        HeadTarget::Before(entry) => match log.find(entry).map_err(internal)? {
+            Some(found) => match found.parent_id {
+                Some(parent) if known(&parent)? => Ok(parent),
+                // The client named a real entry, so a parent id the log does
+                // not hold is a torn log rather than a bad request.
+                Some(parent) => Err(HostError::Internal(
+                    format!("entry {entry} names parent {parent}, which the log does not hold")
+                        .into(),
+                )),
+                None => Err(HostError::Invalid(format!(
+                    "entry {entry} starts the session, so there is nothing before it"
+                ))),
+            },
             None => Err(HostError::UnknownEntry(entry.clone())),
         },
     }?;
+    let named = known(&entry)?;
     log.validate_head(&entry).map_err(|err| match err {
-        aj_session::ConversationError::InvalidHead(_) if log.contains(&entry) => {
+        aj_session::SessionError::InvalidHead(_) if named => {
             // A before request names the child, not the rejected parent.
             HostError::Invalid(match target {
                 HeadTarget::Entry(entry) => {
-                    format!("entry {entry} is not on the user thread and cannot be a head")
+                    format!("entry {entry} is not on the main thread and cannot be a head")
                 }
                 HeadTarget::Before(entry) => format!(
-                    "cannot branch before entry {entry}: its parent is not on the user thread"
+                    "cannot branch before entry {entry}: its parent is not on the main thread"
                 ),
             })
         }
-        aj_session::ConversationError::InvalidHead(_) => {
+        aj_session::SessionError::InvalidHead(_) => {
             HostError::UnknownEntry(target.named().to_string())
         }
         other => internal(other),
@@ -102,30 +110,15 @@ pub(super) fn resolve_head_target(
     Ok(entry)
 }
 
-/// How long a shutdown waits for cancelled turns to wind themselves down
-/// before falling back to aborting them.
-///
-/// The graceful path is what keeps a transcript consistent (a cancelled
-/// turn emits its synthetic aborted `MessageEnd`s and error tool results),
-/// so we prefer it. A wedged turn must not hang the process, hence the
-/// bound.
-///
-/// Every session gets this grace concurrently under the host's total shutdown
-/// deadline, so adding sessions does not add their waits together.
-const TURN_DRAIN_GRACE: Duration = Duration::from_secs(5);
-
-/// How long teardown waits to acquire a session's log for its final flush.
-const LOG_FLUSH_GRACE: Duration = Duration::from_secs(5);
-
 pub(crate) struct Driver {
     session: Arc<LiveSession>,
     shared: Arc<HostShared>,
     turns: Turns,
     lifecycle: AgentLifecycle,
-    events: UnboundedReceiver<TaggedEvent>,
+    events: UnboundedReceiver<Committed>,
     requests: UnboundedReceiver<Request>,
-    /// Fired once by the conversation log when a write fails and fuses it
-    /// (see `ConversationLog::install_failure_signal`). The log reports from
+    /// Fired once by the session log when a write fails and fuses it
+    /// (see `SessionLog::install_failure_signal`). The log reports from
     /// the fuse itself, so a failure inside a detached task's append reaches
     /// this task the same way a foreground turn's does.
     persistence_failure: oneshot::Receiver<PersistenceFailure>,
@@ -134,16 +127,23 @@ pub(crate) struct Driver {
     /// the storage error a second time.
     persistence_failed: bool,
     /// Failed compaction leaves Main idle for inspection. Retain queued input
-    /// and task notices until the user starts work again, rather than waking
+    /// and task notifications until the user starts work again, rather than waking
     /// into the same oversized context. This is not a session-persistent pause.
     compaction_failed: bool,
     /// Explicit yield. Only synthetic goal continuation is held: queued input
-    /// and task notices retain their ordinary wake paths.
+    /// and task notifications retain their ordinary wake paths.
     waiting_for_input: bool,
     /// User goal input not yet admitted by Main. A yield decided against
     /// the earlier objective must not swallow that request to continue.
     goal_resume_pending: bool,
     goal: goal::GoalRun,
+    /// The agents whose turn the open found interrupted and that still
+    /// wait to be resumed (see [`crate::recovery::RESUME`]). An agent
+    /// leaves when a turn starts on it.
+    interrupted: Vec<AgentId>,
+    /// Set once this materialization was ended from inside a request (see
+    /// [`Self::stop_with`]). The driver loop returns when it sees it.
+    stopped: bool,
     /// Zero means no goal history. User mutations advance this revision, which
     /// admission returns to fence tools from an older objective or stop request.
     goal_revision: u64,
@@ -153,13 +153,14 @@ impl Driver {
     pub(crate) fn new(
         session: Arc<LiveSession>,
         shared: Arc<HostShared>,
-        events: UnboundedReceiver<TaggedEvent>,
+        events: UnboundedReceiver<Committed>,
         requests: UnboundedReceiver<Request>,
         persistence_failure: oneshot::Receiver<PersistenceFailure>,
         goal_revision: u64,
     ) -> Self {
-        let turns = Turns::with_handoff(session.handoff.clone());
+        let turns = Turns::new();
         let goal = goal::GoalRun::new(session.status().goal.clone());
+        let interrupted = session.core.interrupted.clone();
         Self {
             session,
             shared,
@@ -173,11 +174,14 @@ impl Driver {
             waiting_for_input: false,
             goal_resume_pending: false,
             goal,
+            interrupted,
+            stopped: false,
             goal_revision,
         }
     }
 
     pub(crate) async fn run(mut self) {
+        self.apply_resume_policy().await;
         loop {
             tokio::select! {
                 biased;
@@ -197,8 +201,12 @@ impl Driver {
                 // state as of now, and the event arm can be arbitrarily
                 // busy during a streaming turn.
                 request = self.requests.recv() => {
+                    // The host asked us to stop, or dropped the session.
+                    // Nothing already committed is folded first: the store
+                    // has it, and the next open reads it from there.
                     if matches!(&request, Some(Request::Shutdown) | None) {
-                        self.session.start_draining();
+                        self.wind_down().await;
+                        return;
                     }
                     // A client that keeps commands in flight would
                     // otherwise starve the two arms below for as long as it
@@ -231,6 +239,9 @@ impl Driver {
                         Some(Request::Command { command, reply }) => {
                             let outcome = self.command(command).await;
                             let _ = reply.send(outcome);
+                            if self.stopped {
+                                return;
+                            }
                         }
                         // Judged here, after the catch-up above, so a command
                         // or an event that arrived before this request has
@@ -249,23 +260,22 @@ impl Driver {
                             let _ = reply.send(ReleaseOutcome::Released { row });
                             return;
                         }
-                        // The host asked us to stop, or dropped the session.
-                        Some(Request::Shutdown) | None => {
-                            self.wind_down().await;
-                            return;
-                        }
+                        Some(Request::Shutdown) | None => unreachable!("handled above"),
                     }
                 },
 
-                Some(tagged) = self.events.recv() => self.on_event(tagged),
+                Some(committed) = self.events.recv() => self.on_committed(committed),
 
                 joined = self.turns.join_next() => self.on_join(joined),
             }
+            // What this pass decided about the goal is committed before the
+            // next request is taken, and the goal continues only from a
+            // committed state.
             if let Err(err) = self.checkpoint_goal().await {
-                self.fail_goal_persistence(err).await;
+                self.report_goal_unsaved(err).await;
             } else if self.requests.is_empty() && self.events.is_empty() {
                 if let Err(err) = self.continue_goal().await {
-                    self.fail_goal_persistence(err).await;
+                    self.report_goal_unsaved(err).await;
                 }
             }
         }
@@ -287,6 +297,17 @@ impl Driver {
 
     // -- events ----------------------------------------------------------
 
+    /// Fold one item of the journal's stream. This is the only place the
+    /// driver learns that the log grew.
+    fn on_committed(&mut self, committed: Committed) {
+        match committed {
+            Committed::Event(tagged) => self.on_event(tagged),
+            // Entries with nothing to show. Clients get no frame, and one
+            // that attaches later gets none from the backfill either.
+            Committed::Position(seq) => self.advance(seq),
+        }
+    }
+
     /// Fold one event of the session's tagged stream: update the
     /// lifecycle, advance the durable high-water mark, publish the frame,
     /// and start a wake if the event earned one.
@@ -302,7 +323,7 @@ impl Driver {
         // `apply_lifecycle`: `Turns::spawn_wake` refuses a busy owner, and
         // this `AgentEnd` is what marks the owner idle, so waking any earlier
         // would find it busy and drop the wake. `TaskEnd` wakes
-        // unconditionally so a completion notice reaches the model the moment
+        // unconditionally so a task notification reaches the model the moment
         // its task finishes. `AgentEnd` only when something is actually
         // queued, because a sub-agent's initial run ends inside its parent's
         // turn and never reaches the join arm.
@@ -322,7 +343,7 @@ impl Driver {
             && self.automatic_wake_allowed(owner)
             && (!conditional
                 || self.session.core.task_registry.has_notices(owner)
-                || self.session.has_queued(owner))
+                || self.session.has_pending(owner))
         {
             self.wake(owner);
         }
@@ -333,6 +354,7 @@ impl Driver {
         match event {
             AgentEvent::AgentStart { agent_id, .. } => {
                 self.lifecycle.mark_running(*agent_id);
+                self.interrupted.retain(|agent| agent != agent_id);
                 if *agent_id == AgentId::Main {
                     self.waiting_for_input = false;
                 }
@@ -341,7 +363,7 @@ impl Driver {
                 agent_id, waiting, ..
             } => {
                 self.lifecycle.mark_idle(*agent_id);
-                self.note_finished(*agent_id);
+                self.mark_idle(*agent_id);
                 if *agent_id == AgentId::Main {
                     let resume_pending = std::mem::take(&mut self.goal_resume_pending);
                     self.waiting_for_input = *waiting && !resume_pending;
@@ -357,36 +379,8 @@ impl Driver {
         }
     }
 
-    /// Record that `agent`'s run is over, if it is a sub-agent.
-    ///
-    /// This is the one fact a backfill's bracketing decisions derive from
-    /// (see `SessionStatus::finished_subs`), so every path that observes a
-    /// sub going idle has to come through here: the `AgentEnd` on the bus,
-    /// and the join-time reap for a sub that emitted none.
-    fn note_finished(&self, agent: AgentId) {
-        if let AgentId::Sub(n) = agent {
-            self.session.status().finished_subs.insert(n);
-        }
-    }
-
-    /// Record whether the host is driving a turn for sub-agent `agent`.
-    ///
-    /// Called on both sides of a spawn, and at reap. A continuation of a
-    /// finished sub-agent starts appending to its thread as soon as its task
-    /// runs, so the record has to exist before the spawn, and has to go away
-    /// again when the spawn did not take.
-    fn note_driven(&self, agent: AgentId, driven: bool) {
-        let AgentId::Sub(n) = agent else { return };
-        let mut status = self.session.status();
-        if driven {
-            status.driven_subs.insert(n);
-        } else {
-            status.driven_subs.remove(&n);
-        }
-    }
-
     /// Handle one completed turn: reap, conclude the sub-agent boxes the
-    /// reap swept, wake on queued work, and surface the outcome.
+    /// reap swept, wake on pending work, and surface the outcome.
     fn on_join(&mut self, joined: Joined) {
         // A producer can emit its final events and finish after the select
         // loop polled an empty event channel but before it polls this join.
@@ -406,8 +400,7 @@ impl Driver {
             .turns
             .reap(&mut self.lifecycle, &self.session.core.task_registry, agent)
         {
-            self.note_finished(idled);
-            self.note_driven(idled, false);
+            self.mark_idle(idled);
             // A sub the reap swept emitted no `AgentEnd` of its own, and a
             // remote client cannot conclude its box by reaching into the
             // model the way the local frontend does, so the conclusion
@@ -424,6 +417,17 @@ impl Driver {
                         assignment_pending: self.session.core.registry.assignment(n).is_some(),
                     },
                 );
+            }
+        }
+        if agent == AgentId::Main {
+            // A main turn's end bounds every run it spawned in the
+            // foreground. One that was dropped before it reported a start
+            // has its turn marked and nothing else to end it.
+            let tasks = &self.session.core.task_registry;
+            for n in self.session.core.turn.working_subs() {
+                if !tasks.agent_task_running(n) {
+                    self.mark_idle(AgentId::Sub(n));
+                }
             }
         }
         let result = match outcome {
@@ -444,6 +448,7 @@ impl Driver {
                         text: format!("agent task panicked: {err}"),
                     },
                 );
+                self.announce_waiting(agent);
                 self.refresh_state();
                 self.shared.fanout.mark_list_dirty();
                 return;
@@ -457,12 +462,19 @@ impl Driver {
                 Err(_) => aj_wire::TurnOutcome::Failed,
             });
         }
+        // A turn that failed fatally is not followed by a wake. It may have
+        // failed before it took its pending work, and a wake would then
+        // fail the same way, again and again. The work waits for the user.
+        let fatal = matches!(result, Err(TurnError::Fatal(_)));
         if !self.session.is_draining()
+            && !fatal
             && self.automatic_wake_allowed(agent)
             && (self.session.core.task_registry.has_notices(agent)
-                || self.session.has_queued(agent))
+                || self.session.has_pending(agent))
         {
             self.wake(agent);
+        } else {
+            self.announce_waiting(agent);
         }
         match result {
             Ok(()) => {}
@@ -503,6 +515,9 @@ impl Driver {
         owner != AgentId::Main || !self.compaction_failed
     }
 
+    /// Start a wake on `owner`. A no-op for a busy owner and for one with
+    /// no live handle. A wake that finds nothing to deliver starts no turn
+    /// and stores nothing.
     fn wake(&mut self, owner: AgentId) {
         if !self.turns.is_busy(&self.lifecycle, owner) {
             // Reactive callers check the hold. A user-resumed goal can also
@@ -512,17 +527,33 @@ impl Driver {
             }
             self.prepare_goal_turn(owner, false);
         }
-        self.note_driven(owner, true);
         self.turns.spawn_wake(
             owner,
             &self.session.core,
             &self.lifecycle,
             &self.shared.config,
         );
-        // The wake is a no-op for a busy owner and refused for one with no
-        // live handle, so what was actually spawned decides.
-        self.note_driven(owner, self.turns.is_driving(owner));
         self.refresh_state();
+    }
+
+    /// Store that `agent`'s turn ended in this process, whether it
+    /// finished, failed or was cancelled. Its start was stored by the
+    /// journal, on the turn's `AgentStart`, so a turn that
+    /// never started has nothing to end and this writes nothing. A no-op
+    /// while the agent is busy: a turn the host drives ends when it is
+    /// joined.
+    ///
+    /// A draining session is closed for writing (see [`Self::wind_down`]),
+    /// so nothing is stored for it. A turn the host stops stays marked
+    /// working, as after a host that died. The next open reads the main
+    /// agent's as interrupted and closes a sub-agent's run.
+    fn mark_idle(&self, agent: AgentId) {
+        if !self.session.is_draining()
+            && !self.turns.is_busy(&self.lifecycle, agent)
+            && let Err(error) = self.session.core.turn.set(agent, TurnState::Idle)
+        {
+            tracing::warn!("could not record that {agent:?}'s turn ended: {error}");
+        }
     }
 
     // -- publishing ------------------------------------------------------
@@ -541,44 +572,44 @@ impl Driver {
                 "a MessageEnd must be published with its own log entry",
             );
         }
-        // Checked outside the guard below: a failing assert inside it would
-        // poison the status mutex, and every later `status()` would panic on
-        // a lock that is only there to publish frames.
-        if let Some(entry) = &entry {
-            let last_seq = self.session.status().last_seq;
-            debug_assert!(
-                entry.seq > last_seq,
-                "durable seqs must be monotone per session: {} after {last_seq}",
-                entry.seq,
-            );
-        }
-        let durable = entry.is_some();
-        let (epoch, durability) = {
-            let mut status = self.session.status();
-            if let Some(entry) = &entry {
-                // Monotone by `max` rather than by assignment: the assert
-                // above is a debug-only guard, and a release build must not
-                // let one out-of-order append walk the high-water mark
-                // backwards and re-serve entries a client already applied.
-                status.last_seq = status.last_seq.max(entry.seq);
-                status.note_activity();
-            }
-            (status.epoch.clone(), entry)
-        };
-        self.shared.fanout.publish(Frame::Event {
-            session: self.session.id().to_string(),
-            epoch,
-            durability,
-            event: event.into(),
-        });
         // A durable event moves the row's `last_seq` and `last_activity`. A
         // transient one, every streaming delta included, moves no row field,
         // so it does not wake the list publisher to rebuild an unchanged
         // directory. `working` is marked where it changes, in
         // `refresh_state`, and the remaining fields by their own commands.
-        if durable {
-            self.shared.fanout.mark_list_dirty();
+        if let Some(entry) = &entry {
+            self.advance(entry.seq);
         }
+        let epoch = self.session.status().epoch.clone();
+        self.shared.fanout.publish(Frame::Event {
+            session: self.session.id().to_string(),
+            epoch,
+            durability: entry,
+            event: event.into(),
+        });
+    }
+
+    /// Move the published position to `seq`, which the journal's stream
+    /// just delivered, and put it on the session's row.
+    ///
+    /// The stream is in commit order and is the only source of positions,
+    /// so `seq` is above every position published before it.
+    fn advance(&self, seq: u64) {
+        let last_seq = {
+            let mut status = self.session.status();
+            let last_seq = status.last_seq;
+            status.last_seq = seq;
+            status.note_activity();
+            last_seq
+        };
+        // Checked outside the guard: a failing assert inside it would
+        // poison the status mutex, and every later `status()` would panic on
+        // a lock that is only there to publish frames.
+        debug_assert!(
+            seq > last_seq,
+            "the journal's stream delivers positions in commit order: {seq} after {last_seq}",
+        );
+        self.shared.fanout.mark_list_dirty();
     }
 
     /// Publish Main's turn state separately from the directory's session-wide
@@ -595,12 +626,15 @@ impl Driver {
                 .snapshot()
                 .iter()
                 .any(|task| task.status == TaskStatus::Running);
+        let turn_interrupted = self.session.core.turn.get(AgentId::Main) == TurnState::Interrupted;
         let mut changed = false;
         self.session.publish_state(&self.shared.fanout, |status| {
             changed = status.session_working != session_working;
             status.session_working = session_working;
-            let main_changed = status.working != working;
+            let main_changed =
+                status.working != working || status.turn_interrupted != turn_interrupted;
             status.working = working;
+            status.turn_interrupted = turn_interrupted;
             if working {
                 status.turn_outcome = None;
             }
@@ -613,6 +647,66 @@ impl Driver {
 
     fn publish_state(&self) {
         self.session.publish_state(&self.shared.fanout, |_| true);
+    }
+
+    /// Change the pending message of `agent`, which has a turn running or
+    /// a message waiting, and publish its queue. The change is saved before
+    /// the queue takes it, so a queued message is one a restart still has
+    /// and a withdrawn one is gone. A failed save refuses the command and
+    /// leaves the queue as it was.
+    fn edit_queue(&self, agent: AgentId, edit: QueueEdit<'_>) -> Result<Option<String>, HostError> {
+        let core = &self.session.core;
+        let taken = crate::session::edit_pending(&core.pending, &core.message_queues, agent, edit)
+            .map_err(|error| not_saved("the queued message", error))?;
+        self.publish_queue(agent);
+        Ok(taken)
+    }
+
+    /// Take a prompt for an idle agent: save it as the agent's pending
+    /// input, then start the wake turn that takes it. `Accepted` means the
+    /// input is saved. A failed save refuses the command, and no turn
+    /// starts.
+    ///
+    /// No `QueueUpdate` announces the input, because the turn takes it at
+    /// once and a client would show it as queued for an instant. A turn
+    /// that ends without having taken it announces it then (see
+    /// [`Self::on_join`]).
+    ///
+    /// A message already pending for the agent, one restored at an open
+    /// for example, takes the new content and is delivered as one message
+    /// (see [`aj_agent::queue`] on "one message, one kind").
+    ///
+    /// The main agent's first prompt in a session that is not stored, or
+    /// at a fork point, creates the session or branch in the transaction
+    /// that saves it (see [`crate::session::accept_prompt`]).
+    async fn start_with(
+        &mut self,
+        agent: AgentId,
+        content: &[UserContent],
+    ) -> Result<CommandOutcome, HostError> {
+        let core = &self.session.core;
+        if core.resolve_agent(agent).is_none() {
+            // A command picks its agent up before it prompts it. Checked
+            // before the save, so a refusal leaves nothing pending.
+            return Err(HostError::Internal(
+                format!("{} has no live agent", agent_label(agent)).into(),
+            ));
+        }
+        let (journal, queues) = (&core.journal, &core.message_queues);
+        crate::session::accept_prompt(journal, &core.pending, queues, agent, content)
+            .await
+            .map_err(|error| not_saved("the prompt", error))?;
+        self.spawn(agent, TurnStart::Wake)
+    }
+
+    /// Tell clients of the message `agent`'s finished turn left pending,
+    /// when no wake is taking it. A prompt to an idle agent is not
+    /// announced when it is accepted (see [`Self::start_with`]), so this
+    /// is where clients learn of one its turn did not take.
+    fn announce_waiting(&self, agent: AgentId) {
+        if !self.session.is_draining() && self.session.has_pending(agent) {
+            self.publish_queue(agent);
+        }
     }
 
     /// Publish `agent`'s queue snapshot. The agent only emits this after a
@@ -630,16 +724,16 @@ impl Driver {
         );
     }
 
-    /// Publish everything already queued on the event stream.
+    /// Fold everything already on the journal's stream, without waiting
+    /// for the event arm to be polled.
     ///
-    /// A frame this task emits itself carries an append position, and every
-    /// entry below it has already reached the stream (the forwarder sends
-    /// under the guard that appended). Draining first is therefore what
-    /// keeps the published seqs monotone: without it, an append that
-    /// happened before ours would be published after it.
+    /// Never needed for the order of positions, which the stream fixes. A
+    /// caller drains because something it does next has to come after what
+    /// is already committed: a frame it publishes itself, a decision it
+    /// takes on the folded state, or a stream it is about to close.
     fn drain_events(&mut self) {
-        while let Ok(tagged) = self.events.try_recv() {
-            self.on_event(tagged);
+        while let Ok(committed) = self.events.try_recv() {
+            self.on_committed(committed);
         }
     }
 
@@ -652,8 +746,14 @@ impl Driver {
                 .await
                 .map(CommandOutcome::Goal)
                 .map_err(goal::host_error),
-            Command::Prompt { agent, content } => self.prompt(agent, content),
-            Command::Steer { agent, text } => self.steer(agent, text),
+            Command::Prompt { agent, content } => {
+                self.pick_up(agent).await?;
+                self.prompt(agent, content).await
+            }
+            Command::Steer { agent, text } => {
+                self.pick_up(agent).await?;
+                self.steer(agent, text).await
+            }
             Command::Cancel { agent } => {
                 if agent == AgentId::Main {
                     self.pause_goal().await?;
@@ -661,21 +761,50 @@ impl Driver {
                 self.cancel(agent)
             }
             Command::KillAgent { agent } => self.kill_agent(agent),
-            Command::Queue(op) => Ok(self.queue_op(op)),
+            Command::Queue(op) => self.queue_op(op),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
             Command::Account { provider, account } => self.account(provider, account).await,
             Command::Env { key, value } => self.environment(key, value).await,
-            Command::Tag { tag } => self.tag(tag),
-            Command::Archive { archived } => self.archive(archived),
+            Command::Tag { tag } => self.tag(tag).await,
+            Command::Archive { archived } => self.archive(archived).await,
             Command::Head { target, changes } => self.head_switch(target, changes).await,
             Command::KillTask { task } => self.kill_task(task),
+            Command::Continue => self.continue_turn().await,
         }
     }
 
-    /// Exactly the local submit gesture: run a turn when the target is
-    /// idle, queue a follow-up when it is busy.
-    fn prompt(
+    /// Make `agent` one this process can drive. The main agent always is.
+    /// A sub-agent it holds no live agent for, one spawned by an earlier
+    /// process or dropped at a head switch, is built from its stored run.
+    /// One the selected branch shows no run of is refused.
+    async fn pick_up(&self, agent: AgentId) -> Result<(), HostError> {
+        let AgentId::Sub(n) = agent else {
+            return Ok(());
+        };
+        let core = &self.session.core;
+        if core.registry.get(n).is_some() {
+            return Ok(());
+        }
+        let config = {
+            let config = self.shared.config.lock().expect("config mutex poisoned");
+            config.clone()
+        };
+        let mut log = core.log.lock().await;
+        let built = core.rebuild_sub_agent(&mut log, n, &config, self.shared.restore.as_ref());
+        match built {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(HostError::Conflict {
+                reason: format!("{} has no run on this branch", agent_label(agent)),
+            }),
+            Err(error) => Err(HostError::Internal(error.into())),
+        }
+    }
+
+    /// The submit gesture. The prompt becomes the agent's pending input
+    /// either way: an idle agent is woken to take it, and behind a running
+    /// turn it waits as a follow-up.
+    async fn prompt(
         &mut self,
         agent: AgentId,
         content: Vec<UserContent>,
@@ -684,55 +813,48 @@ impl Driver {
         if text.as_deref().is_some_and(str::is_empty) || content.is_empty() {
             return Err(HostError::Invalid("the prompt is empty".to_string()));
         }
-        if self.turns.is_busy(&self.lifecycle, agent) {
-            let Some(text) = text else {
-                // The pending-message queues hold text, so an attachment
-                // cannot be queued. Refusing beats silently dropping it.
-                return Err(HostError::Conflict {
-                    reason: "attachments cannot be queued while the agent is busy".to_string(),
-                });
-            };
-            self.session
-                .core
-                .message_queues
-                .append_follow_up(agent, &text);
-            self.publish_queue(agent);
-            return Ok(CommandOutcome::Accepted);
+        let attached = text.is_none();
+        // A text-only prompt is one trimmed block of text, as a typed
+        // submit sends it.
+        let content = text.map_or(content, |text| vec![UserContent::text(text)]);
+        if !self.turns.is_busy(&self.lifecycle, agent) {
+            return self.start_with(agent, &content).await;
         }
-        let start = match text {
-            // A text-only prompt takes the same path a typed submit does.
-            Some(text) => TurnStart::Prompt(text),
-            None => TurnStart::Content(content),
-        };
-        self.spawn(agent, start)
+        if attached {
+            // The pending-message box shows text and a withdrawal hands
+            // back text, so a client could neither show a waiting
+            // attachment nor take it back. Refusing beats that.
+            return Err(HostError::Conflict {
+                reason: "attachments cannot be queued while the agent is busy".to_string(),
+            });
+        }
+        self.edit_queue(agent, QueueEdit::FollowUp(&content))?;
+        Ok(CommandOutcome::Accepted)
     }
 
     /// The steer gesture: while busy, queue as steering, or promote the
     /// pending follow-up when there is no text. While idle there is nothing
-    /// to steer yet, so text starts a normal turn.
-    fn steer(&mut self, agent: AgentId, text: String) -> Result<CommandOutcome, HostError> {
+    /// to steer yet, so text is a prompt.
+    async fn steer(&mut self, agent: AgentId, text: String) -> Result<CommandOutcome, HostError> {
         let text = text.trim().to_string();
         if self.turns.is_busy(&self.lifecycle, agent) {
-            if text.is_empty() {
-                self.session.core.message_queues.promote(agent);
+            let edit = if text.is_empty() {
+                QueueEdit::Promote
             } else {
-                self.session
-                    .core
-                    .message_queues
-                    .append_steering(agent, &text);
-            }
-            self.publish_queue(agent);
+                QueueEdit::Steer(&text)
+            };
+            self.edit_queue(agent, edit)?;
             return Ok(CommandOutcome::Accepted);
         }
         if text.is_empty() {
             return Ok(CommandOutcome::Accepted);
         }
-        self.spawn(agent, TurnStart::Prompt(text))
+        self.start_with(agent, &[UserContent::text(text)]).await
     }
 
-    /// Route a cancel to the mechanism that owns `agent`'s run.
+    /// Route a cancel to the mechanism that owns `agent`'s turn.
     ///
-    /// `Accepted` means the owner was signalled to end the run, or the run
+    /// `Accepted` means the owner was signalled to end the turn, or the turn
     /// had already ended. A running mark with no owner is refused and logged
     /// so neither the wire answer nor the host's invariant tripwire claims a
     /// cancellation happened when no mechanism could perform it.
@@ -791,11 +913,21 @@ impl Driver {
         self.cancel(agent)
     }
 
-    fn queue_op(&self, op: QueueOp) -> CommandOutcome {
-        match op {
+    fn queue_op(&self, op: QueueOp) -> Result<CommandOutcome, HostError> {
+        Ok(match op {
             QueueOp::Remove { agent } => {
-                let text = self.session.core.message_queues.take_pending(agent);
-                self.publish_queue(agent);
+                let pending = self.session.core.message_queues.pending(agent);
+                if pending.is_some_and(|(_, input)| input.has_attachments()) {
+                    // A withdrawal hands back text. Taking the message
+                    // would drop its attachment without a word.
+                    return Err(HostError::Conflict {
+                        reason: "the pending message has an attachment, which cannot be \
+                                 pulled back. Continue sends it, and clearing the queue \
+                                 discards it"
+                            .to_string(),
+                    });
+                }
+                let text = self.edit_queue(agent, QueueEdit::Withdraw)?;
                 // Handed back so a client can restore it to its editor,
                 // which is what the local dequeue gesture does.
                 CommandOutcome::Withdrawn(text)
@@ -806,12 +938,94 @@ impl Driver {
                 // tracks the queues per agent and would otherwise keep
                 // showing the ones it was not told about.
                 for agent in self.session.core.message_queues.queued_agents() {
-                    self.session.core.message_queues.clear(agent);
-                    self.publish_queue(agent);
+                    self.edit_queue(agent, QueueEdit::Withdraw)?;
                 }
                 CommandOutcome::Accepted
             }
+        })
+    }
+
+    /// Apply the resume policy to the turns the open found interrupted,
+    /// once, as the session goes live. Under
+    /// [`Resume::WaitForUser`](crate::recovery::Resume::WaitForUser) they
+    /// wait for [`Self::continue_turn`].
+    async fn apply_resume_policy(&mut self) {
+        match crate::recovery::RESUME {
+            crate::recovery::Resume::WaitForUser => {}
+            crate::recovery::Resume::Continue => {
+                if let Err(error) = self.resume_interrupted().await {
+                    tracing::warn!("could not continue an interrupted turn: {error}");
+                }
+            }
         }
+    }
+
+    /// Continue every interrupted turn that still waits, for the main
+    /// agent and for sub-agents alike. Returns whether any turn started.
+    async fn resume_interrupted(&mut self) -> Result<bool, HostError> {
+        let mut resumed = false;
+        for agent in self.interrupted.clone() {
+            if self.turns.is_busy(&self.lifecycle, agent) {
+                continue;
+            }
+            // The main agent's turn may have been answered since: a prompt
+            // or a wake continues it as well as this does.
+            let unanswered = match agent {
+                AgentId::Main => self.main_turn_unanswered().await,
+                AgentId::Sub(_) => true,
+            };
+            self.interrupted.retain(|waiting| *waiting != agent);
+            if unanswered {
+                self.pick_up(agent).await?;
+                self.spawn(agent, TurnStart::Continue)?;
+                resumed = true;
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Whether the main thread leaves input the model never
+    /// answered.
+    async fn main_turn_unanswered(&self) -> bool {
+        let log = self.session.core.log.lock().await;
+        log.head()
+            .is_some_and(|head| turn_unanswered(&log.linearize(head, ThreadFilter::MAIN)))
+    }
+
+    /// The Continue gesture: resume the interrupted turns, of the main
+    /// agent and of sub-agents, or else deliver pending work left without
+    /// a turn. The host decides which applies, so a client can offer the
+    /// action without tracking that.
+    async fn continue_turn(&mut self) -> Result<CommandOutcome, HostError> {
+        let resumed = self.resume_interrupted().await?;
+        if self.turns.is_busy(&self.lifecycle, AgentId::Main) {
+            // Busy with the turn this just resumed, or with its own while
+            // a sub-agent's was resumed.
+            return match resumed {
+                true => Ok(CommandOutcome::Accepted),
+                false => Err(HostError::Conflict {
+                    reason: "a turn is running".to_string(),
+                }),
+            };
+        }
+        // A turn can be cut short on a branch the session only came to by
+        // a head switch, which the open did not see.
+        if self.main_turn_unanswered().await {
+            return self.spawn(AgentId::Main, TurnStart::Continue);
+        }
+        // Work restored after a finished turn has no turn to ride on.
+        let core = &self.session.core;
+        if core.message_queues.has_pending(AgentId::Main)
+            || core.task_registry.has_notices(AgentId::Main)
+        {
+            return self.spawn(AgentId::Main, TurnStart::Wake);
+        }
+        if resumed {
+            return Ok(CommandOutcome::Accepted);
+        }
+        Err(HostError::Conflict {
+            reason: "the last turn finished, so there is nothing to continue".to_string(),
+        })
     }
 
     fn compact(&mut self, instructions: Option<String>) -> Result<CommandOutcome, HostError> {
@@ -829,45 +1043,43 @@ impl Driver {
         )
     }
 
-    /// Write the session's tag sidecar and put the new label on its row.
+    /// Set the session's tag and put the new label on its row.
     ///
     /// The write happens here rather than at the host's surface because this
     /// task holds the session's advisory lock: a tag materializes like any
     /// other command so that two writers of one store cannot interleave on a
-    /// session's label.
+    /// session's label. It goes through the log, which commits the label of a
+    /// stored session and keeps that of a session not stored yet in its
+    /// draft, which the session's first input stores.
     ///
     /// A tag is display metadata and nothing else, so it appends no log entry
     /// and publishes no `state` frame. The session list is where it surfaces,
     /// which is what the dirty mark is for.
-    fn tag(&self, tag: Option<String>) -> Result<CommandOutcome, HostError> {
-        self.shared
-            .persistence
-            .write_tag(self.session.id(), tag.as_deref())
-            .map_err(internal)?;
-        // After the write, so a sidecar that would not be written leaves the
+    async fn tag(&self, tag: Option<String>) -> Result<CommandOutcome, HostError> {
+        let set = self.session.core.log.lock().await.set_tag(tag.as_deref());
+        set.map_err(|error| not_saved("the label", error))?;
+        // After the write, so a label that would not be written leaves the
         // row saying what the store still says.
         self.session.status().tag = tag;
         self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
     }
 
-    /// Write the session's archived sidecar and put the new bit on its row.
+    /// Set the session's archived bit and put it on its row.
     ///
-    /// Here rather than at the host's surface for the reason [`Self::tag`]
-    /// gives: this task holds the session's advisory lock, which is what
-    /// orders two writers of one store on a session's sidecars.
+    /// Here and through the log for the reasons [`Self::tag`] gives: this
+    /// task holds the session's advisory lock, which is what orders two
+    /// writers of one store on a session's bit.
     ///
     /// The bit is display metadata and nothing else, so this appends no log
     /// entry, publishes no `state` frame, and touches nothing about the
     /// session's life: a session working through a turn goes on working,
     /// archived. Nothing else in this driver writes it either, so a prompt to
     /// an archived session leaves it archived.
-    fn archive(&self, archived: bool) -> Result<CommandOutcome, HostError> {
-        self.shared
-            .persistence
-            .write_archived(self.session.id(), archived)
-            .map_err(internal)?;
-        // After the write, so a sidecar that would not be written leaves the
+    async fn archive(&self, archived: bool) -> Result<CommandOutcome, HostError> {
+        let set = self.session.core.log.lock().await.set_archived(archived);
+        set.map_err(|error| not_saved("the archive marker", error))?;
+        // After the write, so a bit that would not be written leaves the
         // row saying what the store still says.
         self.session.status().archived = archived;
         self.shared.fanout.mark_list_dirty();
@@ -885,18 +1097,14 @@ impl Driver {
 
     fn spawn(&mut self, agent: AgentId, start: TurnStart) -> Result<CommandOutcome, HostError> {
         self.prepare_goal_turn(agent, matches!(&start, TurnStart::Goal(_)));
-        // Before the spawn: a sub-agent's turn task can append to its thread
-        // as soon as it runs, and a backfill in between has to see the run as
-        // live rather than as the finished one it continues.
-        self.note_driven(agent, true);
         if !self
             .turns
             .spawn(&self.session.core, &self.shared.config, agent, start)
         {
-            self.note_driven(agent, false);
-            return Err(HostError::Conflict {
-                reason: format!("{agent:?} has no live handle and cannot be prompted"),
-            });
+            // A command picks its agent up before it starts a turn on it.
+            return Err(HostError::Internal(
+                format!("{} has no live agent", agent_label(agent)).into(),
+            ));
         }
         if agent == AgentId::Main {
             self.compaction_failed = false;
@@ -930,8 +1138,8 @@ impl Driver {
         Ok(())
     }
 
-    /// Apply a settings change and synthesize its frames: the notice tagged
-    /// with the entry the change appended, then a refreshed `state`.
+    /// Apply a settings change and publish its frames: the notice the
+    /// change recorded with its entry, then a refreshed `state`.
     ///
     /// A change that did not apply is an error, never an acceptance: the
     /// host staged nothing and has nothing to publish, and a client told
@@ -943,6 +1151,7 @@ impl Driver {
             persist,
             axis,
         } = change;
+        self.pick_up(agent).await?;
         let core = &self.session.core;
         let shared = &self.shared;
         let target = axis.model_target();
@@ -1078,10 +1287,10 @@ impl Driver {
             );
         }
 
-        if let Some(entry) = &outcome.entry {
-            self.publish_state_entry(agent, entry, &outcome.notice)
-                .await;
-        }
+        // The change recorded its notice with its entry. Fold it now, so it
+        // is published before the `state` frame below and before the
+        // command is answered.
+        self.drain_events();
         let incomplete = (!outcome.notes.is_empty()).then(|| {
             format!(
                 "Current-session setting applied. {}",
@@ -1089,7 +1298,7 @@ impl Driver {
             )
         });
         for note in outcome.notes {
-            // A failed config write or log record is a live-only
+            // A failed config write is a live-only
             // diagnostic: no entry exists for a backfill to regenerate it
             // from, so it rides an untagged frame.
             self.publish_event(
@@ -1118,49 +1327,6 @@ impl Driver {
         Ok(incomplete.map_or(CommandOutcome::Accepted, CommandOutcome::Incomplete))
     }
 
-    async fn publish_state_entry(&mut self, agent: AgentId, entry: &EntryRef, confirmation: &str) {
-        // Ask the projection what a backfill would render rather than
-        // restating the wording. The snapshot is taken under the log
-        // lock and projected outside it, because the projection walks
-        // the whole log.
-        let snapshot = self.session.core.log.lock().await.snapshot();
-        let notice = snapshot.project_state_entry(&entry.id);
-
-        // Splice the notice into the stream at its own append
-        // position. The confirm released the log lock before
-        // returning, so a background sub-agent's append can already
-        // sit in the channel carrying a higher position, and
-        // publishing the notice on either side of it unconditionally
-        // would break the monotone-per-stream guarantee. Holding the
-        // log lock for the splice is what stops a further append from
-        // arriving mid-way through it.
-        // Held through a clone, so the guard does not borrow `self`
-        // and the splice below can still publish.
-        let log = Arc::clone(&self.session.core.log);
-        let guard = log.lock().await;
-        let mut buffered = Vec::new();
-        while let Ok(tagged) = self.events.try_recv() {
-            buffered.push(tagged);
-        }
-        let mut spliced = false;
-        for tagged in buffered {
-            if !spliced
-                && tagged
-                    .entry
-                    .as_ref()
-                    .is_some_and(|buffered| buffered.seq > entry.seq)
-            {
-                self.publish_notice(agent, entry, notice.clone(), confirmation);
-                spliced = true;
-            }
-            self.on_event(tagged);
-        }
-        if !spliced {
-            self.publish_notice(agent, entry, notice, confirmation);
-        }
-        drop(guard);
-    }
-
     async fn account(
         &mut self,
         provider: String,
@@ -1180,26 +1346,26 @@ impl Driver {
         if choices.get(&provider) == account {
             return Ok(CommandOutcome::Accepted);
         }
-        let entry = self
-            .session
-            .core
-            .log
-            .lock()
-            .await
-            .append_account_change(&provider, account.as_deref())
-            .map_err(internal)?;
-        choices.set(&provider, account.clone());
         let selection = match account.as_deref() {
             None => "Provider default".to_string(),
             Some("") => "Unnamed account".to_string(),
             Some(label) => format!("{label:?}"),
         };
-        self.publish_state_entry(
-            AgentId::Main,
-            &entry,
-            &format!("{provider} account: {selection}."),
-        )
-        .await;
+        let confirmation = format!("{provider} account: {selection}.");
+        self.session
+            .core
+            .journal
+            .record(|log| {
+                let entry = log.append_account_change(&provider, account.as_deref())?;
+                let events =
+                    crate::settings::change_events(log, AgentId::Main, &entry, &confirmation);
+                Ok(((), events))
+            })
+            .await
+            .map_err(internal)?;
+        choices.set(&provider, account.clone());
+        // The change's notice goes out before the `state` frame.
+        self.drain_events();
         self.publish_state();
         Ok(CommandOutcome::Accepted)
     }
@@ -1216,80 +1382,51 @@ impl Driver {
         )]))
         .map_err(|err| HostError::Invalid(err.to_string()))?;
         self.require_idle()?;
-        let (entry, env) = {
-            let mut log = self.session.core.log.lock().await;
-            let current = log.session_env().cloned().unwrap_or_default();
-            let mut env = current.clone();
-            match value {
-                Some(value) => {
-                    env.insert(key, value);
+        let changed = self
+            .session
+            .core
+            .journal
+            .record(|log| {
+                let current = log.session_env().cloned().unwrap_or_default();
+                let mut env = current.clone();
+                match &value {
+                    Some(value) => {
+                        env.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        env.remove(&key);
+                    }
                 }
-                None => {
-                    env.remove(&key);
+                if env == current {
+                    return Ok((None, Vec::new()));
                 }
-            }
-            if env == current {
-                return Ok(CommandOutcome::Accepted);
-            }
-            let entry = log.append_env_change(env.clone()).map_err(internal)?;
-            // Established logs flush before runtime changes. Fresh seed-only
-            // logs remain buffered until their first message. Either failure
-            // invokes the log's existing session fence.
-            log.flush_pending().map_err(internal)?;
-            (entry, env)
+                let entry = log.append_env_change(env.clone())?;
+                let events = crate::settings::change_events(
+                    log,
+                    AgentId::Main,
+                    &entry,
+                    "Session environment changed",
+                );
+                Ok((Some(env), events))
+            })
+            .await
+            .map_err(internal)?;
+        let Some(env) = changed else {
+            return Ok(CommandOutcome::Accepted);
         };
         self.session.core.agent.lock().await.set_session_env(env);
-        self.publish_state_entry(AgentId::Main, &entry, "Session environment changed")
-            .await;
+        // The change's notice goes out before the `state` frame.
+        self.drain_events();
         self.publish_state();
         self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
-    }
-
-    /// Publish a settings entry's event: the projected one tagged with the
-    /// entry, or `confirmation` untagged when the entry projects none.
-    ///
-    /// A main-thread settings seed before the first message
-    /// projects no notice, so a tagged frame would name something no
-    /// backfill can regenerate. Publishing the confirmation untagged is
-    /// what keeps the pre-first-prompt settings gesture from going silent:
-    /// live clients see it, and it is a transient notice
-    /// like any other. The entry's position still moves the high-water
-    /// mark, since the entry is on disk either way.
-    fn publish_notice(
-        &self,
-        agent: AgentId,
-        entry: &EntryRef,
-        projected: Option<AgentEvent>,
-        confirmation: &str,
-    ) {
-        match projected {
-            Some(event) => {
-                self.publish_event(Some(super::durable_event(entry.clone(), None)), event)
-            }
-            None => {
-                {
-                    let mut status = self.session.status();
-                    status.last_seq = status.last_seq.max(entry.seq);
-                    status.note_activity();
-                }
-                self.shared.fanout.mark_list_dirty();
-                self.publish_event(
-                    None,
-                    AgentEvent::Notice {
-                        agent_id: agent,
-                        text: confirmation.to_string(),
-                    },
-                );
-            }
-        }
     }
 
     /// A child's spawn snapshot and recorded edits, without taking its agent
     /// lock, which may be held for a running turn. Staged overrides take
     /// precedence when applying a setting to that child.
     async fn sub_settings(&self, n: usize) -> aj_session::SessionSettings {
-        let filter = ThreadFilter::subagent(n);
+        let filter = ThreadFilter::sub(n);
         let log = self.session.core.log.lock().await;
         log.latest_leaf(filter)
             .map(|head| log.linearize(&head, filter).settings())
@@ -1297,22 +1434,67 @@ impl Driver {
     }
 
     fn require_idle(&self) -> Result<(), HostError> {
-        let snapshot = self.session.core.task_registry.snapshot();
-        let (agents, bash) = running_work_counts(
-            self.turns.driven(),
-            snapshot.iter().map(|task| (&task.kind, task.status)),
-        );
-        if agents + bash > 0 {
+        let (agents, tasks) = self.running_work();
+        if agents + tasks > 0 {
             return Err(HostError::Conflict {
-                reason: format!("{agents} agents and {bash} background tasks are still running"),
+                reason: format!("{agents} agents and {tasks} background tasks are still running"),
             });
         }
         Ok(())
     }
 
+    /// Driven turns and running agent runs, and every other running task.
+    fn running_work(&self) -> (usize, usize) {
+        let snapshot = self.session.core.task_registry.snapshot();
+        running_work_counts(
+            self.turns.driven(),
+            snapshot.iter().map(|task| (&task.kind, task.status)),
+        )
+    }
+
+    /// Refuse a head switch unless the session is quiesced: nothing
+    /// runs for any agent, and nothing accepted waits to be delivered.
+    ///
+    /// Live work therefore exists only on the thread the session is
+    /// on, and a switch has nothing to carry over, let go of or take up.
+    /// The refusal names what is in the way and how to clear it.
+    fn require_quiesced(&self) -> Result<(), HostError> {
+        let core = &self.session.core;
+        let (agents, tasks) = self.running_work();
+        let mut blocking = Vec::new();
+        if agents + tasks > 0 {
+            blocking.push(format!(
+                "{agents} agents and {tasks} background tasks are still running: \
+                 wait for them or stop them"
+            ));
+        }
+        // Continue delivers the main agent's waiting work. A sub-agent's is
+        // delivered by its next turn, which a message to it starts.
+        if !core.message_queues.queued_agents().is_empty() {
+            blocking.push(
+                "a queued message is waiting: withdraw it, or deliver it with Continue \
+                 (for a sub-agent, by sending it a message)"
+                    .into(),
+            );
+        }
+        if core.task_registry.has_any_notices() {
+            blocking.push(
+                "a finished task's notification is waiting: deliver it with Continue \
+                 (for a sub-agent, by sending it a message)"
+                    .to_string(),
+            );
+        }
+        if blocking.is_empty() {
+            return Ok(());
+        }
+        Err(HostError::Conflict {
+            reason: format!("the branch was not switched. {}", blocking.join(". ")),
+        })
+    }
+
     async fn prepare_head(
         &self,
-        log: &aj_session::ConversationLog,
+        log: &aj_session::SessionLog,
         entry: &String,
         changes: &aj_wire::BranchChanges,
     ) -> Result<
@@ -1322,7 +1504,10 @@ impl Driver {
         ),
         HostError,
     > {
-        let env = log.session_env_at(Some(entry)).cloned().unwrap_or_default();
+        let env = log
+            .session_env_at(Some(entry))
+            .map_err(internal)?
+            .unwrap_or_default();
         let run = self
             .session
             .core
@@ -1332,7 +1517,7 @@ impl Driver {
             .clone();
         super::head::prepare(
             run,
-            &log.linearize(entry, ThreadFilter::USER).settings(),
+            &log.linearize(entry, ThreadFilter::MAIN).settings(),
             &self.shared,
             env,
             changes,
@@ -1342,59 +1527,134 @@ impl Driver {
 
     /// Switch the session's head to `target`, in place.
     ///
-    /// Refused while any turn is driven or any background task is live: a
-    /// mid-turn switch would let the running turn persist onto the wrong
-    /// branch. On success the queues are cleared, the state that belonged to
-    /// the branch being left is reset, the agent is reseeded from the new
-    /// branch, a fresh epoch is minted and `reset` published.
+    /// Refused unless the session is quiesced (see
+    /// [`Self::require_quiesced`]): a mid-turn switch would let the running
+    /// turn persist onto the wrong branch, and work that waits would be
+    /// delivered on a branch it was not accepted on. On success the state
+    /// that belonged to the branch being left is reset, the agent is
+    /// reseeded from the new branch, a fresh epoch is minted and `reset`
+    /// published.
+    ///
+    /// The switch happens whole or not at all. Everything that can be
+    /// refused comes before the head moves, and a refusal there leaves the
+    /// session as it was. Moving the head is the point of no return. The
+    /// one fallible step after it is the write of what the switch appends
+    /// to the branch it lands on, which needs the head there. If that
+    /// fails, the log is on the new branch and nothing else is, so the
+    /// session is ended as after a storage failure ([`Self::stop_with`])
+    /// and clients open it again from what is stored. Every later step
+    /// only changes memory and cannot fail.
     async fn head_switch(
         &mut self,
         target: HeadTarget,
         changes: aj_wire::BranchChanges,
     ) -> Result<CommandOutcome, HostError> {
-        self.require_idle()?;
         // Everything already on the event stream belongs to the epoch this
         // switch is about to replace. Published afterwards it would carry
         // the new epoch, which no client's epoch filter can reject, and it
         // would name positions in the history the switch just left.
+        //
+        // Before the check, because a drained event can start a turn (a
+        // task's end wakes its owner). From the check to the head move only
+        // this task could start work, and it does not: it takes no request
+        // and folds no event until the switch returns.
         self.drain_events();
+        self.require_quiesced()?;
 
-        // Queued messages belong to the branch being left, so they are
-        // cleared once the switch is committed to (`set_head` validated
-        // the target) but before the epoch changes: published under the old
-        // epoch they still reach clients, whereas a frame minted after the
-        // switch would be dropped by their epoch filter.
-        // Cloned so the guard does not borrow `self`: the queue updates
-        // below are published while it is held.
-        let log_handle = Arc::clone(&self.session.core.log);
-        {
-            let mut log = log_handle.lock().await;
-            // The abandoned branch's buffered non-punctuation entries
-            // belong to it, so they must reach disk before the head moves
-            // off them.
-            log.flush_pending().map_err(internal)?;
+        // Cloned so the guard does not borrow `self`.
+        let journal = self.session.core.journal.clone();
+        let switched = {
+            let mut log = journal.lock().await;
             // Resolved here rather than at the caller, under the same lock
             // that moves the head: a parent read outside it could be
             // superseded by an append before the switch lands.
             let entry = resolve_head_target(&log, &target)?;
-            let (prepared, env) = self.prepare_head(&log, &entry, &changes).await?;
-            log.set_head(entry).map_err(internal)?;
-            self.goal = goal::GoalRun::new(restore_goal(&mut log).map_err(internal)?);
+            // The target branch has its own model context and display
+            // tail, which the log may not hold. They are read before the
+            // head moves, off the async threads. An earlier entry of the
+            // selected branch, after its last compaction, needs no read.
+            let left = match log.branch_read(&entry).map_err(internal)? {
+                Some(read) => {
+                    let branch = tokio::task::spawn_blocking(move || read.read())
+                        .await
+                        .map_err(internal)?
+                        .map_err(internal)?;
+                    Some(log.log_mut().install_branch(branch).map_err(internal)?)
+                }
+                None => None,
+            };
+            let moved = match self.prepare_head(&log, &entry, &changes).await {
+                // The live evaluator belongs to the branch being left. It
+                // is shut down while the switch can still be refused. Its
+                // values stay, and an evaluator is built again when needed.
+                Ok(prepared) => match self.shutdown_evaluator().await {
+                    Ok(()) => log
+                        .log_mut()
+                        .set_head(entry)
+                        .map(|()| prepared)
+                        .map_err(|error| not_saved("the branch switch", error)),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let (prepared, env) = match moved {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // The head stays where it was, so the log goes back to
+                    // holding its branch.
+                    if let Some(left) = left {
+                        log.log_mut().restore_branch(left);
+                    }
+                    return Err(error);
+                }
+            };
+            // The head has moved. What the switch appends to the branch it
+            // lands on, in one write. At a fork point all of it joins the
+            // branch's draft and is stored with the branch's first input. None
+            // of it has an event: the `reset` below makes every client read
+            // the new branch again.
+            let appended = log
+                .record(|log| {
+                    log.in_draft(|log| {
+                        let goal = crate::recovery::pause_goal(log)?;
+                        // A fork point can sit between a tool call and its result.
+                        // No task launch is left unanswered on the target: those are
+                        // answered when a session opens, and none runs across a switch.
+                        let head = log.head().cloned().expect("the head was just set");
+                        let branch = log.linearize(&head, ThreadFilter::MAIN);
+                        let main = AgentId::Main;
+                        aj_session::repair_interrupted_tool_uses(log, main, &branch)?;
+                        let head = log.head().cloned().expect("repair keeps a head");
+                        let branch = log.linearize(&head, ThreadFilter::MAIN);
+                        super::head::append_changes(log, &changes, &prepared, &env)?;
+                        Ok(((goal, branch), Vec::new()))
+                    })
+                })
+                .await;
+            match appended {
+                Ok((goal, branch)) => Ok((log, goal, branch, prepared, env)),
+                Err(error) => Err(error),
+            }
+        };
+        let (log, goal, branch, prepared, env) = match switched {
+            Ok(switched) => switched,
+            Err(error) => {
+                // The log guard is released, as the teardown needs.
+                let reason = format!(
+                    "Switching branches failed after the session had moved: {error}. AJ \
+                     stopped the session so that it is read again from what is stored. \
+                     Check which branch it is on, then switch again if needed."
+                );
+                self.stop_with(reason.clone()).await;
+                return Err(HostError::Internal(reason.into()));
+            }
+        };
+        {
+            self.goal = goal::GoalRun::new(goal);
             self.session
                 .core
                 .message_queues
                 .set_context(AgentId::Main, None);
-            for agent in self.session.core.message_queues.queued_agents() {
-                self.session.core.message_queues.clear(agent);
-                self.publish_queue(agent);
-            }
-            let head = log.head().cloned().expect("set_head installed one");
-            let conversation = log.linearize(&head, ThreadFilter::USER);
-            repair_interrupted_tool_uses(&mut log, &conversation).map_err(internal)?;
-            let head = log.head().cloned().expect("repair keeps a head");
-            let conversation = log.linearize(&head, ThreadFilter::USER);
-            super::head::append_changes(&mut log, &changes, &prepared, &env)?;
-            log.flush_pending().map_err(internal)?;
             *self
                 .session
                 .core
@@ -1405,34 +1665,37 @@ impl Driver {
             // Nothing is driven, so reseeding cannot race an inference request.
             {
                 let mut agent = self.session.core.agent.lock().await;
-                agent.reseed_transcript(conversation.agent_messages());
+                agent.reseed_transcript(branch.agent_messages());
                 agent.set_session_env(env);
                 agent.clear_todo_list();
-                agent
-                    .reset_code_mode(conversation.code_mode_store())
-                    .await
-                    .map_err(HostError::Internal)?;
+                agent.set_code_mode_store(branch.code_mode_store());
             }
-            // The epoch and the high-water mark move under the log lock, so
-            // an attach that snapshots the log cannot pair the new
-            // projection with the old epoch.
+            // The position of what the switch appended belongs to the row
+            // of the branch it landed on. Nothing else is on the stream:
+            // the session is quiesced and this task holds the log.
+            self.drain_events();
+            // The epoch moves under the log lock, so an attach that
+            // snapshots the log cannot pair the new projection with the old
+            // epoch.
             let mut status = self.session.status();
             status.goal = self.goal.current.clone();
             (status.settings, status.oracle_settings) = settings_of(&self.session.core.run_config);
             status.epoch = mint_epoch();
-            status.last_seq = log.last_seq();
+            // The turn state is the new branch's thread's.
+            status.turn_interrupted =
+                self.session.core.turn.get(AgentId::Main) == TurnState::Interrupted;
             status.note_activity();
-            // Every run the log names is finished: the refusal above
-            // established that nothing is live, and the runs of the
-            // abandoned branch are over by definition.
-            status.finished_subs = log.sub_agent_ids();
         }
+        drop(log);
 
         // The backfill boundaries live streams filter against are left
-        // alone. The log is append-only and `set_head` renumbers nothing,
-        // so every position the new epoch mints sits above every boundary
-        // handed out under the old one, and no frame of the new history can
-        // be mistaken for one the old backfill already covered.
+        // alone. The store is append-only and `set_head` renumbers nothing
+        // in it, so every position the new epoch publishes sits above
+        // every stored position an old boundary covers. A boundary handed
+        // out at a fork point also covers the positions of the branch's
+        // draft, which a switch away gives up and later records take. Its
+        // client attaches again on the `reset` below, and that backfill
+        // reads those records.
         self.shared.fanout.publish(Frame::Reset {
             session: self.session.id().to_string(),
         });
@@ -1464,7 +1727,7 @@ impl Driver {
     /// `SessionCore`, so it cannot carry state across a branch. A head
     /// switch keeps the core (its handles are held by an in-process client
     /// and by the log's open file), so what would otherwise leak is dropped
-    /// here. Only valid with nothing running, which the refusal in
+    /// here. Only valid on a quiesced session, which the refusal in
     /// [`Self::head_switch`] establishes.
     ///
     /// What deliberately survives: the agent's sub-agent counter, so ids
@@ -1472,117 +1735,96 @@ impl Driver {
     /// records tokens this process really spent.
     fn reset_branch_state(&self) {
         self.session.status().turn_outcome = None;
-        // The abandoned branch's sub-agents must stop being promptable: a
-        // prompt to one would grow that branch under the new epoch, and
-        // every attached client would fold it into the new branch's
-        // transcript.
+        // A sub-agent the new branch does not show must not be prompted:
+        // its run would grow under the new epoch, and every attached
+        // client would fold it into the new branch's transcript. Dropping
+        // every handle is enough, because a prompt builds the agent again
+        // from its stored run, which only a branch that shows the run
+        // allows (see `Self::pick_up`).
         self.session.core.registry.clear();
-        // Inert once the registry is cleared (an override is only read at
-        // its sub's turn start, and no such turn can start again), dropped
-        // so the map cannot outlive what it describes.
+        // A staged override is recorded on its sub-agent's thread,
+        // which is where an agent built again reads it from.
         self.session
             .core
             .sub_overrides
             .lock()
             .expect("sub overrides mutex poisoned")
             .clear();
-        // Terminal entries and undelivered notices of the branch being
-        // left. The re-attach's `caught_up` carries the table and would
-        // otherwise hand a client the other branch's tasks.
+        // The terminal entries of the branch being left. The re-attach's
+        // `caught_up` carries the table and would otherwise hand a client
+        // the other branch's tasks.
         self.session.core.task_registry.clear();
     }
 
     // -- teardown --------------------------------------------------------
 
-    /// End this materialization after its log fused: tell every attached
-    /// client once, detach them, and tear down the way a shutdown does.
+    /// Shut down the main agent's live Code Mode evaluator ahead of a head
+    /// switch. Nothing is driven, so the agent is free.
+    async fn shutdown_evaluator(&self) -> Result<(), HostError> {
+        let mut agent = self.session.core.agent.lock().await;
+        agent
+            .shutdown_code_mode()
+            .await
+            .map_err(HostError::Internal)
+    }
+
+    /// End this materialization after its log fused.
+    async fn stop_for_persistence(&mut self, failure: PersistenceFailure) {
+        self.stop_with(persistence_failure_message(&failure)).await;
+    }
+
+    /// End this materialization because its memory can no longer be
+    /// trusted to match the store: tell every attached client once with
+    /// `message`, detach them, and stop as a shutdown does. The driver loop
+    /// returns once the request in hand is answered.
     ///
     /// The error frame is what makes a client let go of this materialization
     /// and ask for the session again, and the ask rebuilds it from
     /// disk because the host treats a draining entry as absent. Detaching
-    /// after the frame keeps later teardown frames (a cancelled turn's notice,
-    /// the final state) off streams that have already been told the session is
-    /// gone, and lets the idle sweeper reap this entry.
-    async fn stop_for_persistence(&mut self, failure: PersistenceFailure) {
+    /// after the frame lets the idle sweeper reap this entry.
+    async fn stop_with(&mut self, message: String) {
         self.session.start_draining();
         self.shared.fanout.publish(Frame::Error {
             session: self.session.id().to_string(),
             code: PERSISTENCE_FAILED_CODE.to_string(),
-            message: persistence_failure_message(&failure),
+            message,
         });
         self.shared.fanout.detach_all(self.session.id());
         self.wind_down().await;
+        self.stopped = true;
     }
 
-    /// Cancel the session's turns and let them wind themselves down, then
-    /// quiesce background tasks and flush the log.
+    /// Stop the session as a host that died stops it. This is the one way
+    /// a host lets go: for a shutdown, a storage failure, a dropped
+    /// session, and an idle release, which finds nothing running.
     ///
-    /// The cancellation tokens rather than `JoinSet::shutdown`: an abort leaves
-    /// a transcript with an unfinished message and an unanswered tool call,
-    /// while a cancelled turn emits its synthetic aborted `MessageEnd`s. We keep
-    /// consuming the event stream while draining so those reach attached clients
-    /// before their streams close.
+    /// 1. The session is closed for writing. From here the store holds
+    ///    what the next open will find, and this returns no earlier than
+    ///    any write that was in progress.
+    /// 2. The turns are aborted where they stand. A turn that is cut
+    ///    short writes no aborted message and no cancelled tool result,
+    ///    which is what tells it from a turn the user cancelled. A
+    ///    foreground command ends with its tool call. The turns' tokens
+    ///    are fired first, for what runs outside a turn's task and only
+    ///    watches the token, a provider request for example.
+    /// 3. The task drivers are let go. A task record keeps running
+    ///    under its row. An agent run and a Code Mode cell end, and the
+    ///    loss each announced when it started stays stored.
     ///
-    /// The flush is what a release has already done (see
-    /// [`Self::row_for_release`]), so on that path this one finds nothing
-    /// pending. It still takes the log lock, which a long-running reader can
-    /// hold, and a release is waited on with the host's session map held.
+    /// Nothing is recorded about any of it: not that a turn ended, not a
+    /// sub-agent's end, not a goal's pause. The next open settles what is
+    /// left ([`crate::recovery::recover`]).
     async fn wind_down(&mut self) {
         self.session.start_draining();
-        self.goal.stop_pursuit();
+        self.session.core.journal.close();
         self.turns.cancel_all();
-        let grace = tokio::time::sleep(TURN_DRAIN_GRACE);
-        tokio::pin!(grace);
-        while !self.turns.is_empty() {
-            tokio::select! {
-                joined = self.turns.join_next() => self.on_join(joined),
-                Some(tagged) = self.events.recv() => self.on_event(tagged),
-                () = &mut grace => {
-                    tracing::warn!(
-                        session = self.session.id(),
-                        phase = "turn drain",
-                        "turns still running after the cancellation grace; aborting them"
-                    );
-                    self.turns.shutdown().await;
-                    break;
-                }
-            }
-        }
-        self.drain_events();
+        self.turns.shutdown().await;
         if !crate::shutdown_background_tasks_quietly(&self.session.core.task_registry).await {
             tracing::warn!(
                 session = self.session.id(),
                 phase = "background task quiesce",
                 "background tasks still running after the shutdown grace; forced abortable drivers while the session owner retains reap responsibility"
             );
-        }
-        // Detached task drivers emit their terminal events while quiescing.
-        // Publish those before the host closes the attachment streams.
-        self.drain_events();
-        match tokio::time::timeout(LOG_FLUSH_GRACE, self.checkpoint_goal_usage()).await {
-            Ok(Ok(())) => {}
-            outcome => tracing::warn!(?outcome, "could not checkpoint goal usage at teardown"),
-        }
-        // Buffered non-punctuation entries (the state records, spawn
-        // roots) are lost with the process otherwise: nothing else forces
-        // them out.
-        match tokio::time::timeout(LOG_FLUSH_GRACE, self.session.core.log.lock()).await {
-            Ok(mut log) => {
-                if let Err(err) = log.flush_pending() {
-                    tracing::warn!(
-                        session = self.session.id(),
-                        phase = "log flush",
-                        "failed to flush the conversation log at teardown: {err}"
-                    );
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    session = self.session.id(),
-                    phase = "log flush",
-                    "the conversation log remained locked through the flush grace; pending entries were not flushed"
-                );
-            }
         }
     }
 
@@ -1604,36 +1846,18 @@ impl Driver {
         // `try_lock`, because the host holds its session map while it waits for
         // this answer: the log can be held for the length of an export render,
         // and a release that queued behind one would stall every other
-        // session's materialization for as long. Declining costs one grace. The
-        // teardown flush can still meet a held log, which is the same wait one
-        // tick later.
-        let mut log = self.session.core.log.try_lock().ok()?;
-        // A log with no file yet is the one condition `releasable` cannot see.
+        // session's materialization for as long. Declining costs one grace.
+        let log = self.session.core.log.try_lock().ok()?;
+        // A session not stored yet is the one condition `releasable` cannot see.
         // Releasing such a session would not hand it back to the store, which
         // does not know its id, it would drop it.
         if !log.is_durable() {
             return None;
         }
-        // Flushed before anything is torn down, so a log that will not flush
-        // declines with the session still intact rather than going with a row
-        // nobody can trust.
-        if let Err(err) = log.flush_pending() {
-            tracing::warn!(
-                session = self.session.id(),
-                "not releasing a session whose log will not flush: {err}"
-            );
-            return None;
-        }
-        let file = std::fs::metadata(log.path()).ok()?;
-        let file = SessionMetadata::new(
-            self.session.id().to_string(),
-            file.modified().ok()?.into(),
-            file.len(),
-        );
-        // The stamp is what this driver saw, not what the file says. The flush
-        // above can land buffered entries a whole idle grace after the work
-        // that produced them, and a row stamped with its own teardown reads to
-        // a client as output it has not seen.
+        let file = log.storage_metadata().ok()??;
+        // The stamp is what this driver saw, not when the store was last
+        // written: a row stamped with its own teardown reads to a client as
+        // output it has not seen.
         //
         // The status lock nests under the log lock here. That is the order the
         // driver always takes them in, and nothing takes the log lock while
@@ -1676,6 +1900,20 @@ fn agent_label(agent: AgentId) -> String {
         AgentId::Main => "the main agent".to_string(),
         AgentId::Sub(n) => format!("sub-agent {n}"),
     }
+}
+
+/// A change the store refused, which therefore did not happen. A busy
+/// database is a state the user can wait out, so it is not an internal
+/// error.
+fn not_saved(what: &str, error: aj_session::SessionError) -> HostError {
+    if error.is_busy() {
+        return HostError::Conflict {
+            reason: format!(
+                "the session database is busy, so {what} was not saved. Try again in a moment"
+            ),
+        };
+    }
+    HostError::Internal(format!("{what} could not be saved: {error}").into())
 }
 
 fn internal(err: impl std::error::Error + Send + Sync + 'static) -> HostError {

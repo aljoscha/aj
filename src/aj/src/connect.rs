@@ -184,9 +184,11 @@ async fn resolve_session(
                 .filter(|summary| !summary.archived)
                 .max_by_key(|summary| (summary.last_activity, summary.id.clone()))
                 .map(|summary| summary.id.clone());
-            latest
-                .map(|session| (session, false))
-                .ok_or_else(|| anyhow!("no conversation sessions to resume; use `aj connect <url> --new` to start a new session"))
+            latest.map(|session| (session, false)).ok_or_else(|| {
+                anyhow!(
+                    "no sessions to resume; use `aj connect <url> --new` to start a new session"
+                )
+            })
         }
     }
 }
@@ -875,10 +877,7 @@ mod tests {
             log.entries_in_order()
                 .iter()
                 .filter(|entry| {
-                    matches!(
-                        entry.entry,
-                        aj_session::ConversationEntryKind::EnvChange { .. }
-                    )
+                    matches!(entry.entry, aj_session::LogEntryKind::EnvChange { .. })
                 })
                 .count(),
             1,
@@ -937,10 +936,7 @@ mod tests {
 
             let error = peer.try_dial(&[]).await.err().expect("nothing to resume");
             let message = format!("{error:#}");
-            assert!(
-                message.contains("no conversation sessions to resume"),
-                "{message}"
-            );
+            assert!(message.contains("no sessions to resume"), "{message}");
             assert!(message.contains("aj connect <url> --new"), "{message}");
             let after = peer.rows().await;
             assert_eq!(

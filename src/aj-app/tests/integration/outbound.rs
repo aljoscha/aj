@@ -103,6 +103,7 @@ fn durable(seq: u64) -> Frame {
 /// carries as the context window.
 fn state(revision: u64) -> Frame {
     Frame::State {
+        turn_interrupted: false,
         session: "left:s-1".into(),
         epoch: "epoch-1".into(),
         opens_block: false,
@@ -268,6 +269,7 @@ fn snapshots_drop_but_durable_reliable_and_unknown_frames_evict() {
             last_seq: 1,
             tasks: Default::default(),
             queues: Default::default(),
+            history_start: None,
         },
         Frame::Reset {
             session: "s".into(),

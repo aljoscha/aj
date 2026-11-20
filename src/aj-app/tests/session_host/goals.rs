@@ -9,9 +9,9 @@ use serde_json::json;
 #[path = "goals/wait.rs"]
 mod wait;
 
-struct Recorded {
+pub(super) struct Recorded {
     script: Arc<ScriptedProvider>,
-    contexts: StdMutex<Vec<Context>>,
+    pub(super) contexts: StdMutex<Vec<Context>>,
 }
 
 type HeldInference = (
@@ -112,7 +112,7 @@ impl Provider for Recorded {
     }
 }
 
-fn recorded(messages: Vec<AssistantMessage>) -> (Harness, Arc<Recorded>) {
+pub(super) fn recorded(messages: Vec<AssistantMessage>) -> (Harness, Arc<Recorded>) {
     let script = scripted(messages, 0, Duration::ZERO);
     let provider = Arc::new(Recorded {
         script: Arc::clone(&script),
@@ -368,7 +368,7 @@ async fn goal_model_stops_return_a_final_subtotal_before_reporting() {
         assert_eq!(reported["goal"]["tokens_used"], stopped.tokens_used);
         let handles = h.host.local_handles(&session).await.unwrap();
         let log = handles.log.lock().await;
-        assert_eq!(log.goal_at(log.head().unwrap()), Some(stopped));
+        assert_eq!(log.goal_at(log.head().unwrap()).unwrap(), Some(stopped));
         drop(log);
         h.host.shutdown().await;
     }
@@ -522,21 +522,13 @@ async fn goal_checkpoint_write_failure_uses_session_teardown_without_duplicate_e
             None
         };
         assert_eq!(provider.contexts.lock().unwrap().len(), 1);
-        let path = h
-            .persistence
-            .sessions_dir()
-            .join(format!("{session}.jsonl"));
-        let fault = AppendFaultFixture::new(AppendFault::ShortWrite(23));
         let baseline = {
             let handles = h.host.local_handles(&session).await.unwrap();
             let mut log = handles.log.lock().await;
             // With inference held (or idle) and prior writes flushed, the next
             // write is the goal checkpoint, not an assistant-message append.
-            log.flush_pending().unwrap();
-            let baseline = std::fs::read(&path).unwrap();
-            assert!(baseline.ends_with(b"\n"));
-            fault.install(&mut log).unwrap();
-            baseline
+            fail_sqlite_commits(&mut log);
+            h.stored(&session)
         };
         let command = if active {
             GoalAction::Edit {
@@ -583,68 +575,105 @@ async fn goal_checkpoint_write_failure_uses_session_teardown_without_duplicate_e
                 "session teardown must cancel active inference"
             );
         }
-        let torn = std::fs::read(&path).unwrap();
-        assert_eq!(torn.len(), baseline.len() + 23);
-        assert!(torn.starts_with(&baseline));
         assert_eq!(
-            fault.writes(),
-            2,
-            "no writes after the partial write and failed continuation"
+            h.stored(&session),
+            baseline,
+            "the failed commit stored nothing"
         );
         h.host.shutdown().await;
     }
 }
 
+/// A goal change is committed before it takes effect. One whose commit is
+/// refused, by a store that takes no write but is not broken, did not
+/// happen: the command is refused, which is how its user is told, and the
+/// goal in effect is the one before it. Nothing is patched up in memory,
+/// and the session goes on.
 #[tokio::test]
-async fn goal_checkpoint_rejection_without_a_write_fuse_stops_pursuit_and_reports_error() {
+async fn a_goal_change_whose_commit_is_refused_leaves_the_old_goal_in_effect() {
     let (h, provider) = recorded(Vec::new());
     let session = h.create().await;
     let mut client = Client::attach(&h.host, &session).await;
     let handles = h.host.local_handles(&session).await.unwrap();
-    let persistence = ConversationPersistence::new(h._dir.path().join("invalid-goal-parent"));
-    let mut replacement = ConversationLog::create(&persistence).unwrap();
-    replacement
-        .append(
-            None,
-            aj_session::ThreadKind::Meta,
-            None,
-            aj_session::ConversationEntryKind::ThinkingChange {
-                level: "off".into(),
-            },
-        )
-        .unwrap();
-    assert!(matches!(
-        replacement.append_goal_change(None),
-        Err(aj_session::ConversationError::InvalidAppend(_))
-    ));
-    assert!(replacement.write_failure().is_none());
-    // Retain the real log and its failure sender while the invalid-parent log
-    // exercises a checkpoint rejection that cannot signal the write fuse.
-    let original = std::mem::replace(&mut *handles.log.lock().await, replacement);
+    // A log that rejects a goal record without fusing, to stand in for a
+    // commit the store refuses.
+    let rejecting = || {
+        let persistence = ProjectSessions::new(h._dir.path().join("invalid-goal-parent"));
+        let mut replacement = SessionLog::create(&persistence).unwrap();
+        let level = "off".into();
+        let record = aj_session::LogEntryKind::ThinkingChange { level };
+        replacement
+            .append(None, aj_session::ThreadKind::Meta, None, record)
+            .unwrap();
+        assert!(matches!(
+            replacement.append_goal_change(None),
+            Err(aj_session::SessionError::InvalidAppend(_))
+        ));
+        assert!(replacement.write_failure().is_none());
+        replacement
+    };
+    let refused = |request: GoalAction| {
+        let (host, session) = (h.host.clone(), session.clone());
+        async move {
+            let outcome = host.command(&session, Command::Goal(request.into()));
+            let refused = bounded("the refused goal command", outcome).await;
+            refused.expect_err("the commit was refused").to_string()
+        }
+    };
+
+    // A goal that cannot be committed does not come into effect: no goal
+    // is shown, and nothing is started for it.
+    let original = std::mem::replace(&mut *handles.log.lock().await, rejecting());
+    let told = refused(create()).await;
+    assert!(!told.is_empty());
+    assert!(action(&h.host, &session, GoalAction::Get).await.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(provider.contexts.lock().unwrap().is_empty());
+    *handles.log.lock().await = original;
+
+    // A status change that cannot be committed leaves the status as it
+    // was, here an active goal whose first turn is waiting on its model.
+    let held = hold_first(&h, &session, Arc::clone(&provider)).await;
+    action(&h.host, &session, create()).await;
+    let (stream, _cancel) = bounded("the goal's first inference", held).await.unwrap();
+    let original = std::mem::replace(&mut *handles.log.lock().await, rejecting());
+    for change in [GoalAction::Pause, GoalAction::Block, GoalAction::Clear] {
+        refused(change).await;
+        let goal = goal(&h.host, &session).await;
+        assert_eq!(goal.status, GoalStatus::Active, "the old goal is in effect");
+    }
+    let frames = client.drain_into_fold();
+    let shown: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::State { goal, .. } => goal.as_ref().map(|goal| goal.status),
+            _ => None,
+        })
+        .collect();
     assert!(
-        bounded(
-            "rejected goal",
-            h.host.command(&session, Command::Goal(create().into()))
-        )
-        .await
-        .is_err()
+        shown.iter().all(|status| *status == GoalStatus::Active),
+        "no client was shown a state that was not committed: {shown:?}"
     );
-    let frames = frames_until(&mut client.stream, "goal error", |frame| {
-        matches!(frame, Frame::Event { event, .. } if matches!(event.known(), Some(AgentEvent::Error { .. })))
-    }).await;
-    assert_eq!(errors(&frames).len(), 1);
     assert!(
         !frames.iter().any(
             |frame| matches!(frame, Frame::Error { code, .. } if code == "persistence_failed")
-        )
+        ),
+        "a refused commit does not end the session"
     );
-    assert_eq!(goal(&h.host, &session).await.status, GoalStatus::Blocked);
-    assert!(provider.contexts.lock().unwrap().is_empty());
     {
         let mut log = handles.log.lock().await;
         assert!(log.write_failure().is_none());
         *log = original;
     }
+
+    // With the store back, the same change is committed and takes effect.
+    let paused = action(&h.host, &session, GoalAction::Pause).await.unwrap();
+    assert_eq!(paused.status, GoalStatus::Paused);
+    let stored = h.stored(&session).to_string();
+    assert!(stored.contains(r#""status":"paused""#), "{stored}");
+    release(stream, finalized_text_message("stopping here"));
+    client.pump_until_idle().await;
+    drop(handles);
     h.host.shutdown().await;
 }
 
@@ -1129,7 +1158,7 @@ async fn goal_tools_continue_across_turns_and_account_only_the_goal_work() {
     assert!(continuation.contains("Verify the entire requested change"));
     let handles = h.host.local_handles(&session).await.unwrap();
     let log = handles.log.lock().await;
-    assert_eq!(log.goal_at(log.head().unwrap()), Some(result));
+    assert_eq!(log.goal_at(log.head().unwrap()).unwrap(), Some(result));
     drop(log);
     h.host.shutdown().await;
 }
@@ -1185,9 +1214,7 @@ async fn goal_usage_is_recorded_at_turn_boundaries_and_published_between_them() 
         log.entries_in_order()
             .iter()
             .filter_map(|entry| match &entry.entry {
-                aj_session::ConversationEntryKind::GoalChange { goal: Some(goal) } => {
-                    Some(goal.tokens_used)
-                }
+                aj_session::LogEntryKind::GoalChange { goal: Some(goal) } => Some(goal.tokens_used),
                 _ => None,
             })
             .collect::<Vec<u64>>()
@@ -1407,7 +1434,7 @@ async fn goal_main_cancel_pauses_but_attaching_to_live_work_does_not() {
     })
     .await;
     action(&h.host, &session, create()).await;
-    frames_until(&mut stream, "goal inference", |frame| matches!(frame, Frame::Event { event, .. } if matches!(event.known(), Some(AgentEvent::TurnStart { .. })))).await;
+    frames_until(&mut stream, "goal inference", |frame| matches!(frame, Frame::Event { event, .. } if matches!(event.known(), Some(AgentEvent::RoundStart { .. })))).await;
     let mut second = h.host.attach(&[attach_request(&session)]).await.unwrap();
     let attached = frames_until(&mut second, "live reattach", |frame| {
         matches!(frame, Frame::CaughtUp { .. })
@@ -1443,8 +1470,10 @@ async fn goal_reopen_and_branch_selection_pause_without_implicitly_resuming_on_a
     let branch_point = {
         let mut log = handles.log.lock().await;
         let entry = log.append_goal_change(Some(seed.clone())).unwrap();
-        log.flush_pending().unwrap();
-        assert_eq!(log.goal_at(&entry.id).unwrap().status, GoalStatus::Active);
+        assert_eq!(
+            log.goal_at(&entry.id).unwrap().unwrap().status,
+            GoalStatus::Active
+        );
         entry.id
     };
     drop(handles);

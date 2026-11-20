@@ -49,7 +49,7 @@ fn compact_tool_result(result: &mut ToolResultMessage) {
 ///
 /// [`resolve_tool_details`] against the same content gives back what
 /// `details` held. Appending to a log does this already. This entry point is
-/// for rewriting records that were stored before a rule existed.
+/// for rewriting entries that were stored before a rule existed.
 pub fn compact_tool_details(details: &Value, content: &[UserContent]) -> Option<Value> {
     let object = details.as_object()?;
     let compacted = match object.get("kind").and_then(Value::as_str) {

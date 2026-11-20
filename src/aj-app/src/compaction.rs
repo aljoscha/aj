@@ -6,15 +6,12 @@
 //! summarizer inference on the agent, records a compaction entry, and
 //! reseeds the agent's transcript from the post-compaction projection.
 
-use std::sync::Arc;
-
 use aj_agent::events::{AgentEvent, AgentId, CompactionPhase, CompactionReason};
 use aj_agent::message::AgentMessage;
-use aj_agent::{Agent, TurnError, UsageAccounting};
+use aj_agent::{Agent, TurnError};
 use aj_models::types::{AssistantContent, AssistantMessage, Message, StopReason, Usage};
 use aj_session::compaction as planning;
-use aj_session::{AppendHandoff, ConversationLog, ThreadFilter};
-use tokio::sync::Mutex as TokioMutex;
+use aj_session::{Journal, TaggedEvent, ThreadFilter};
 use tokio_util::sync::CancellationToken;
 
 /// Upper bound on summary output tokens, clamped against the model's
@@ -65,7 +62,7 @@ pub enum CompactionOutcome {
     Failed(String),
 }
 
-/// A failed compaction is not a failed conversational inference. The turn
+/// A failed compaction is not a failed inference of a turn. The turn
 /// driver must not classify its retained assistant message for overflow retry.
 #[derive(Debug, thiserror::Error)]
 #[error("compaction failed: {0}")]
@@ -85,40 +82,44 @@ impl CompactionOutcome {
 
 /// Plan, summarize, persist, and reseed in one shot. The agent must be
 /// idle or paused in its before-continuation hook, with all foreground
-/// message events persisted. Locks `log` only around the pure planning and the
-/// final persist+reseed, never across the summarizer network call, so a
+/// message events persisted. Locks the log only around the pure planning and
+/// the final persist+reseed, never across the summarizer network call, so a
 /// long summary doesn't block log writers. Cancellation is honored by
 /// the `complete_oneshot` calls; an abort before the persist step leaves
 /// the log untouched. Failures append a display-only error, not a checkpoint.
 ///
-/// `handoff` carries the checkpoint's log identity to whoever tags the
-/// successful `CompactionEnd` this emits (see [`AppendHandoff`]). Failure
-/// events are persisted by the ordinary listener. Cancellation stays untagged.
+/// The checkpoint and the successful `CompactionEnd` that stands for it are
+/// one write to `journal`, the session's. The bus gets that event after the
+/// write. Failure events are recorded by the journal as the bus commits
+/// them. Cancellation records nothing.
 pub async fn run_compaction(
     agent: &mut Agent,
-    log: &Arc<TokioMutex<ConversationLog>>,
-    handoff: &AppendHandoff,
+    journal: &Journal,
     reason: CompactionReason,
     custom_instructions: Option<&str>,
     keep_recent_tokens: u64,
     cancel: CancellationToken,
 ) -> CompactionOutcome {
     // Plan under the log lock, then drop it before any network call. We
-    // plan before announcing the run so a no-op never shows the
+    // plan before announcing the compaction so a no-op never shows the
     // "Compacting…" spinner or disturbs the footer. A missing head and a
     // `None` plan both collapse to "nothing to do".
     let plan = {
-        let log_guard = log.lock().await;
+        let mut log_guard = journal.lock().await;
         match log_guard.head().cloned() {
-            Some(head) => {
-                let conversation = log_guard.linearize(&head, ThreadFilter::USER);
-                planning::prepare_compaction(&conversation, keep_recent_tokens)
-            }
-            None => None,
+            // The plan chooses the user messages to keep among all of the
+            // branch's, which a reopened log reads only now.
+            Some(head) => log_guard.log_mut().hold_user_messages().map(|()| {
+                let branch = log_guard.linearize(&head, ThreadFilter::MAIN);
+                planning::prepare_compaction(&branch, keep_recent_tokens)
+            }),
+            None => Ok(None),
         }
     };
-    let Some(plan) = plan else {
-        return finish_nothing(agent, reason, keep_recent_tokens).await;
+    let plan = match plan {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return finish_nothing(agent, reason, keep_recent_tokens).await,
+        Err(error) => return finish_failed(agent, reason, 0, error.to_string()).await,
     };
 
     match agent.admit_goal_inference(cancel.clone()).await {
@@ -127,7 +128,7 @@ pub async fn run_compaction(
         Err(err) => return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await,
     }
 
-    // Best-effort UI signal; a failed emit must not abort the run.
+    // Best-effort UI signal; a failed emit must not abort the compaction.
     if let Err(err) = agent
         .emit_event(AgentEvent::CompactionStart {
             agent_id: AgentId::Main,
@@ -143,12 +144,12 @@ pub async fn run_compaction(
     let model_max_tokens = agent.model_info().max_tokens;
     let summary_max_tokens = clamp_output_budget(SUMMARY_OUTPUT_CAP, model_max_tokens);
 
-    let conversation_text = planning::serialize_conversation(&plan.messages_to_summarize);
+    let messages_text = planning::serialize_messages(&plan.messages_to_summarize);
     let prompt = match plan.previous_summary.as_deref() {
         Some(previous) => {
-            planning::update_summary_prompt(&conversation_text, previous, custom_instructions)
+            planning::update_summary_prompt(&messages_text, previous, custom_instructions)
         }
-        None => planning::initial_summary_prompt(&conversation_text, custom_instructions),
+        None => planning::initial_summary_prompt(&messages_text, custom_instructions),
     };
 
     // The summarizer's spend is out-of-band: its exchange never becomes
@@ -183,7 +184,7 @@ pub async fn run_compaction(
     // A cut that split a turn leaves the retained suffix without its
     // turn setup; summarize the prefix separately and append it.
     if !plan.turn_prefix_messages.is_empty() {
-        let prefix_text = planning::serialize_conversation(&plan.turn_prefix_messages);
+        let prefix_text = planning::serialize_messages(&plan.turn_prefix_messages);
         let prefix_prompt = planning::turn_prefix_summary_prompt(&prefix_text);
         let prefix_max_tokens = clamp_output_budget(SUMMARY_OUTPUT_CAP / 2, model_max_tokens);
         emit_progress(agent, reason, CompactionPhase::SummarizingTurnPrefix).await;
@@ -221,83 +222,78 @@ pub async fn run_compaction(
     summary.push_str(&format_file_ops(&plan.file_ops));
 
     // Persist the checkpoint, reseed the live transcript from the
-    // post-compaction projection, and emit the `CompactionEnd` for the
-    // checkpoint, all under one log guard. `log` and `agent` are distinct
-    // locks, so holding the log guard while reseeding the agent is safe.
+    // post-compaction projection, and account the summarizer's spend, all in
+    // one write. The write also sends the `CompactionEnd` to the session's
+    // stream, so no later append can be published before the checkpoint.
     emit_progress(agent, reason, CompactionPhase::Saving).await;
-    let tokens_after = {
-        let mut log_guard = log.lock().await;
-        // Cancellation before the commit boundary leaves history untouched.
-        // Once appended, checkpoint publication and reseeding must finish together.
-        if cancel.is_cancelled() {
-            drop(log_guard);
-            return finish_canceled(agent, reason, plan.tokens_before).await;
-        }
-        let checkpoint = match log_guard.append_compaction(
-            ThreadFilter::USER,
-            summary.clone(),
-            plan.first_kept_entry_id.clone(),
-            plan.retained_user_entry_ids.clone(),
-            plan.tokens_before,
-            Some(plan.file_ops.clone()),
-            summarizer_usage.clone(),
-        ) {
-            Ok(entry) => entry,
-            Err(err) => {
-                drop(log_guard);
-                return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await;
+    let tokens_before = plan.tokens_before;
+    let committed = journal
+        .record(|log| {
+            // Cancellation before the commit boundary leaves history untouched.
+            // Once appended, the checkpoint is published and the agent reseeded
+            // in this same step.
+            if cancel.is_cancelled() {
+                return Ok((None, Vec::new()));
             }
-        };
-        let head = log_guard.head().cloned().expect("head exists after append");
-        let conversation = log_guard.linearize(&head, ThreadFilter::USER);
-        let mut messages = conversation.agent_messages();
-        // Drop a trailing failed-assistant message. The log records the
-        // failed turn (it was emitted to the bus), but the wire layer
-        // never shows Error/Aborted assistants to the model, and the
-        // reactive overflow path needs the reseeded transcript to end in
-        // a user/tool-result message so `continue_run` can re-drive
-        // inference against the reduced context.
-        trim_trailing_failed_assistant(&mut messages);
-        // The just-appended compaction sits at the head, so the
-        // retained tail's assistant `usage` is stale; the
-        // compaction-aware estimate uses the projection's heuristic
-        // size instead, which is what the next turn will actually send.
-        let after = planning::estimate_conversation_context(&conversation).tokens;
-        agent.reseed_transcript(messages);
-
-        let _handoff_guard = handoff.file(checkpoint);
-        // Keep publication under the log guard so a concurrent append cannot
-        // forward a higher sequence before this checkpoint. Listeners must not
-        // take the log lock for CompactionEnd.
-        if let Err(err) = agent
-            .account_usage(
-                &summarizer_usage,
-                UsageAccounting::CommittedCompaction {
-                    reason,
-                    tokens_before: plan.tokens_before,
-                    tokens_after: after,
-                    summary,
-                },
-            )
-            .await
-        {
-            tracing::warn!("failed to emit committed compaction: {err}");
-        }
-        after
+            let checkpoint = log.append_compaction(
+                ThreadFilter::MAIN,
+                summary.clone(),
+                plan.first_kept_entry_id.clone(),
+                plan.retained_user_entry_ids.clone(),
+                tokens_before,
+                Some(plan.file_ops.clone()),
+                summarizer_usage.clone(),
+            )?;
+            let head = log.head().cloned().expect("head exists after append");
+            let branch = log.linearize(&head, ThreadFilter::MAIN);
+            let mut messages = branch.agent_messages();
+            // Drop a trailing failed-assistant message. The log records the
+            // failed turn (it was emitted to the bus), but the wire layer
+            // never shows Error/Aborted assistants to the model, and the
+            // reactive overflow path needs the reseeded transcript to end in
+            // a user/tool-result message so `continue_turn` can re-drive
+            // inference against the reduced context.
+            trim_trailing_failed_assistant(&mut messages);
+            // The just-appended compaction sits at the head, so the
+            // retained tail's assistant `usage` is stale; the
+            // compaction-aware estimate uses the projection's heuristic
+            // size instead, which is what the next turn will actually send.
+            let after = planning::estimate_branch_context(&branch).tokens;
+            agent.reseed_transcript(messages);
+            let summary = summary.clone();
+            let end =
+                agent.account_compaction(&summarizer_usage, reason, tokens_before, after, summary);
+            let event = TaggedEvent {
+                entry: Some(checkpoint),
+                event: end.event().clone(),
+                branch_settings: None,
+            };
+            Ok((Some((after, end)), vec![event]))
+        })
+        .await;
+    let (tokens_after, end) = match committed {
+        Ok(Some(committed)) => committed,
+        Ok(None) => return finish_canceled(agent, reason, tokens_before).await,
+        Err(err) => return finish_failed(agent, reason, tokens_before, err.to_string()).await,
     };
+    // The event is committed and on the session's stream. This delivers it
+    // to the bus, outside the log lock.
+    if let Err(err) = agent.publish_compaction(end).await {
+        tracing::warn!("failed to emit committed compaction: {err}");
+    }
 
     CompactionOutcome::Compacted {
-        tokens_before: plan.tokens_before,
+        tokens_before,
         tokens_after,
     }
 }
 
-/// Drop trailing failed-assistant messages (an overflow's error turn
+/// Drop trailing failed-assistant messages (an overflow's error message
 /// or an aborted turn) so the reseeded transcript ends in a
-/// user/tool-result message — the precondition `continue_run` enforces
+/// user/tool-result message — the precondition `continue_turn` enforces
 /// for reactive recovery. We only trim a failed assistant that carries
 /// no tool calls, so we never orphan a tool result that references it;
-/// a partially-executed tool turn ends in its tool-result messages
+/// a partially-executed tool round ends in its tool-result messages
 /// rather than the assistant and so is left untouched.
 fn trim_trailing_failed_assistant(messages: &mut Vec<AgentMessage>) {
     while let Some(last) = messages.last() {
@@ -319,7 +315,7 @@ fn trim_trailing_failed_assistant(messages: &mut Vec<AgentMessage>) {
 }
 
 /// Emit a best-effort [`AgentEvent::CompactionProgress`]; a failed emit
-/// only loses a UI label, so it must not abort the run.
+/// only loses a UI label, so it must not abort the compaction.
 async fn emit_progress(agent: &Agent, reason: CompactionReason, phase: CompactionPhase) {
     if let Err(err) = agent
         .emit_event(AgentEvent::CompactionProgress {
@@ -376,7 +372,7 @@ async fn finish_nothing(
 ) -> CompactionOutcome {
     if matches!(reason, CompactionReason::Manual) {
         let text = format!(
-            "Nothing to compact: the conversation already fits within the \
+            "Nothing to compact: the branch already fits within the \
              recent-context budget (~{keep_recent_tokens} tokens)."
         );
         if let Err(err) = agent
@@ -417,7 +413,7 @@ async fn finish_failed(
     CompactionOutcome::Failed(error)
 }
 
-/// Emit a terminal `CompactionEnd` for a cancelled run. `summary` and
+/// Emit a terminal `CompactionEnd` for a cancelled compaction. `summary` and
 /// `error` are both `None` — the event's documented "ended without
 /// writing" shape — so a renderer stops the in-progress indicator and
 /// shows a neutral notice rather than reading it as success or failure.
@@ -445,6 +441,8 @@ async fn finish_canceled(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use aj_models::types::{AssistantMessage, ToolCall, UserMessage};
 
@@ -482,7 +480,7 @@ mod tests {
         use aj_agent::bus::listener_from_sync;
         use aj_agent::queue::MessageQueues;
         use aj_models::types::UserContent;
-        use aj_session::{ConversationEntryKind, ConversationPersistence};
+        use aj_session::{LogEntryKind, ProjectSessions};
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("evidence.txt");
@@ -516,8 +514,8 @@ mod tests {
                 requests: Arc::clone(&requests),
             });
         }
-        let store = ConversationPersistence::new(dir.path().join("sessions"));
-        let (mut agent, log, persistence) = build_test_agent(&store, &run_config);
+        let store = ProjectSessions::new(dir.path().join("sessions"));
+        let (mut agent, log, journal) = build_test_agent(&store, &run_config);
         let queues = MessageQueues::default();
         agent.set_message_queues(queues.clone());
         let _steering = agent.subscribe(listener_from_sync(move |event| {
@@ -558,8 +556,7 @@ mod tests {
             }
             let outcome = run_compaction(
                 &mut agent,
-                &log,
-                &AppendHandoff::default(),
+                &journal,
                 CompactionReason::Manual,
                 None,
                 4000,
@@ -571,12 +568,12 @@ mod tests {
                 "{outcome:?}"
             );
             let guard = log.lock().await;
-            let conversation = guard.linearize(guard.head().unwrap(), ThreadFilter::USER);
-            let ConversationEntryKind::Compaction {
+            let branch = guard.linearize(guard.head().unwrap(), ThreadFilter::MAIN);
+            let LogEntryKind::Compaction {
                 retained_user_entry_ids,
                 first_kept_entry_id,
                 ..
-            } = &conversation.entries().last().unwrap().entry
+            } = &branch.entries().last().unwrap().entry
             else {
                 panic!("checkpoint missing")
             };
@@ -591,16 +588,16 @@ mod tests {
                 );
             }
             prior_selected = retained_user_entry_ids.clone();
-            let cut = conversation
+            let cut = branch
                 .entries()
                 .iter()
                 .position(|entry| &entry.id == first_kept_entry_id)
                 .unwrap();
             assert!(
-                conversation.entries()[cut..]
+                branch.entries()[cut..]
                     .iter()
                     .filter_map(|entry| match &entry.entry {
-                        ConversationEntryKind::Message { message } =>
+                        LogEntryKind::Message { message } =>
                             Some(serde_json::to_string(message).unwrap()),
                         _ => None,
                     })
@@ -610,7 +607,7 @@ mod tests {
         }
         let live = serde_json::to_value(agent.messages()).unwrap();
         let session_id = log.lock().await.session_id().to_string();
-        drop(persistence);
+        drop(journal);
         drop(agent);
         drop(log);
 
@@ -695,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_of_a_long_first_turn_preserves_the_tail_on_resume_and_continuation() {
         use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
-        use aj_session::ConversationPersistence;
+        use aj_session::ProjectSessions;
 
         let dir = tempfile::TempDir::new().unwrap();
         let old_path = dir.path().join("old.txt");
@@ -728,8 +725,8 @@ mod tests {
                 requests: Arc::clone(&requests),
             });
         }
-        let store = ConversationPersistence::new(dir.path().join("sessions"));
-        let (mut agent, log, _persistence) = build_test_agent(&store, &run_config);
+        let store = ProjectSessions::new(dir.path().join("sessions"));
+        let (mut agent, log, journal) = build_test_agent(&store, &run_config);
         agent
             .prompt("inspect both files".into(), CancellationToken::new())
             .await
@@ -739,8 +736,7 @@ mod tests {
 
         let outcome = run_compaction(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             CompactionReason::Manual,
             Some("focus on the evidence"),
             100,
@@ -759,10 +755,15 @@ mod tests {
         assert!(reduced.len() < before.len());
 
         let session_id = log.lock().await.session_id().to_string();
-        let resumed = ConversationLog::resume(&store, &session_id).unwrap();
-        let conversation = resumed.linearize(resumed.head().unwrap(), ThreadFilter::USER);
+        // Whoever drives a turn stores its end. A second log would
+        // otherwise store it, and fence this one out.
+        let turn = log.lock().await.turn_state();
+        turn.set(AgentId::Main, aj_session::TurnState::Idle)
+            .unwrap();
+        let resumed = aj_session::SessionLog::resume(&store, &session_id).unwrap();
+        let branch = resumed.linearize(resumed.head().unwrap(), ThreadFilter::MAIN);
         assert_eq!(
-            serde_json::to_value(conversation.agent_messages()).unwrap(),
+            serde_json::to_value(branch.agent_messages()).unwrap(),
             compacted
         );
 
@@ -804,7 +805,7 @@ mod tests {
     async fn invalid_compaction_summaries_leave_live_and_durable_history_unchanged() {
         use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
         use aj_agent::bus::listener_from_sync;
-        use aj_session::ConversationPersistence;
+        use aj_session::ProjectSessions;
 
         let mut length_limited = finalized_text_message("incomplete checkpoint");
         length_limited.stop_reason = StopReason::Length;
@@ -831,7 +832,7 @@ mod tests {
         ] {
             for fail_prefix in [false, true] {
                 let dir = tempfile::TempDir::new().unwrap();
-                let store = ConversationPersistence::new(dir.path().to_path_buf());
+                let store = ProjectSessions::new(dir.path().to_path_buf());
                 let mut script = vec![
                     finalized_text_message("first answer"),
                     finalized_text_message(&"recent work ".repeat(400)),
@@ -844,7 +845,7 @@ mod tests {
                     script.push(finalized_text_message("valid prefix summary"));
                 }
                 let run_config = scripted_run_config(script);
-                let (mut agent, log, _persistence) = build_test_agent(&store, &run_config);
+                let (mut agent, log, journal) = build_test_agent(&store, &run_config);
                 agent
                     .prompt("first question".into(), CancellationToken::new())
                     .await
@@ -869,8 +870,7 @@ mod tests {
 
                 let outcome = run_compaction(
                     &mut agent,
-                    &log,
-                    &AppendHandoff::default(),
+                    &journal,
                     CompactionReason::Manual,
                     None,
                     100,
@@ -883,9 +883,9 @@ mod tests {
                 );
                 assert_eq!(serde_json::to_value(agent.messages()).unwrap(), live_before);
                 let guard = log.lock().await;
-                let conversation = guard.linearize(guard.head().unwrap(), ThreadFilter::USER);
+                let branch = guard.linearize(guard.head().unwrap(), ThreadFilter::MAIN);
                 assert_eq!(
-                    serde_json::to_value(conversation.agent_messages()).unwrap(),
+                    serde_json::to_value(branch.agent_messages()).unwrap(),
                     live_before
                 );
                 assert!(std::fs::read(&path).unwrap().starts_with(&durable_before));
@@ -960,105 +960,76 @@ mod tests {
         assert_eq!(msgs.len(), 2);
     }
 
-    /// What the sink observed across one compaction, plus whether a
-    /// concurrent durable append managed to land inside the checkpoint's
-    /// window.
-    struct RaceOutcome {
-        /// Whether the racing append found the log lock free while
-        /// `CompactionEnd` was being delivered.
-        interleaved: bool,
-        /// The durable positions the sink saw, in delivery order.
-        durable: Vec<u64>,
-        /// The position `CompactionEnd` was tagged with.
-        compaction_end: Option<u64>,
-    }
-
-    /// Drive two turns and then a compaction, with the tagging forwarder
-    /// installed and a listener that models a concurrent durable append
-    /// landing while `CompactionEnd` is delivered.
+    /// The checkpoint's append and the `CompactionEnd` that stands for it
+    /// are one step under the log lock. A racing append that queues for the
+    /// lock right behind the checkpoint takes the next position, and must
+    /// reach the stream after the checkpoint's event.
     ///
-    /// The racer uses `try_lock` deliberately: a real concurrent appender
-    /// (a background sub-agent's `MessageEnd` through the same forwarder)
-    /// gets its append in exactly when the log lock is free at that
-    /// moment, and blocks until after the event otherwise.
-    async fn compaction_with_a_racing_append() -> RaceOutcome {
-        use std::sync::Mutex as StdMutex;
-
+    /// The racer models a background sub-agent's commit. It is queued while
+    /// the lock is held elsewhere, so it gets the lock the moment the
+    /// compaction's write lets go of it.
+    #[tokio::test]
+    async fn a_racing_append_is_published_after_the_checkpoint_it_follows() {
         use aj_agent::events::AgentEvent;
-        use aj_session::{
-            AppendHandoff, ConversationEntryKind, ConversationPersistence, TaggedEvent, ThreadKind,
-            persisting_forwarder,
-        };
+        use aj_session::{Committed, LogEntryKind, ProjectSessions, ThreadFilter};
         use tempfile::TempDir;
         use tokio_util::sync::CancellationToken;
 
         use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
 
         let dir = TempDir::new().expect("tempdir");
-        let store = ConversationPersistence::new(dir.path().to_path_buf());
+        let store = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![
             finalized_text_message(&"first answer ".repeat(400)),
             finalized_text_message("second answer"),
             finalized_text_message("SUMMARY"),
         ]);
-        let (mut agent, log, persistence) = build_test_agent(&store, &run_config);
-        // The forwarder replaces the plain persistence listener: it is the
-        // one that tags, and two persisting listeners would append every
-        // message twice.
-        drop(persistence);
+        let (mut agent, log, journal) = build_test_agent(&store, &run_config);
+        let mut rx = journal.stream();
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interleaved = Arc::new(StdMutex::new(false));
-
-        // Subscribed before the forwarder, so a durable append it manages
-        // to make reaches the sink before `CompactionEnd` does.
+        // When the compaction is about to save, hold the log for a few polls and
+        // queue the racer. The compaction's write queues first.
         let racer_log = Arc::clone(&log);
-        let racer_sink = tx.clone();
-        let racer_flag = Arc::clone(&interleaved);
+        let racer_journal = journal.clone();
+        let racer = Arc::new(std::sync::Mutex::new(None));
+        let racer_slot = Arc::clone(&racer);
         let _racer = agent.subscribe(Arc::new(move |event: &AgentEvent| {
+            let saving = matches!(
+                event,
+                AgentEvent::CompactionProgress {
+                    phase: CompactionPhase::Saving,
+                    ..
+                }
+            );
             let log = Arc::clone(&racer_log);
-            let sink = racer_sink.clone();
-            let flag = Arc::clone(&racer_flag);
-            let is_compaction_end = matches!(event, AgentEvent::CompactionEnd { .. });
+            let journal = racer_journal.clone();
+            let slot = Arc::clone(&racer_slot);
             Box::pin(async move {
-                if !is_compaction_end {
+                if !saving {
                     return Ok(());
                 }
-                let Ok(mut guard) = log.try_lock() else {
-                    return Ok(());
-                };
-                *flag.lock().expect("flag mutex poisoned") = true;
-                let message = user("interleaved");
-                let parent = guard.head().cloned().expect("the log has a head");
-                let entry = guard
-                    .append(
-                        Some(parent),
-                        ThreadKind::User,
-                        None,
-                        ConversationEntryKind::Message {
-                            message: message.clone(),
-                        },
-                    )
-                    .expect("append the interleaved message");
-                let _ = sink.send(TaggedEvent {
-                    entry: Some(entry),
-                    branch_settings: None,
-                    event: AgentEvent::MessageEnd {
-                        agent_id: AgentId::Main,
-                        message,
-                    },
+                let held = log.lock_owned().await;
+                tokio::spawn(async move {
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
+                    drop(held);
                 });
+                let racing = tokio::spawn(async move {
+                    journal
+                        .lock()
+                        .await
+                        .record(|log| {
+                            let entry = log.append_thinking_change(ThreadFilter::MAIN, "high")?;
+                            Ok((entry.seq, Vec::new()))
+                        })
+                        .await
+                        .expect("the racing append")
+                });
+                *slot.lock().expect("racer slot poisoned") = Some(racing);
                 Ok(())
             })
         }));
-
-        let handoff = AppendHandoff::default();
-        let _forwarder = agent.subscribe(persisting_forwarder(
-            Arc::clone(&log),
-            handoff.clone(),
-            tx,
-            aj_session::PersistenceFence::default(),
-        ));
 
         agent
             .prompt("first question".to_string(), CancellationToken::new())
@@ -1072,8 +1043,7 @@ mod tests {
 
         let outcome = run_compaction(
             &mut agent,
-            &log,
-            &handoff,
+            &journal,
             CompactionReason::Manual,
             None,
             100,
@@ -1084,21 +1054,48 @@ mod tests {
             matches!(outcome, CompactionOutcome::Compacted { .. }),
             "expected a compaction, got {outcome:?}"
         );
+        let racing = racer
+            .lock()
+            .expect("racer slot poisoned")
+            .take()
+            .expect("the compaction announced its save");
+        let raced = racing.await.expect("racer task");
 
-        let mut durable = Vec::new();
+        let mut positions = Vec::new();
         let mut compaction_end = None;
-        while let Ok(tagged) = rx.try_recv() {
-            let Some(entry) = tagged.entry else { continue };
-            if matches!(tagged.event, AgentEvent::CompactionEnd { .. }) {
-                compaction_end = Some(entry.seq);
+        while let Ok(item) = rx.try_recv() {
+            match item {
+                Committed::Event(tagged) => {
+                    let Some(entry) = tagged.entry else { continue };
+                    if matches!(tagged.event, AgentEvent::CompactionEnd { .. }) {
+                        compaction_end = Some(entry.clone());
+                    }
+                    positions.push(entry.seq);
+                }
+                Committed::Position(seq) => positions.push(seq),
             }
-            durable.push(entry.seq);
         }
-        RaceOutcome {
-            interleaved: *interleaved.lock().expect("flag mutex poisoned"),
-            durable,
-            compaction_end,
-        }
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "positions must reach the stream in increasing order, got {positions:?}"
+        );
+        let compaction_end = compaction_end.expect("the compaction end is tagged");
+        assert_eq!(
+            raced,
+            compaction_end.seq + 1,
+            "the racer must have queued right behind the checkpoint"
+        );
+        assert_eq!(positions.last().copied(), Some(raced));
+        let guard = log.lock().await;
+        let checkpoint = guard
+            .entries_in_order()
+            .into_iter()
+            .find(|entry| entry.id == compaction_end.id)
+            .expect("the tagged entry is in the log");
+        assert!(
+            matches!(checkpoint.entry, LogEntryKind::Compaction { .. }),
+            "the compaction end is tagged with its checkpoint"
+        );
     }
 
     /// A compaction's checkpoint carries what the summarizer spent,
@@ -1110,7 +1107,7 @@ mod tests {
     /// zeros, against which a dropped dollar figure reads as correct.
     #[tokio::test]
     async fn the_checkpoint_records_what_every_summarizer_call_spent() {
-        use aj_session::{ConversationEntryKind, ConversationPersistence};
+        use aj_session::{LogEntryKind, ProjectSessions};
         use tempfile::TempDir;
         use tokio_util::sync::CancellationToken;
 
@@ -1124,7 +1121,7 @@ mod tests {
         }
 
         let dir = TempDir::new().expect("tempdir");
-        let store = ConversationPersistence::new(dir.path().to_path_buf());
+        let store = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![
             finalized_text_message("first answer"),
             // Long enough to blow the keep-recent budget on its own, so
@@ -1147,7 +1144,7 @@ mod tests {
                 ..crate::test_support::scripted_model_info()
             });
         }
-        let (mut agent, log, _persistence) = build_test_agent(&store, &run_config);
+        let (mut agent, log, journal) = build_test_agent(&store, &run_config);
 
         agent
             .prompt("first question".to_string(), CancellationToken::new())
@@ -1158,11 +1155,9 @@ mod tests {
             .await
             .expect("second turn");
 
-        let handoff = AppendHandoff::default();
         let outcome = run_compaction(
             &mut agent,
-            &log,
-            &handoff,
+            &journal,
             CompactionReason::Manual,
             None,
             100,
@@ -1179,7 +1174,7 @@ mod tests {
             .entries_in_order()
             .into_iter()
             .find_map(|e| match &e.entry {
-                ConversationEntryKind::Compaction { usage, summary, .. } => {
+                LogEntryKind::Compaction { usage, summary, .. } => {
                     Some((usage.clone(), summary.clone()))
                 }
                 _ => None,
@@ -1206,22 +1201,19 @@ mod tests {
     }
 
     /// Cancellation after the checkpoint commit cannot erase its spend or
-    /// leave its append identity for a later terminal event.
+    /// take back its event, which the stream got with the commit.
     #[tokio::test]
-    async fn committed_accounting_and_handoff_survive_listener_cancellation() {
+    async fn committed_accounting_and_publication_survive_listener_cancellation() {
         use aj_agent::events::AgentEvent;
         use aj_models::types::Usage;
-        use aj_session::{
-            AppendHandoff, ConversationEntryKind, ConversationPersistence, TaggedEvent,
-            persisting_forwarder,
-        };
+        use aj_session::{Committed, LogEntryKind, ProjectSessions};
         use tempfile::TempDir;
         use tokio_util::sync::CancellationToken;
 
         use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
 
         let dir = TempDir::new().expect("tempdir");
-        let store = ConversationPersistence::new(dir.path().to_path_buf());
+        let store = ProjectSessions::new(dir.path().to_path_buf());
         let mut summary = finalized_text_message("SUMMARY");
         summary.usage = Usage {
             input: 7,
@@ -1236,8 +1228,7 @@ mod tests {
             finalized_text_message("second answer"),
             summary,
         ]);
-        let (mut agent, log, persistence) = build_test_agent(&store, &run_config);
-        drop(persistence);
+        let (mut agent, log, journal) = build_test_agent(&store, &run_config);
 
         let listener_entered = Arc::new(tokio::sync::Notify::new());
         let entered = Arc::clone(&listener_entered);
@@ -1260,14 +1251,7 @@ mod tests {
                 }
             })
         }));
-        let handoff = AppendHandoff::default();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
-        let _forwarder = agent.subscribe(persisting_forwarder(
-            Arc::clone(&log),
-            handoff.clone(),
-            tx,
-            aj_session::PersistenceFence::default(),
-        ));
+        let mut rx = journal.stream();
 
         agent
             .prompt("first question".to_string(), CancellationToken::new())
@@ -1281,8 +1265,7 @@ mod tests {
 
         let mut compaction = Box::pin(run_compaction(
             &mut agent,
-            &log,
-            &handoff,
+            &journal,
             CompactionReason::Manual,
             None,
             100,
@@ -1304,7 +1287,7 @@ mod tests {
             .entries_in_order()
             .into_iter()
             .find_map(|entry| match &entry.entry {
-                ConversationEntryKind::Compaction { usage, .. } => Some(usage.clone()),
+                LogEntryKind::Compaction { usage, .. } => Some(usage.clone()),
                 _ => None,
             })
             .expect("committed checkpoint usage");
@@ -1313,41 +1296,19 @@ mod tests {
         assert_eq!(checkpoint_usage.cache_write, 13);
         assert_eq!(checkpoint_usage.cache_read, 17);
         drop(log_guard);
-        while rx.try_recv().is_ok() {}
 
+        let mut published = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            if let Committed::Event(tagged) = item
+                && matches!(tagged.event, AgentEvent::CompactionEnd { .. })
+            {
+                published.push(tagged.entry.is_some());
+            }
+        }
         assert_eq!(
-            handoff.take(),
-            None,
-            "canceled delivery left a stale checkpoint handoff"
-        );
-    }
-
-    /// The checkpoint's append and the `CompactionEnd` that stands for it
-    /// have to be one atomic step. Emitting after dropping the log guard
-    /// lets another durable append take a higher position and reach the
-    /// sink first.
-    #[tokio::test]
-    async fn compaction_end_is_emitted_under_the_log_guard() {
-        let outcome = compaction_with_a_racing_append().await;
-        assert!(
-            !outcome.interleaved,
-            "no durable append may land between the checkpoint and its event"
-        );
-    }
-
-    /// Live durable frames reach a stream in strictly increasing seq order.
-    #[tokio::test]
-    async fn durable_seqs_reach_the_sink_in_increasing_order() {
-        let outcome = compaction_with_a_racing_append().await;
-        assert!(
-            outcome.durable.windows(2).all(|pair| pair[0] < pair[1]),
-            "durable seqs must strictly increase, got {:?}",
-            outcome.durable
-        );
-        assert_eq!(
-            outcome.compaction_end,
-            outcome.durable.last().copied(),
-            "the checkpoint is the log's newest entry when its event is sent"
+            published,
+            vec![true],
+            "the checkpoint's event is published once, tagged, with the commit"
         );
     }
 }

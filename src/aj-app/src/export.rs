@@ -1,4 +1,4 @@
-//! Self-contained HTML export of a conversation session.
+//! Self-contained HTML export of a session.
 //!
 //! [`render_session_html`] assembles a single static HTML document that
 //! renders the session entirely client-side. The exporter ships the
@@ -9,7 +9,7 @@
 //! transcript and the source data used by the page.
 //!
 //! What gets embedded:
-//! - the on-disk entries (`ConversationEntry`), with session environment
+//! - the on-disk entries (`LogEntry`), with session environment
 //!   values redacted, valid diff details normalized, and valid text body
 //!   references expanded one entry at a time,
 //! - the page renderer (`template.js`),
@@ -30,10 +30,7 @@ use aj_agent::events::AgentEvent;
 use aj_agent::message::AgentMessageKind;
 use aj_agent::tool::ToolDetails;
 use aj_models::types::{Message, ToolResultMessage, UserContent};
-use aj_session::{
-    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, replay,
-    resolve_tool_details,
-};
+use aj_session::{EntryId, LogEntry, LogEntryKind, SessionLog, replay, resolve_tool_details};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::Compression;
@@ -60,14 +57,14 @@ const MARKED_LICENSE: &str = include_str!("../assets/export/vendor/marked.LICENS
 #[derive(Serialize)]
 struct ExportData<'a> {
     session_id: &'a str,
-    /// The active user-thread tip, so the page opens on the same branch
+    /// The active main-thread tip, so the page opens on the same branch
     /// a resumed session would. `None` for a session with no user
     /// messages yet.
     leaf_id: Option<EntryId>,
     entries: Vec<ExportEntry<'a>>,
 }
 
-struct ExportEntry<'a>(&'a ConversationEntry);
+struct ExportEntry<'a>(&'a LogEntry);
 
 #[derive(Serialize)]
 struct ExportToolResultMessage<'a> {
@@ -86,9 +83,9 @@ impl Serialize for ExportEntry<'_> {
         S: Serializer,
     {
         let entry = self.0;
-        if matches!(entry.entry, ConversationEntryKind::EnvChange { .. }) {
+        if matches!(entry.entry, LogEntryKind::EnvChange { .. }) {
             let mut redacted = entry.clone();
-            let ConversationEntryKind::EnvChange { env } = &mut redacted.entry else {
+            let LogEntryKind::EnvChange { env } = &mut redacted.entry else {
                 unreachable!("entry kind was checked above");
             };
             for value in env.values_mut() {
@@ -96,7 +93,7 @@ impl Serialize for ExportEntry<'_> {
             }
             return redacted.serialize(serializer);
         }
-        let ConversationEntryKind::Message { message } = &entry.entry else {
+        let LogEntryKind::Message { message } = &entry.entry else {
             return entry.serialize(serializer);
         };
         if let AgentMessageKind::ToolActivity(activity) = &message.kind {
@@ -107,7 +104,7 @@ impl Serialize for ExportEntry<'_> {
                 return entry.serialize(serializer);
             };
             let mut normalized = entry.clone();
-            if let ConversationEntryKind::Message { message } = &mut normalized.entry
+            if let LogEntryKind::Message { message } = &mut normalized.entry
                 && let AgentMessageKind::ToolActivity(activity) = &mut message.kind
                 && let Message::ToolResult(result) = &mut activity.message
             {
@@ -138,7 +135,7 @@ fn normalized_details(result: &ToolResultMessage) -> Option<ToolDetails> {
 }
 
 fn serialize_normalized_tool_result<S>(
-    entry: &ConversationEntry,
+    entry: &LogEntry,
     result: &ToolResultMessage,
     details: &ToolDetails,
     serializer: S,
@@ -148,7 +145,7 @@ where
 {
     // Keep these patterns exhaustive so new persisted fields cannot disappear
     // from normalized exports without a compile error.
-    let ConversationEntry {
+    let LogEntry {
         id,
         parent_id,
         timestamp,
@@ -191,7 +188,7 @@ where
     map.end()
 }
 
-fn export_data(log: &ConversationLog) -> ExportData<'_> {
+fn export_data(log: &SessionLog) -> ExportData<'_> {
     ExportData {
         session_id: log.session_id(),
         leaf_id: log.head().cloned(),
@@ -207,7 +204,7 @@ fn export_data(log: &ConversationLog) -> ExportData<'_> {
 ///
 /// Pure over the log: it reads but never mutates, so it is safe to call
 /// while a turn is in flight.
-pub fn render_session_html(log: &ConversationLog) -> String {
+pub fn render_session_html(log: &SessionLog) -> String {
     let title = derive_title(log)
         .map(|t| truncate_title(&t))
         .unwrap_or_else(|| "aj session".to_string());
@@ -291,7 +288,7 @@ fn embed_session(data: &ExportData) -> String {
 /// The first user prompt's text, used for the page `<title>`. Derived
 /// from the replay stream so it tracks whatever the live view would show
 /// as the opening message.
-fn derive_title(log: &ConversationLog) -> Option<String> {
+fn derive_title(log: &SessionLog) -> Option<String> {
     for event in replay(log) {
         if let AgentEvent::MessageEnd { message, .. } = event
             && let Some(Message::User(u)) = message.as_stored_wire()
@@ -344,7 +341,7 @@ mod tests {
     use std::fs;
     use std::io::Read;
 
-    use aj_session::{ConversationLog, ConversationPersistence};
+    use aj_session::{ProjectSessions, SessionLog};
     use flate2::read::GzDecoder;
     use tempfile::tempdir;
 
@@ -352,12 +349,12 @@ mod tests {
 
     /// Open a log from a JSONL fixture written into a temp sessions
     /// directory, exercising the same `resume` path the binary uses.
-    fn log_from_jsonl(lines: &[&str]) -> (tempfile::TempDir, ConversationLog) {
+    fn log_from_jsonl(lines: &[&str]) -> (tempfile::TempDir, SessionLog) {
         let dir = tempdir().expect("tempdir");
         let id = "test-session";
         fs::write(dir.path().join(format!("{id}.jsonl")), lines.join("\n")).expect("write fixture");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let log = ConversationLog::resume(&persistence, id).expect("resume fixture");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let log = SessionLog::resume(&persistence, id).expect("resume fixture");
         (dir, log)
     }
 
@@ -385,7 +382,7 @@ mod tests {
     const USER: &str = r#"{"id":"u0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"Hello **world**"}],"timestamp":1704067201000}}"#;
     const ASSISTANT: &str = r#"{"id":"a0000001","parent_id":"u0000001","timestamp":"2024-01-01T00:00:02Z","thread":"user","type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Reading the file."},{"type":"tool_call","id":"call-1","name":"read_file","arguments":{"path":"/tmp/x"}}],"api":"anthropic-messages","provider":"anthropic","model":"claude-test","usage":{"input":10,"output":5,"cache_read":0,"cache_write":0,"total_tokens":15,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"ToolUse","timestamp":1704067202000}}"#;
     const TOOL_RESULT: &str = r#"{"id":"t0000001","parent_id":"a0000001","timestamp":"2024-01-01T00:00:03Z","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"read_file","content":[{"type":"text","text":"the file body"}],"details":{"kind":"text","summary":"read_file /tmp/x","body":"the file body"},"is_error":false,"timestamp":1704067203000}}"#;
-    // A task-completion notice on the user thread, in the new on-disk
+    // A task-task notification on the main thread, in the new on-disk
     // shape (`role:"task_notification"` with structured fields).
     const NOTIFICATION_ROOT: &str = r#"{"id":"n0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"task_notification","label":"cargo build","kind":"bash","outcome":{"status":"succeeded"},"body":"exit code 0"}}"#;
     const USER_AFTER_NOTICE: &str = r#"{"id":"u0000009","parent_id":"n0000001","timestamp":"2024-01-01T00:00:02Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"typed after notice"}],"timestamp":1704067202000}}"#;
@@ -591,10 +588,10 @@ mod tests {
         );
 
         drop(log);
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let reread = ConversationLog::resume(&persistence, "test-session")
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let reread = SessionLog::resume(&persistence, "test-session")
             .expect("re-read source log after export");
-        let ConversationEntryKind::EnvChange { env } = &reread.entries_in_order()[1].entry else {
+        let LogEntryKind::EnvChange { env } = &reread.entries_in_order()[1].entry else {
             panic!("source log lost its env entry");
         };
         assert_eq!(
@@ -636,7 +633,7 @@ mod tests {
         );
 
         let entries = log.entries_in_order();
-        let ConversationEntryKind::Message { message } = &entries[3].entry else {
+        let LogEntryKind::Message { message } = &entries[3].entry else {
             panic!("expected message entry");
         };
         let Some(Message::ToolResult(result)) = message.as_stored_wire() else {
@@ -665,7 +662,7 @@ mod tests {
         );
 
         let entries = log.entries_in_order();
-        let ConversationEntryKind::Message { message } = &entries[3].entry else {
+        let LogEntryKind::Message { message } = &entries[3].entry else {
             panic!("expected message entry");
         };
         let Some(Message::ToolResult(result)) = message.as_stored_wire() else {

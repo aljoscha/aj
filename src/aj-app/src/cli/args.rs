@@ -185,7 +185,7 @@ pub struct Args {
     #[arg(long, env = "AJ_NAME")]
     pub name: Option<String>,
 
-    /// Subcommand selector for the non-conversational utilities
+    /// Subcommand selector for the utilities
     /// (`list-sessions`, `version`, `continue`, `update-models`) and the
     /// remote-control modes (`serve`, `connect`).
     #[command(subcommand)]
@@ -647,15 +647,17 @@ pub enum PrintFormat {
     Json,
 }
 
-/// Non-conversational subcommands.
+/// Subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// List existing conversation sessions for this project.
+    /// List existing sessions for this project.
     ListSessions,
     /// Rewrite stored JSONL sessions into the smaller form this build
     /// writes: tool output stored once, edits as diffs, and one goal record
     /// where a goal's usage was recorded every second. Reports what it would
     /// save unless `--write` is given. A session that is open is skipped.
+    /// Sessions already imported into SQLite are not touched, so run this
+    /// before `migrate-session`.
     CompactSessions {
         /// Rewrite the sessions instead of only reporting.
         #[arg(long)]
@@ -667,7 +669,40 @@ pub enum Command {
     /// Print the version: the cargo version and the git revision this
     /// binary was built from. Same output as `--version`.
     Version,
-    /// Continue a conversation session (latest unarchived one if no id
+    /// Import JSONL sessions into the global SQLite store. The original
+    /// file is retained, and a successful import becomes authoritative.
+    MigrateSession {
+        /// Session ID from `aj list-sessions`. The session must not be open
+        /// in another host. Repeating a completed migration is safe.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        session_id: Option<String>,
+        /// Import all projects under ~/.aj/sessions, reporting each result.
+        #[arg(long)]
+        all: bool,
+        /// Validate without importing or creating session lock files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Write a session of this project as a JSONL file, with its label and
+    /// archive sidecars, into a directory. Existing files are not replaced.
+    ExportSession {
+        /// Session ID from `aj list-sessions`.
+        session_id: String,
+        /// Directory to write `ID.jsonl` and `meta/` into.
+        directory: PathBuf,
+    },
+    /// Import a JSONL session file into this project's SQLite store, keeping
+    /// the session ID in its file name. The file is left unchanged.
+    ImportSession {
+        /// Path to an `ID.jsonl` file. Sidecars are read from `meta/` beside it.
+        file: PathBuf,
+    },
+    /// Check the SQLite session store: schema version, SQLite integrity and
+    /// foreign keys. Then list the commands it records as running, in every
+    /// session, and whether each one's process is still alive. Read-only.
+    /// Nothing is repaired.
+    Doctor,
+    /// Continue a session (latest unarchived one if no id
     /// given). Fails if there is no session to resume.
     ///
     /// Accepts optional positional launch input after the session id:
@@ -678,7 +713,7 @@ pub enum Command {
     /// id is ambiguous, so callers wanting "latest + prompt" should pass
     /// the session id explicitly (e.g. via `aj list-sessions`).
     Continue {
-        /// Conversation ID to continue. If absent, the latest session for
+        /// Session ID to continue. If absent, the latest session for
         /// this project that is not archived is resumed. Naming one works
         /// whatever its archived bit says, and `aj list-sessions` shows
         /// archived rows, so its first row can differ from the unnamed
@@ -894,6 +929,7 @@ mod tests {
                 vec!["serve"],
                 vec!["gateway"],
                 vec!["list-sessions"],
+                vec!["migrate-session", "id"],
                 vec!["update-models"],
             ] {
                 let allowed = command.is_empty()

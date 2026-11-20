@@ -1,8 +1,8 @@
 //! Frontend-agnostic per-session state.
 //!
-//! A [`SessionCore`] owns everything whose lifetime is one conversation
+//! A [`SessionCore`] owns everything whose lifetime is one session
 //! session and that does not depend on a rendering backend: the agent,
-//! its sub-agent registry, the conversation log, the bus
+//! its sub-agent registry, the session log, the bus
 //! subscriptions, the staged settings, and the agent-lifecycle sets. A
 //! frontend wraps a `SessionCore` in its own view type (the `aj` binary
 //! adds an event pump plus the install/reconcile view work). Session
@@ -14,27 +14,33 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use aj_agent::bus::{EventSubscriptions, SubscriptionHandle};
 use aj_agent::events::{AgentId, AgentSettings};
-use aj_agent::queue::MessageQueues;
-use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TaskRegistry};
+use aj_agent::message::AgentMessage;
+use aj_agent::queue::{MessageQueues, PendingInput, PendingKind, QueueEdit};
+use aj_agent::tool::TaskId;
+use aj_agent::{
+    Agent, BoxError, RecordedTask, SharedAgent, SubAgentBuilder, SubAgentConfig, SubAgentRegistry,
+    TaskRegistry, TaskStore,
+};
 use aj_conf::{AgentEnv, Config};
 use aj_models::ThinkingConfig;
 use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, StreamOptions};
 use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, PersistenceFailure,
-    PersistenceFence, TaggedEvent, persistence_listener, persisting_forwarder,
+    Committed, EntryId, Journal, PendingStore, PersistenceFailure, ProjectSessions, SessionLog,
+    TaskRecord, TaskRecords,
 };
+use aj_tools::tools::bash::{DetachedProcess, watch_background_bash};
 use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::host::HeadTarget;
+use crate::recovery::{Recovered, RecoveredAgent, RecoveredSubAgent};
 use crate::session_setup::{
     BuiltAgent, PreparedLog, RestoreContext, RunConfigSnapshot, SessionSource, build_agent,
-    freeze_and_seed, prepare_log,
+    freeze_and_seed, prepare_log, restore_model_settings,
 };
 
 /// Terminal window title: `"<app title> - <session id> - <cwd basename>"`,
@@ -56,11 +62,11 @@ pub fn window_title(app_title: &str, session_id: &str, cwd: &std::path::Path) ->
 /// How a session comes into being and what the user sees announced
 /// when it is installed.
 pub enum SessionSpec {
-    /// Mint a fresh conversation log.
+    /// Mint a fresh session log.
     Create {
         entry: SessionEntry,
         /// Complete environment stated by this creation. `None` differs from
-        /// an explicitly stated empty map in the on-disk creation record.
+        /// an explicitly stated empty map in the on-disk creation entry.
         session_env: Option<BTreeMap<String, String>>,
     },
     /// Resume the identified log from disk.
@@ -77,7 +83,7 @@ pub enum SessionEntry {
     Switch,
 }
 
-/// Why a session's run loop returned.
+/// Why a session's driver loop returned.
 pub enum SessionExit {
     /// The user quit (Ctrl+C / the quit command, or the terminal
     /// stream ended); the process shuts down.
@@ -98,7 +104,7 @@ pub enum SessionExit {
 }
 
 /// A session change requested by a command or selector. The session's
-/// run loop maps it onto a [`SessionExit`] so the host can tear down
+/// driver loop maps it onto a [`SessionExit`] so the host can tear down
 /// the current session and build the next one. Only emitted with no
 /// turn in flight.
 #[derive(Debug, PartialEq, Eq)]
@@ -247,19 +253,18 @@ pub struct SessionCore {
     /// Shared because a submit handler spawns a task that holds it
     /// across `agent.prompt(...).await`.
     pub agent: Arc<TokioMutex<Agent>>,
-    /// Subscription-only handle for the agent's event bus, captured before the
-    /// agent was shared. Subscribing through it needs no agent lock, which
-    /// matters because a turn holds that lock for its whole duration.
-    subscriptions: EventSubscriptions,
     /// The environment the agent was built against: base prompt,
     /// AGENTS.md/CLAUDE.md context files, discovered skills, working
     /// directory. The runtime takes only the assembled prompt, so the
     /// core keeps this for the startup context notice, the footer cwd,
     /// and the editor's autocomplete root.
     pub env: AgentEnv,
-    /// Sub-agent registry injected into `agent`; starts empty, so only
-    /// sub-agents spawned in this session are promptable.
+    /// The sub-agents this process holds a live agent for: the ones it
+    /// spawned and the ones it built from their stored runs (see
+    /// [`Self::rebuild_sub_agent`]). Injected into `agent`.
     pub registry: SubAgentRegistry,
+    /// What a sub-agent built outside a tool call shares with `agent`.
+    sub_agents: SubAgentBuilder,
     /// Background-task registry injected into `agent`; shared with the
     /// driver so wake triggers can poll notices and session teardown can
     /// close the task tree. Frontend session switches do not end this
@@ -270,6 +275,14 @@ pub struct SessionCore {
     /// and the wake triggers poll [`MessageQueues::has_pending`].
     /// Per-session, like the agent itself.
     pub message_queues: MessageQueues,
+    /// Where the session saves `message_queues` and undelivered task
+    /// notices.
+    pub pending: Arc<PendingStore>,
+    /// The session's record of the background tasks that outlive the
+    /// process.
+    pub tasks: Arc<TaskRecords>,
+    /// The stored turn state of the main agent and of each sub-agent.
+    pub turn: Arc<aj_session::TurnStore>,
     /// Loop-side staged settings overrides, keyed by sub-agent id. The
     /// model and thinking-effort selectors write entries when the user
     /// changes a sub-agent's settings; the turn primitive re-applies
@@ -281,9 +294,9 @@ pub struct SessionCore {
     /// model change or a resumed session's restored bundle cannot leak
     /// into another live session (see [`RunConfigSnapshot`]).
     pub run_config: Arc<StdMutex<RunConfigSnapshot>>,
-    /// The session's on-disk conversation log, shared with the
-    /// persistence listener.
-    pub log: Arc<TokioMutex<ConversationLog>>,
+    /// The session's on-disk session log, shared with the
+    /// journal.
+    pub log: Arc<TokioMutex<SessionLog>>,
     /// Convenience copy of the log's session id, readable without
     /// locking `log`.
     pub session_id: String,
@@ -291,25 +304,125 @@ pub struct SessionCore {
     /// restored, or why a recorded value was kept out). Pumped onto the
     /// chat scrollback by the caller after install.
     pub restore_notices: Vec<String>,
-    /// The one ephemeral recovery notice for an open whose resume repaired
-    /// an interrupted final write. Taken exactly once by the first attach
-    /// served from this materialization, so the opening client sees it and
-    /// nothing can duplicate it on later attaches or reopens.
-    recovery_notice: StdMutex<Option<String>>,
-    /// Keeps the log-writing listener subscribed; dropped with the core,
-    /// and replaced wholesale by
-    /// [`SessionCore::install_persisting_forwarder`].
-    persistence_handle: SubscriptionHandle,
-    /// Rejects and drains snapshotted persistence-listener calls before a host
-    /// releases this session's advisory lock.
-    pub(crate) persistence_fence: PersistenceFence,
+    /// The branch's goal as the open found it, already paused if it was
+    /// being pursued.
+    pub goal: Option<aj_agent::goal::Goal>,
+    /// Whether the session ever recorded a goal.
+    pub goal_history: bool,
+    /// The agents whose turn the last host left unfinished (see
+    /// [`crate::recovery::Recovered::interrupted`]).
+    pub interrupted: Vec<AgentId>,
+    /// What this open owes the first client it serves, each once: that
+    /// its resume repaired an interrupted final write, and one notice for
+    /// each sub-agent it could not restore.
+    open_notices: StdMutex<Vec<String>>,
+    /// The task records the open found running, until
+    /// [`Self::event_stream`] starts watching them.
+    watch: StdMutex<Vec<(AgentId, TaskRecord)>>,
+    /// The one writer of `log` while the session is hosted (see [`Journal`]). A host closes
+    /// it before it releases the session lock.
+    pub(crate) journal: Journal,
+}
+
+/// A sub-agent's stored run, as an agent is built from it.
+struct SubAgentRun {
+    spawned_by_oracle: bool,
+    settings: aj_session::SessionSettings,
+    transcript: Vec<AgentMessage>,
+    code_mode_store: BTreeMap<String, serde_json::Value>,
+}
+
+/// Records a session's background tasks in its database.
+struct SessionTaskStore(Arc<TaskRecords>);
+
+impl TaskStore for SessionTaskStore {
+    fn minted(&self, id: TaskId) -> Result<(), BoxError> {
+        Ok(self.0.reserve(id)?)
+    }
+
+    fn record(&self, task: &RecordedTask) -> Result<(), BoxError> {
+        // Bash is the one tool whose work is recorded.
+        let process: DetachedProcess = serde_json::from_value(task.state.clone())?;
+        Ok(self.0.start(&TaskRecord {
+            id: task.id,
+            owner: task.owner,
+            call_id: task.call_id.clone(),
+            command: task.label.clone(),
+            pid: process.pid,
+            process_start: process.start_time,
+            output_path: process.output_path,
+            exit_path: process.exit_path,
+            started_at: chrono::Utc::now(),
+        })?)
+    }
+
+    fn finish(&self, id: TaskId, owner: AgentId, notice: &AgentMessage) -> Result<(), BoxError> {
+        Ok(self.0.finish(id, owner, notice)?)
+    }
+}
+
+/// Change `agent`'s pending message in `queues`, saving the change to
+/// `pending` first. An accepted input is one that is saved, a withdrawn
+/// one is gone, and a refused save leaves the queue as it was. Returns the
+/// text a withdrawal removed.
+///
+/// This is how the pending message of an agent that has a thread is
+/// changed. A prompt for an idle agent goes through [`accept_prompt`],
+/// because the main agent may be on a draft.
+pub(crate) fn edit_pending(
+    pending: &PendingStore,
+    queues: &MessageQueues,
+    agent: AgentId,
+    edit: QueueEdit<'_>,
+) -> Result<Option<String>, aj_session::SessionError> {
+    let save = |before: Option<&(PendingKind, PendingInput)>,
+                after: Option<&(PendingKind, PendingInput)>| match (before, after) {
+        (_, Some((kind, input))) => pending.save_input(agent, *kind, input),
+        (Some((_, input)), None) => pending.forget(&input.id),
+        (None, None) => Ok(()),
+    };
+    queues.edit(agent, edit, save)
+}
+
+/// Accept a prompt for `agent`: save it as the agent's pending input (see
+/// [`edit_pending`]). The caller then wakes the agent if no turn of it is
+/// running, and that turn takes the message from the queue. Its append
+/// removes the saved copy in the same transaction.
+///
+/// The main agent's first prompt in a new session or at a fork point finds
+/// it on a draft. The session or branch is then created in one transaction
+/// with the saved input, so an accepted prompt is stored like any other and
+/// the turn that takes it has a thread to work on.
+pub(crate) async fn accept_prompt(
+    journal: &Journal,
+    pending: &PendingStore,
+    queues: &MessageQueues,
+    agent: AgentId,
+    content: &[aj_models::types::UserContent],
+) -> Result<(), aj_session::SessionError> {
+    let edit = QueueEdit::FollowUp(content);
+    if agent == AgentId::Main && !pending.has_thread(agent) {
+        // Only the task that accepts prompts creates a thread, so
+        // the draft seen under the log lock is the one seen above.
+        let mut log = journal.lock().await;
+        if log.is_draft() {
+            let create = |_: Option<&_>, after: Option<&(PendingKind, PendingInput)>| match after {
+                Some((kind, input)) => log.accept(*kind, input),
+                None => Ok(()),
+            };
+            return queues.edit(agent, edit, create).map(|_| ());
+        }
+    }
+    edit_pending(pending, queues, agent, edit).map(|_| ())
 }
 
 impl SessionCore {
     /// Build the frontend-agnostic half of a session bound to `spec`.
     ///
     /// Performs the setup that doesn't touch a rendering backend: log
-    /// resolve (create/resume), interrupted-tool-use repair, resume-time
+    /// resolve (create/resume), the recovery of what a resumed session's
+    /// last host left ([`crate::recovery::recover`]) and its installation
+    /// ([`Self::install`]), resume-time
     /// settings restoration (when `restore` is supplied, the log's
     /// recorded model/thinking/speed are written back into the shared
     /// run-config snapshot before the agent is built), agent
@@ -328,7 +441,7 @@ impl SessionCore {
     pub fn build(
         config: &Config,
         run_config: RunConfigSnapshot,
-        persistence: &ConversationPersistence,
+        persistence: &ProjectSessions,
         spec: &SessionSpec,
         restore: Option<&RestoreContext>,
     ) -> Result<(SessionCore, MainAgentSeed)> {
@@ -345,14 +458,13 @@ impl SessionCore {
         // driver reads it at every turn start.
         let run_config = Arc::new(StdMutex::new(run_config));
 
-        // Resolve + repair the log and, on a resume with restoration
+        // Resolve and settle the log and, on a resume with restoration
         // enabled, write its recorded settings back into the shared run
         // config before the agent is built off it.
         let PreparedLog {
             mut log,
-            transcript,
+            mut recovered,
             restore_notices,
-            recovery_notice,
             session_env,
         } = prepare_log(persistence, &source, &run_config, restore)?;
 
@@ -379,7 +491,7 @@ impl SessionCore {
         freeze_and_seed(
             &mut log,
             &mut agent,
-            transcript,
+            &mut recovered.main,
             &env,
             include_skills,
             source.creation_env(),
@@ -396,8 +508,8 @@ impl SessionCore {
             }
         }
 
-        // Fresh, empty registry: only sub-agents spawned in this session
-        // become promptable.
+        // Fresh, empty registry. A sub-agent of an earlier process enters
+        // it when its stored run is picked up.
         let registry = SubAgentRegistry::default();
         agent.set_sub_agent_registry(registry.clone());
 
@@ -414,12 +526,13 @@ impl SessionCore {
         let message_queues = MessageQueues::default();
         agent.set_message_queues(message_queues.clone());
 
-        // Bus subscriptions: the persistence listener writes events into
-        // the log. Seeding never emits bus events, so subscription order
-        // relative to it is immaterial. A session host swaps the
-        // listener for the tagging forwarder (see
-        // [`Self::install_persisting_forwarder`]).
+        let pending = Arc::new(log.pending());
+        let tasks = Arc::new(log.task_records());
+        let turn = Arc::new(log.turn_state());
+        task_registry.set_store(Arc::new(SessionTaskStore(Arc::clone(&tasks))));
+
         let session_id = log.session_id().to_string();
+        let system_prompt = log.system_prompt().unwrap_or_default().to_string();
 
         // Read the Main agent's footer seed off the owned agent before
         // it is shared: a synchronous caller can't read `model_info`
@@ -430,72 +543,226 @@ impl SessionCore {
         };
 
         let log = Arc::new(TokioMutex::new(log));
-        let persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
-        let subscriptions = agent.event_subscriptions();
+        // Seeding emits nothing, so nothing was published uncommitted.
+        let journal = Journal::new(Arc::clone(&log));
+        agent.set_committer(journal.committer());
+        let sub_agents = agent.sub_agent_builder();
 
         let core = SessionCore {
             agent: Arc::new(TokioMutex::new(agent)),
-            subscriptions,
             env,
             registry,
+            sub_agents,
             task_registry,
             message_queues,
+            pending,
+            tasks,
+            turn,
             sub_overrides: Arc::new(StdMutex::new(HashMap::new())),
             run_config,
             log,
             session_id,
             restore_notices,
-            recovery_notice: StdMutex::new(recovery_notice),
-            persistence_handle,
-            persistence_fence: PersistenceFence::default(),
+            goal: recovered.goal.take(),
+            goal_history: recovered.goal_history,
+            interrupted: std::mem::take(&mut recovered.interrupted),
+            open_notices: StdMutex::new(std::mem::take(&mut recovered.notices)),
+            watch: StdMutex::new(Vec::new()),
+            journal,
         };
+        core.install(recovered, &system_prompt, config, restore);
         Ok((core, seed))
     }
 
-    /// Take the one-shot recovery notice, if this open's resume repaired an
-    /// interrupted final write and nothing has consumed the notice yet.
-    pub fn take_recovery_notice(&self) -> Option<String> {
-        self.recovery_notice
-            .lock()
-            .expect("recovery notice mutex poisoned")
-            .take()
+    /// Install a settled session in this live one: put back each agent's
+    /// pending input and undelivered notices, build the sub-agents that
+    /// have some, and keep the task id counter above the ids already
+    /// minted. Nothing here writes or can fail, and no turn starts:
+    /// restored work is delivered at its agent's next ordinary drain
+    /// point, once.
+    ///
+    /// The commands found running are watched from [`Self::event_stream`]
+    /// on, so that their `TaskStart` reaches the stream.
+    fn install(
+        &self,
+        recovered: Recovered,
+        system_prompt: &str,
+        config: &Config,
+        restore: Option<&RestoreContext>,
+    ) {
+        self.task_registry.seed_last_id(recovered.last_task_id);
+        let mut watch = Vec::new();
+        self.install_agent(AgentId::Main, recovered.main, &mut watch);
+        for (n, sub) in recovered.sub_agents {
+            let RecoveredSubAgent {
+                mut agent,
+                spawned_by_oracle,
+            } = sub;
+            let run = SubAgentRun {
+                spawned_by_oracle,
+                settings: std::mem::take(&mut agent.settings),
+                transcript: std::mem::take(&mut agent.transcript),
+                code_mode_store: std::mem::take(&mut agent.code_mode_store),
+            };
+            self.build_sub_agent(n, run, system_prompt, config, restore);
+            self.install_agent(AgentId::Sub(n), agent, &mut watch);
+        }
+        *self.watch.lock().expect("watch mutex poisoned") = watch;
     }
 
-    /// Replace the plain persistence listener with the tagging forwarder and
-    /// return its tagged event stream plus the one-shot storage-failure signal
-    /// the owning driver ends the materialization on.
+    fn install_agent(
+        &self,
+        agent: AgentId,
+        recovered: RecoveredAgent,
+        watch: &mut Vec<(AgentId, TaskRecord)>,
+    ) {
+        for (kind, input) in recovered.inputs {
+            self.message_queues.restore(agent, kind, input);
+        }
+        for notice in recovered.task_notifications {
+            self.task_registry.restore_notice(agent, notice);
+        }
+        watch.extend(recovered.tasks.into_iter().map(|task| (agent, task)));
+    }
+
+    /// Take the notices this open owes the first client it serves, each
+    /// once: that its resume repaired an interrupted final write, and one
+    /// for each sub-agent it could not restore.
+    pub fn take_open_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.open_notices.lock().expect("notices mutex poisoned"))
+    }
+
+    /// What the session's journal commits from now on, as a stream in
+    /// commit order, plus the one-shot storage-failure signal the owning
+    /// driver ends the materialization on.
     ///
-    /// This is how a session host takes ownership of the session's
-    /// durability: the forwarder both writes the log and hands every
-    /// event to the returned stream paired with the entry it appended, so
-    /// the host never has to infer an append position at delivery time.
-    /// Keeping both listeners would append every message twice, hence the
-    /// replacement rather than an addition.
-    ///
-    /// Call this before the first turn. Between [`Self::build`] and here
-    /// nothing emits (seeding is silent), so no event is lost.
-    pub async fn install_persisting_forwarder(
+    /// Call this once, before the first turn: a write committed earlier is
+    /// not in the stream. It also starts watching the task records
+    /// the open found running, so the stream carries their `TaskStart`.
+    /// Their drivers are spawned on the current Tokio runtime and hold the
+    /// session's store, so a caller that then gives the session up shuts
+    /// the task registry down and waits for it before it releases the
+    /// session's lock.
+    pub async fn event_stream(
         &mut self,
-        handoff: &AppendHandoff,
     ) -> (
-        UnboundedReceiver<TaggedEvent>,
+        UnboundedReceiver<Committed>,
         tokio::sync::oneshot::Receiver<PersistenceFailure>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (failure_signal, failures) = tokio::sync::oneshot::channel();
         self.log.lock().await.install_failure_signal(failure_signal);
-        self.persistence_handle = self.subscriptions.subscribe(persisting_forwarder(
-            Arc::clone(&self.log),
-            handoff.clone(),
-            tx,
-            self.persistence_fence.clone(),
-        ));
-        (rx, failures)
+        let stream = self.journal.stream();
+        let watch = std::mem::take(&mut *self.watch.lock().expect("watch mutex poisoned"));
+        for (owner, task) in watch {
+            // Nothing else holds an agent before the first turn.
+            if let Some(agent) = self.resolve_agent(owner) {
+                let agent = agent.lock().await;
+                watch_background_bash(&agent, crate::recovery::saved_bash_task(&task));
+            }
+        }
+        (stream, failures)
+    }
+
+    /// Build sub-agent `n` from its stored run on the selected branch and
+    /// retain it, so it is prompted like one this process spawned. `None`
+    /// when the branch shows no run of that sub-agent.
+    ///
+    /// See [`Self::build_sub_agent`] for what is and is not rebuilt.
+    pub fn rebuild_sub_agent(
+        &self,
+        log: &mut SessionLog,
+        n: usize,
+        config: &Config,
+        restore: Option<&RestoreContext>,
+    ) -> Result<Option<SharedAgent>> {
+        let Some(sub) = crate::recovery::read_sub_agent_run(log, n)? else {
+            return Ok(None);
+        };
+        let run = SubAgentRun {
+            spawned_by_oracle: sub.spawned_by_oracle,
+            settings: sub.agent.settings,
+            transcript: sub.agent.transcript,
+            code_mode_store: sub.agent.code_mode_store,
+        };
+        let system_prompt = log.system_prompt().unwrap_or_default().to_string();
+        Ok(Some(self.build_sub_agent(
+            n,
+            run,
+            &system_prompt,
+            config,
+            restore,
+        )))
+    }
+
+    /// Build sub-agent `n` from `run`, its stored run, and retain it.
+    /// Reads nothing from the store and cannot fail.
+    ///
+    /// The agent continues the run: its transcript is the run's model
+    /// context, its settings are the spawn record's with the changes
+    /// recorded since, and it shares the session's environment, tasks and
+    /// queues. Its tools and prompt suffix are those the tool that spawned
+    /// it gives a new sub-agent under `config` now, derived once here. A
+    /// recorded model this host cannot resolve falls back to that tool's
+    /// current one.
+    ///
+    /// Not rebuilt: the todo list, and what the spawning agent held in
+    /// memory only when it spawned (the `image_block` setting comes from
+    /// `config` instead). The parent's tool call no longer waits for the
+    /// sub-agent, so it has no foreground assignment.
+    fn build_sub_agent(
+        &self,
+        n: usize,
+        run: SubAgentRun,
+        system_prompt: &str,
+        config: &Config,
+        restore: Option<&RestoreContext>,
+    ) -> SharedAgent {
+        let oracle = run.spawned_by_oracle;
+        let (mut model, session_id) = {
+            let run_config = self.run_config.lock().expect("run config mutex poisoned");
+            let model = if oracle {
+                run_config.oracle.clone()
+            } else {
+                run_config.main.clone()
+            };
+            (model, run_config.session_id.clone())
+        };
+        // A scripted host resolves no models, as for the main agent.
+        if let Some(restore) = restore {
+            for notice in restore_model_settings(&mut model, &run.settings, restore) {
+                tracing::info!("sub-agent {n}: {notice}");
+            }
+            let accounts = {
+                let run_config = self.run_config.lock().expect("run config mutex poisoned");
+                run_config.accounts.clone()
+            };
+            let provider = model.model_info.provider.clone();
+            accounts.install(&mut model.stream_options, &restore.auth, &provider);
+        }
+        let bundle = if oracle {
+            crate::oracle::child_config(config, &model, session_id)
+        } else {
+            crate::turn::sub_agent_config(config, &model, session_id)
+        };
+        let agent = self.sub_agents.build(SubAgentConfig {
+            agent_id: n,
+            bundle,
+            restrict_tools: oracle,
+            system_prompt: system_prompt.to_string(),
+            disabled_tools: config.disabled_tools.clone(),
+            block_images: config.image_block,
+            code_mode: config.code_mode,
+            transcript: run.transcript,
+            code_mode_store: run.code_mode_store,
+        });
+        let agent: SharedAgent = Arc::new(TokioMutex::new(agent));
+        self.registry.insert(n, Arc::clone(&agent));
+        agent
     }
 
     /// Resolve an `AgentId` to its live handle: the main agent for
-    /// `Main`, a retained sub-agent for `Sub(n)` (`None` if no live
-    /// handle, e.g. a resumed sub-agent).
+    /// `Main`, a retained sub-agent for `Sub(n)`. `None` for a sub-agent
+    /// this process does not hold (see [`Self::rebuild_sub_agent`]).
     pub fn resolve_agent(&self, id: AgentId) -> Option<SharedAgent> {
         match id {
             AgentId::Main => Some(Arc::clone(&self.agent)),
@@ -503,20 +770,19 @@ impl SessionCore {
         }
     }
 
-    /// Decompose the core into an owned agent plus its shared log and
-    /// the persistence subscription, for headless turn tests that drive
-    /// the agent directly.
+    /// Decompose the core into an owned agent, its shared log and its
+    /// journal, for headless turn tests that drive the agent directly.
     ///
     /// The agent is uniquely held after [`Self::build`] (the bus
     /// subscriptions keep handles, not agent clones), so unwrapping it
-    /// out of the `Arc<TokioMutex>` cannot fail. The persistence handle
-    /// is returned so driven turns keep writing to the log.
+    /// out of the `Arc<TokioMutex>` cannot fail. The agent keeps
+    /// committing to the log through its bus.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn into_test_agent(self) -> (Agent, Arc<TokioMutex<ConversationLog>>, SubscriptionHandle) {
+    pub fn into_test_agent(self) -> (Agent, Arc<TokioMutex<SessionLog>>, Journal) {
         let agent = Arc::try_unwrap(self.agent)
             .unwrap_or_else(|_| unreachable!("core.agent is uniquely held after build"))
             .into_inner();
-        (agent, self.log, self.persistence_handle)
+        (agent, self.log, self.journal)
     }
 }
 

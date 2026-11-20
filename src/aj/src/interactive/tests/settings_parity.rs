@@ -558,7 +558,7 @@ fn settings_parity_host_process() {
             project_path: Config::project_config_file_path(),
         };
         let auth = AuthStorage::new(root.join("home/.aj/auth.json"));
-        let persistence = ConversationPersistence::new(root.join("sessions"));
+        let persistence = ProjectSessions::new(root.join("sessions"));
         let ComposedHost { host, .. } =
             compose_host(&args, layers, &auth, &persistence, None).unwrap();
         let session = host.create().await.unwrap();

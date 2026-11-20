@@ -183,6 +183,17 @@ async fn async_main() -> Result<()> {
             println!("aj {}", aj_app::VERSION);
             Ok(())
         }
+        Some(Command::MigrateSession {
+            session_id,
+            dry_run,
+            ..
+        }) => aj_app::handle_migrate_session(session_id.as_deref(), dry_run),
+        Some(Command::ExportSession {
+            session_id,
+            directory,
+        }) => aj_app::handle_export_session(&session_id, &directory),
+        Some(Command::ImportSession { file }) => aj_app::handle_import_session(&file),
+        Some(Command::Doctor) => aj_app::handle_doctor(),
         Some(Command::Serve) => serve::run(args).await,
         Some(Command::Gateway { .. }) => gateway::run(args).await,
         Some(Command::Continue {

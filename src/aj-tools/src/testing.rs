@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 /// snapshots; `cancellation` returns a fresh token that never fires.
 /// Background tasks register against the (default) `task_registry`
 /// and emit on a bus with no subscribers, owned by `agent_id`, which
-/// defaults to [`AgentId::Main`].
+/// defaults to [`AgentId::Main`]. Every call is `dummy-call`.
 pub struct DummyToolContext {
     /// Working directory returned by [`ToolContext::working_directory`].
     pub working_directory: PathBuf,

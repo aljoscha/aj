@@ -466,7 +466,7 @@ mod tests {
         let chat = chat_with_window(200_000);
         chat.borrow_mut()
             .footers_mut()
-            .record_turn_usage(AgentId::Main, &usage(12_345));
+            .record_round_usage(AgentId::Main, &usage(12_345));
         let mut f = footer(chat, StatusState::default());
         let r = draw_rows(&mut f, 80);
         assert_eq!(r.len(), 1, "one footer row: {r:?}");
@@ -485,7 +485,7 @@ mod tests {
         let chat = chat_with_window(0);
         chat.borrow_mut()
             .footers_mut()
-            .record_turn_usage(AgentId::Main, &usage(1_000));
+            .record_round_usage(AgentId::Main, &usage(1_000));
         let mut f = footer(chat, StatusState::default());
         let r = draw_rows(&mut f, 80);
         assert_eq!(r[0], " opus high  ·  /home/user/proj", "{r:?}");
@@ -503,7 +503,7 @@ mod tests {
             let chat = chat_with_window(200_000);
             chat.borrow_mut()
                 .footers_mut()
-                .record_turn_usage(AgentId::Main, &usage(tokens));
+                .record_round_usage(AgentId::Main, &usage(tokens));
             let mut f = footer(chat, StatusState::default());
             let surface = f.draw(&crate::test_support::draw_ctx(80, None));
             let grid = crate::test_support::flatten(&surface);
@@ -517,7 +517,7 @@ mod tests {
         let chat = chat_with_window(200_000);
         chat.borrow_mut()
             .footers_mut()
-            .record_turn_usage(AgentId::Main, &usage(20_000));
+            .record_round_usage(AgentId::Main, &usage(20_000));
         let mut f = footer(chat, StatusState::default());
         let surface = f.draw(&crate::test_support::draw_ctx(80, None));
         let grid = crate::test_support::flatten(&surface);
@@ -672,7 +672,7 @@ mod tests {
         let chat = chat_with_window(200_000);
         chat.borrow_mut()
             .footers_mut()
-            .record_turn_usage(AgentId::Main, &usage(12_345));
+            .record_round_usage(AgentId::Main, &usage(12_345));
         let mut f = footer(chat, StatusState::default());
         let surface = f.draw(&crate::test_support::draw_ctx(20, None));
         assert_eq!(surface.size.height, 1, "never wraps");

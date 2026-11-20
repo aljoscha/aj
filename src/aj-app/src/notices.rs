@@ -1,7 +1,7 @@
-//! Frontend-agnostic startup notices: the session's `Context:` record and the
+//! Frontend-agnostic startup notices: the session's `Context:` entry and the
 //! sandbox warning.
 //!
-//! The context record is written into the session log at creation and
+//! The context entry is written into the session log at creation and
 //! rendered by replay ([`SessionContext::notice`]), so every frontend shows
 //! the same listing at the top of a session for as long as it exists. The
 //! sandbox warning is about the process running the agent, not the session,
@@ -10,7 +10,7 @@
 use aj_conf::{AgentEnv, SystemPromptSource, display_path};
 use aj_session::{ContextFileRecord, ContextSkillRecord, SessionContext};
 
-/// What `env`'s system prompt is assembled from, as the record the session
+/// What `env`'s system prompt is assembled from, as the entry the session
 /// log keeps: the prompt's source, every instruction file in the order they
 /// are stitched in, and every discovered skill with whether it reaches the
 /// model's listing. Paths are abbreviated the way this host displays them.
@@ -78,7 +78,7 @@ mod tests {
 
     use super::{SANDBOX_WARNING, sandbox_warning_enabled_for, session_context_with_display};
 
-    /// Build an [`AgentEnv`] for the record tests. Working directory / OS /
+    /// Build an [`AgentEnv`] for the entry tests. Working directory / OS /
     /// date / git root are stubbed: only `system_prompt`, `context_files`, and
     /// `skills` matter here.
     fn env_with(context_files: Vec<ContextFile>) -> AgentEnv {
@@ -101,7 +101,7 @@ mod tests {
         path.display().to_string()
     }
 
-    /// The record carries what the notice shows and nothing the prompt text
+    /// The entry carries what the notice shows and nothing the prompt text
     /// already holds: files by path and kind, skills by path, name and listing
     /// status, the prompt by its override path or not at all.
     #[test]

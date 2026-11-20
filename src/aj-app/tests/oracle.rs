@@ -30,7 +30,7 @@ use aj_models::types::{
     Speed, StopReason, StreamOptions, ThinkingLevel, ToolCall, ToolResultMessage, UserContent,
     Verbosity,
 };
-use aj_session::ConversationPersistence;
+use aj_session::ProjectSessions;
 use aj_wire::Frame;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -204,7 +204,7 @@ async fn main_and_oracle_require_resolvable_model_defaults() {
                     writes: Default::default(),
                 },
                 &auth,
-                &ConversationPersistence::new(root.path().join("sessions")),
+                &ProjectSessions::new(root.path().join("sessions")),
                 None,
             );
             if valid {
@@ -257,7 +257,7 @@ async fn oracle_credentials_are_checked_before_work_and_login_clears_the_warning
             writes: Default::default(),
         },
         &auth,
-        &ConversationPersistence::new(root.path().join("sessions")),
+        &ProjectSessions::new(root.path().join("sessions")),
         None,
     )
     .unwrap();
@@ -555,7 +555,7 @@ async fn background_oracle_returns_before_completion_and_delivers_its_report_to_
             writes: Default::default(),
         },
         &AuthStorage::with_providers(root.path().join("auth.json"), HashMap::new()),
-        &ConversationPersistence::new(root.path().join("sessions")),
+        &ProjectSessions::new(root.path().join("sessions")),
         None,
     )
     .unwrap();
@@ -1055,7 +1055,7 @@ async fn retained_oracle_settings_use_child_identity_and_fall_back_for_unsupport
             catalog: Arc::new(catalog),
             defaults: RunConfigDefaults::fixed(run),
             restore: Some(restore),
-            persistence: ConversationPersistence::new(root.path().join("sessions")),
+            persistence: ProjectSessions::new(root.path().join("sessions")),
             auth,
             working_directory: root.path().to_path_buf(),
             name: None,
@@ -1341,7 +1341,7 @@ async fn shared_speed_survives_resume_and_resolves_independently_on_real_request
                 layers: Arc::new(Mutex::new(ConfigLayers { user: config, project: ConfigLayer::default(),
                     project_path: None, writes: Default::default() })),
                 catalog: Arc::new(catalog.clone()), defaults: RunConfigDefaults::fixed(defaults),
-                restore: Some(restore.clone()), persistence: ConversationPersistence::new(root.path().join("sessions")),
+                restore: Some(restore.clone()), persistence: ProjectSessions::new(root.path().join("sessions")),
                 auth: auth.clone(), working_directory: root.path().to_path_buf(), name: None,
                 idle_grace: None, live_capacity: None, list_coalesce: None,
             }).unwrap()
@@ -1370,7 +1370,7 @@ async fn shared_speed_survives_resume_and_resolves_independently_on_real_request
             }
             {
                 let log = handles.log.lock().await;
-                assert_eq!(log.settings_at(log.head().unwrap()).speed.as_deref(), Some(expected.as_str()));
+                assert_eq!(log.settings_at(log.head().unwrap()).unwrap().speed.as_deref(), Some(expected.as_str()));
             }
             let mut attachment = host.attach(&[AttachRequest { session: session.clone(), cursor: None }]).await.unwrap();
             while !matches!(attachment.recv().await.unwrap(), Frame::CaughtUp { .. }) {}

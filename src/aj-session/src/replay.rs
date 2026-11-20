@@ -1,95 +1,50 @@
-//! Replay a persisted [`ConversationLog`](crate::log::ConversationLog)
+//! Replay a stored [`SessionLog`](crate::log::SessionLog)
 //! as an iterator of typed [`AgentEvent`]s.
 //!
-//! Resuming a session should look the same to a frontend as a live
-//! run: the renderer consumes a single typed event stream regardless
-//! of whether the events came from a running agent or from a
-//! previously recorded log on disk. `replay` is the bridge between
-//! disk and that pipeline.
-//!
-//! The binary-side wiring: the `aj` binary opens a log, registers
-//! persistence and renderer listeners on the agent, then drains
-//! `replay(...)` into the renderer pipeline before entering its
-//! input loop.
+//! A resumed session looks the same to a frontend as a live one: the
+//! renderer consumes one typed event stream, whether the events came from
+//! a running agent or from stored entries. This module is the bridge.
+//! [`replay`] serves print mode and the HTML export. A host answers a
+//! client that attaches or scrolls back with [`project_suffix`] and
+//! [`project_page`].
 //!
 //! ## Mapping
 //!
-//! Each persisted [`ConversationEntryKind`] maps to zero or more
-//! [`AgentEvent`]s, tagged with an [`AgentId`] derived from the
-//! entry's [`ThreadKind`] / `agent_id` framing so the bridge listener
-//! routes main-agent and sub-agent activity to the right renderers:
+//! Each [`LogEntryKind`] maps to zero or more [`AgentEvent`]s,
+//! tagged with the [`AgentId`] its thread and `agent_id` name. The match
+//! arms are the mapping. What they do not show:
 //!
-//! - [`ConversationEntryKind::SystemPrompt`]: model-facing metadata,
-//!   not user-visible. No event.
-//! - [`ConversationEntryKind::Message`] (assistant): one
-//!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair
-//!   wrapping the projected [`AssistantMessage`], followed by an
-//!   [`AgentEvent::UsageUpdate`] carrying the per-turn `usage`
-//!   recorded on the assistant message and a running
-//!   accumulated total. Listeners such as the TUI footer therefore
-//!   see the same shape on resume as on a live turn. Renderers walk the finalized content blocks on
-//!   `MessageEnd` to paint text/thinking/tool-call blocks; no
-//!   per-block streaming events are synthesized (replay has no
-//!   deltas to stream). Each tool_call updates an internal
-//!   `tool_call_id ↦ (tool_name, args)` map used to label the
-//!   matching tool result later.
-//! - [`ConversationEntryKind::Message`] (user): one
-//!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair.
-//! - [`ConversationEntryKind::Message`] (tool_result): one
-//!   [`AgentEvent::ToolExecutionStart`] / [`ToolExecutionEnd`] pair
-//!   pulling the tool name & input args from the tracking map. The
-//!   structured `ToolDetails` payload is resolved through the session
-//!   codec. Text body references are hydrated from content, while normal
-//!   details use regular deserialization. Absent or malformed details fall
-//!   back to a text-only synthesis. The
-//!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair
-//!   around the tool_result is also emitted so persistence listeners
-//!   replaying the stream see the same shape live runs produce.
-//! - [`ConversationEntryKind::ModelChange`] /
-//!   [`ConversationEntryKind::OracleModelChange`] /
-//!   [`ConversationEntryKind::OracleThinkingChange`] /
-//!   [`ConversationEntryKind::OracleSpeedChange`] /
-//!   [`ConversationEntryKind::OracleVerbosityChange`] /
-//!   [`ConversationEntryKind::AccountChange`] /
-//!   [`ConversationEntryKind::ThinkingChange`] /
-//!   [`ConversationEntryKind::SpeedChange`] /
-//!   [`ConversationEntryKind::VerbosityChange`]: one
-//!   [`AgentEvent::Notice`] (`Model set to <provider>/<id>.`, etc.),
-//!   but only when at least one `Message` entry precedes the entry
-//!   on the same thread. This renders mid-session switches in
-//!   resumed scrollback while keeping seed entries (session
-//!   creation) silent — they never produced a visible notice live
-//!   either.
-//! - [`ConversationEntryKind::EnvChange`]: a keys-only, ASCII-escaped state
-//!   notice after a user message. Seeds and legacy Meta records stay silent.
-//! - [`ConversationEntryKind::Context`]: one [`AgentEvent::Notice`] on the
-//!   main agent, the `Context:` listing that opens the session's
-//!   scrollback, rendered by [`crate::log::SessionContext::notice`].
-//! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
-//!   feeds the sub-agent bracketing below.
-//! - [`ConversationEntryKind::Compaction`][]: an
-//!   [`AgentEvent::CompactionEnd`] carrying the summary, reduced occupancy, and
-//!   any recorded summarizer usage together under the checkpoint's identity.
-//!   This mirrors the live path without treating summarizer spend as context
-//!   occupancy. The retained tail's assistant usage is stale.
-//!   The summarized prefix entries still replay in order, so
-//!   the scrollback shows the full history even though the model
-//!   context (rebuilt via `agent_messages`) is the reduced projection.
-//!
-//! [`ConversationEntryKind::CompactionFailed`] replays a durable
-//! [`AgentEvent::CompactionEnd`] error with its original reason and pre-run
-//! occupancy, no summary or usage, and zero post-run occupancy. It does not
-//! change model context or accounting. Cancellation is transient.
+//! - **Finalized messages only.** A message replays as one
+//!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair. No
+//!   per-block streaming events are synthesized, since an entry has no
+//!   deltas.
+//! - **Usage.** An assistant message is followed by an
+//!   [`AgentEvent::UsageUpdate`] with its own usage and the running total,
+//!   so a footer sees the shape of a live turn.
+//! - **Tool results.** A result is labelled with the tool name and
+//!   arguments of the call it answers, which replay remembers by call id.
+//!   Absent or malformed details fall back to a text-only synthesis.
+//! - **Settings notices.** A model, thinking, speed, verbosity or account
+//!   change emits a notice only when a message precedes it on its thread.
+//!   The entries that seed a session never produced a notice live either.
+//! - **Compaction.** The summarized entries still replay in order, so the
+//!   scrollback shows the full history although the model context is the
+//!   reduced projection. Summarizer usage is reported with the checkpoint
+//!   and is not context occupancy.
 //!
 //! Sub-agent runs are bracketed with synthesized
 //! [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
 //! events. A sub thread leads with its `SubAgentSpawn` entry, which
 //! carries the task and the child's settings snapshot, so the start
-//! event is emitted directly from it. Legacy logs whose sub threads
-//! lead with the task user message instead get the start event at
-//! that first `Message` entry, with the task taken from its user
-//! text and default settings (empty provider/model, thinking "off",
-//! speed "standard").
+//! event is emitted directly from it. A sub thread from before that
+//! entry existed leads with the task user message instead, and gets
+//! the start event at that message, with the task taken from its text
+//! and default settings. A run has one bracket, however its entries
+//! interleave with other agents'. It closes at the run's
+//! [`LogEntryKind::SubAgentEnd`] entry, which projects as a
+//! durable `SubAgentEnd`. Messages a sub-agent writes after that entry
+//! bracket nothing. A run without the entry closes at the first
+//! projected entry after its last message, or at the end of the log.
 //!
 //! ## Live logs
 //!
@@ -97,7 +52,7 @@
 //! at end of log is force-closed. A live session serving a catch-up
 //! backfill needs the same projection with different endings, which is
 //! [`project_suffix`]: it emits only the entries after a cursor, tags
-//! the durable ones with their append position, and leaves the brackets
+//! the durable ones with their position, and leaves the brackets
 //! of the runs the caller knows are still running open.
 //!
 //! ## Timestamps
@@ -106,15 +61,15 @@
 //! and intentionally so. [`AgentEvent`] carries no timestamp slot, and
 //! no frontend renders a per-message "sent at" or a turn duration off
 //! the event stream. The authoritative append time lives on
-//! [`ConversationEntry::timestamp`] and is read straight off the log by
-//! the session-listing surfaces ([`ConversationLog::stats`] and
+//! [`LogEntry::timestamp`] and is read straight off the entries by
+//! the session-listing surfaces ([`SessionLog::stats`] and
 //! [`crate::persistence::SessionPreview`]), so a resumed session reports
 //! the same activity times as a live one without threading anything
 //! through replay. The projected wire messages keep their own
 //! `timestamp` field as persisted (today the live path leaves it `0`).
 //!
-//! [`ConversationEntry::timestamp`]: crate::log::ConversationEntry::timestamp
-//! [`ConversationLog::stats`]: crate::log::ConversationLog::stats
+//! [`LogEntry::timestamp`]: crate::log::LogEntry::timestamp
+//! [`SessionLog::stats`]: crate::log::SessionLog::stats
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -125,23 +80,23 @@ use aj_agent::types::TokenUsage;
 use aj_models::types::{AssistantContent, Message, StopReason, Usage, UserContent};
 use serde_json::Value;
 
-use crate::compaction::estimate_conversation_context;
+use crate::compaction::estimate_branch_context;
 use crate::log::{
-    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, EntryRef, LogSnapshot,
-    SessionSettings, ThreadFilter, ThreadKind,
+    EntryId, EntryRef, LogEntry, LogEntryKind, LogSnapshot, SessionLog, SessionSettings,
+    ThreadFilter, ThreadKind,
 };
 use crate::tool_details::resolve_tool_details;
 
 /// One event paired with the log entry it stands for.
 ///
 /// Both origins produce this shape, which is what lets a host fan one
-/// stream out without converting: the persisting forwarder tags an event
+/// stream out without converting: the journal tags an event
 /// with the entry it just appended, and [`project_suffix`] tags a
 /// projected event with the entry it derives from.
 ///
 /// `entry` is `Some` exactly for the events that are durable,
 /// so a client can advance its cursor on the same events whether they
-/// arrive live or in a backfill. It is absent for everything a live run
+/// arrive live or in a backfill. It is absent for everything a live agent
 /// emits without persisting, for bracketing frames the projection
 /// synthesizes, and for every projected event of an entry at or below the
 /// cursor: their entry is already applied, and tagging them would make
@@ -196,13 +151,21 @@ impl Iterator for Backfill<'_> {
 
 /// Project the events of every entry after `cursor`, for a live log.
 ///
-/// The walk starts at entry 0 regardless of the cursor, so the tool-name
-/// map, the usage accumulators, the state-notice gate and the
-/// sub-agent bracketing state are complete: events of entries at or
-/// below the cursor are computed and dropped, never skipped. `None`
-/// projects the whole log, and so does a cursor beyond the log's
-/// `last_seq`, which cannot name a position in this materialization
-/// (it is treated as an epoch mismatch).
+/// The walk starts at the first entry the log holds regardless of the
+/// cursor, so the tool-name map, the usage accumulators, the state-notice
+/// gate and the sub-agent bracketing state are complete: events of entries
+/// at or below the cursor are computed and dropped, never skipped. `None`
+/// projects everything the log holds of the branch, and so does a cursor
+/// beyond the log's `last_seq`, which cannot name a position in this
+/// materialization (it is treated as an epoch mismatch).
+///
+/// A log that does not hold its whole session projects from where its
+/// window starts (see [`LogSnapshot::window_start`]), whatever the cursor.
+/// The state entries before it still feed the walk, and the window carries
+/// what the messages before it would have added, so the events are those a
+/// whole log yields for the same entries. One figure may differ: the
+/// occupancy after a compaction is estimated from the messages held, which
+/// may not reach back to the first entry an older compaction kept.
 ///
 /// `live_subs` names the sub-agents the caller knows are still running.
 /// Every other run's bracket is force-closed exactly as dead-log
@@ -211,7 +174,7 @@ impl Iterator for Backfill<'_> {
 /// or below the cursor has its `SubAgentStart` re-synthesized before its
 /// first emitted event, so the suffix is well-bracketed.
 ///
-/// Which events carry an [`EntryRef`]: exactly the ones a live run
+/// Which events carry an [`EntryRef`]: exactly the ones a live agent
 /// persists or synthesizes as durable, so live flow and backfill agree
 /// on what a cursor covers. That is the `MessageEnd` of a `Message`
 /// entry, the `SubAgentStart` of a `SubAgentSpawn` root, the
@@ -226,9 +189,40 @@ pub fn project_suffix<'a>(
     // This is the one place that knows `last_seq`, so the out-of-range
     // clamp lives here rather than at every caller.
     let cursor = cursor.filter(|seq| *seq <= log.last_seq());
+    // Nothing before the window is held, so nothing there can be
+    // projected, whatever the caller already has.
+    let cursor = cursor.max(Replay::new(log).cursor);
     Backfill {
         walk: Replay::suffix(log, cursor, live_subs.clone()),
     }
+}
+
+/// Project one page of `agent`'s history: its events for the entries at
+/// positions `from..before`, for a client that already shows everything
+/// of that agent after it. A sub-agent's box belongs to its parent's page,
+/// and what the sub-agent did belongs to its own.
+///
+/// Like [`project_suffix`], the walk starts at the first entry the log
+/// holds so its state is complete, and a run that opened before the page
+/// has its start re-synthesized. A run with entries at or after `before` is
+/// left open, because the client already holds its continuation, and so is
+/// a run of one of `live_subs`, as [`project_suffix`] leaves it. Every
+/// other run the page leaves open is closed, as a dead log would close it.
+/// The log must hold the page (see
+/// [`crate::ProjectSessions::load_page`]).
+pub fn project_page<'a>(
+    log: &'a LogSnapshot,
+    agent: AgentId,
+    from: u64,
+    before: u64,
+    live_subs: &BTreeSet<usize>,
+) -> impl Iterator<Item = TaggedEvent> + 'a {
+    let mut walk = Replay::suffix(log, Some(from.saturating_sub(1)), live_subs.clone());
+    if let Some(path) = &walk.included {
+        walk.live_subs.extend(log.subs_reaching(path, before));
+    }
+    walk.end = before;
+    walk.filter(move |tagged| tagged.event.agent_id() == agent)
 }
 
 impl LogSnapshot {
@@ -258,29 +252,42 @@ impl LogSnapshot {
     }
 }
 
+impl SessionLog {
+    /// See [`LogSnapshot::project_state_entry`]. For a writer that holds
+    /// the log and decides what its append publishes.
+    pub fn project_state_entry(&self, entry: &EntryId) -> Option<AgentEvent> {
+        self.core().project_state_entry(entry)
+    }
+}
+
 /// Walks `log` in append order and lazily yields its projected [`AgentEvent`]s.
 ///
 /// The iterator borrows `log` until it is dropped. It buffers only events from
 /// the current persisted entry, plus events needed to balance an open sub-agent
 /// at EOF.
-pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
+pub fn replay(log: &SessionLog) -> impl Iterator<Item = AgentEvent> + '_ {
     Replay::new(log.core()).map(|projected| projected.event)
 }
 
 struct Replay<'a> {
     log: &'a LogSnapshot,
-    next_entry: usize,
+    /// Position the walk continues from.
+    next: u64,
+    /// Where each sub-agent run without an end record ends: the append
+    /// position of its last message. Such a run's bracket closes at the
+    /// first entry the walk shows after it. A settings entry that trails
+    /// the run does not move its end.
+    ends: HashMap<usize, u64>,
     state: ReplayState,
     pending: VecDeque<TaggedEvent>,
     finished: bool,
-    /// The entry ids to project: the active path from [`LogSnapshot::head`]
-    /// plus the sub-agent threads anchored on it. Append-order entries
-    /// outside this set are skipped, so sibling branches on disk don't
-    /// interleave into the replayed stream. `None` disables filtering
-    /// (a log with no user-thread head), preserving the whole-file
-    /// behaviour.
-    included: Option<HashSet<String>>,
-    /// Entries at or below this append position are projected for their
+    /// The entries to project: the branch ending at [`LogSnapshot::head`]
+    /// with the sub-agent runs that start on it. Append-order entries off
+    /// this path are skipped, so sibling branches on disk don't interleave
+    /// into the replayed stream. `None` disables filtering (a log with no
+    /// main-thread head), preserving the whole-file behaviour.
+    included: Option<crate::threads::Path>,
+    /// Entries at or below this position are projected for their
     /// effect on the walk's state and their events dropped, so the walk
     /// yields only the suffix after it. `None` yields everything.
     cursor: Option<u64>,
@@ -288,19 +295,47 @@ struct Replay<'a> {
     /// caller knows they are still running (see [`project_suffix`]).
     /// Dead-log replay leaves this empty and closes every run.
     live_subs: BTreeSet<usize>,
+    /// Position of the first entry the walk does not visit.
+    end: u64,
 }
 
 impl<'a> Replay<'a> {
     fn new(log: &'a LogSnapshot) -> Self {
+        let included = log.head().map(|head| log.path(Some(head)));
+        // A log holds a run it shows whole, so the held entries name its
+        // last message. A run that recorded its own end needs no such
+        // inference.
+        let mut ends = HashMap::new();
+        let mut recorded = HashSet::new();
+        for (seq, thread, entry) in log.range(1, u64::MAX) {
+            let Some(AgentId::Sub(n)) = agent_id_for(entry) else {
+                continue;
+            };
+            if !included.as_ref().is_none_or(|path| path.holds(thread, seq)) {
+                continue;
+            }
+            match &entry.entry {
+                LogEntryKind::SubAgentEnd { .. } => {
+                    recorded.insert(n);
+                }
+                LogEntryKind::Message { .. } | LogEntryKind::SubAgentSpawn { .. } => {
+                    ends.insert(n, seq);
+                }
+                _ => {}
+            }
+        }
+        ends.retain(|n, _| !recorded.contains(n));
         Self {
             log,
-            next_entry: 0,
-            state: ReplayState::default(),
+            next: 1,
+            ends,
+            state: ReplayState::carried(log),
             pending: VecDeque::new(),
             finished: false,
-            included: included_entries(log),
-            cursor: None,
+            included,
+            cursor: log.window_start().checked_sub(2).map(|before| before + 1),
             live_subs: BTreeSet::new(),
+            end: u64::MAX,
         }
     }
 
@@ -311,84 +346,22 @@ impl<'a> Replay<'a> {
             ..Self::new(log)
         }
     }
-}
 
-/// Compute the set of entry ids replay should project: the head's
-/// ancestor chain on the main thread, plus every sub-agent entry that
-/// chains onto that path.
-///
-/// Returns `None` when the log has no user-thread head, which disables
-/// filtering so a headless log replays in full as before.
-///
-/// Invariant: only sub-agent entries expand forward. Main-thread
-/// inclusion is exactly the head's ancestor chain, so sibling branches
-/// are excluded. A main-thread entry off the head's chain is never
-/// added, which is what keeps an abandoned branch out of the replay.
-///
-/// Anchoring on parent chains rather than on `agent_id` is what makes
-/// this correct under concurrent writers. Two writers that both resume
-/// before spawning can mint the same `Sub(n)` id on different branches
-/// (the counter is seeded from `max_agent_id` at resume), so the id
-/// alone cannot tell an on-path run from an abandoned one. The parent
-/// chain can: append order guarantees a sub entry's anchor (its
-/// main-thread parent, or an earlier entry of the same run) precedes
-/// it, so a single forward pass includes each on-path run completely
-/// and never touches a run anchored on an excluded main entry.
-///
-/// Keying on the parent rather than a [`ConversationEntryKind::SubAgentSpawn`]
-/// root also handles legacy logs whose sub threads lead with the task
-/// user message: both shapes anchor their first entry on the user
-/// thread and chain forward the same way. No transitive closure across
-/// sub threads is needed, since a spawned agent has the `agent` tool
-/// removed and its thread always anchors on the user thread.
-fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
-    let head = log.head()?;
-
-    // Main path: walk parent pointers from the head, collecting the
-    // head's user and meta ancestors (state and system-prompt
-    // entries chain here too, so they stay included). This is the only
-    // source of main-thread inclusion, so sibling branches never enter
-    // the set.
-    let mut included: HashSet<String> = HashSet::new();
-    let mut cursor = Some(head.clone());
-    let mut root = None;
-    while let Some(id) = cursor {
-        let Some(entry) = log.get(&id) else { break };
-        included.insert(id.clone());
-        cursor = entry.parent_id.clone();
-        root = Some(entry);
+    /// Whether the entry of `thread` at position `seq` is projected.
+    ///
+    /// The path follows threads, not agent numbers, which is what makes
+    /// this correct when two branches hold a sub-agent of the same number:
+    /// two writers that both resume before spawning mint the same `Sub(n)`,
+    /// and only the run that starts on this branch is on its path. A run
+    /// is on the path whole or not at all, so an excluded run is never
+    /// opened and the bracketing stays balanced.
+    ///
+    /// A meta entry belongs to every branch, also when it sits in the
+    /// root thread after the point where the branch leaves it.
+    fn shows(&self, thread: usize, seq: u64, entry: &LogEntry) -> bool {
+        let included = self.included.as_ref();
+        entry.thread == ThreadKind::Meta || included.is_none_or(|path| path.holds(thread, seq))
     }
-    let root_id = root.map(|entry| entry.id.clone());
-
-    // Single forward pass in append order: a sub-agent entry joins the
-    // set when its parent is already included. A run's first entry
-    // anchors on the main path, later entries chain onto earlier ones of
-    // the same run, so one pass includes each on-path run whole. Only
-    // `Subagent` entries expand here. Expanding user entries too would
-    // pull in a sibling branch's first entry, whose parent is a common
-    // ancestor on the main path, and leak the abandoned branch.
-    //
-    // A meta entry hanging off the root is creation metadata about the whole
-    // session (its legacy environment baseline, its context). It is a sibling
-    // of the first message rather than an ancestor, and belongs to every branch.
-    for index in 0..log.len() {
-        let Some(entry) = log.entry_in_append_order(index) else {
-            continue;
-        };
-        let anchored_on_path = entry.thread == ThreadKind::Subagent
-            && entry
-                .parent_id
-                .as_ref()
-                .is_some_and(|parent| included.contains(parent));
-        let creation_metadata = entry.thread == ThreadKind::Meta
-            && entry.parent_id.is_some()
-            && entry.parent_id == root_id;
-        if anchored_on_path || creation_metadata {
-            included.insert(entry.id.clone());
-        }
-    }
-
-    Some(included)
 }
 
 impl Iterator for Replay<'_> {
@@ -400,21 +373,11 @@ impl Iterator for Replay<'_> {
                 return Some(event);
             }
 
-            if self.next_entry < self.log.len() {
-                let index = self.next_entry;
-                self.next_entry += 1;
-                if let Some(entry) = self.log.entry_in_append_order(index) {
-                    // Skip entries off the active path (sibling branches,
-                    // sub threads anchored on an abandoned branch).
-                    // Sub threads are excluded whole, never partially,
-                    // so an excluded run is simply never opened and the
-                    // bracketing stays balanced.
-                    let skip = self
-                        .included
-                        .as_ref()
-                        .is_some_and(|set| !set.contains(&entry.id));
+            if let Some((seq, thread, entry)) = self.log.range(self.next, self.end).next() {
+                self.next = seq + 1;
+                {
+                    let skip = !self.shows(thread, seq, entry);
                     if !skip {
-                        let seq = u64::try_from(index).expect("log index fits u64") + 1;
                         let keep = self.cursor.is_none_or(|cursor| seq > cursor);
                         // A dropped entry's events may not be tagged: its
                         // position is already applied by whoever offered
@@ -424,13 +387,12 @@ impl Iterator for Replay<'_> {
                             id: entry.id.clone(),
                         });
                         let mut projected = VecDeque::new();
-                        self.state.bracket_subagent(
-                            entry,
-                            at.clone(),
-                            keep,
-                            &self.live_subs,
-                            &mut projected,
-                        );
+                        let ended = |n: usize| self.ends.get(&n).is_some_and(|end| *end < seq);
+                        let after = |n: usize| keep && after_cursor(&self.ends, self.cursor, n);
+                        self.state
+                            .close_runs(ended, &self.live_subs, after, &mut projected);
+                        self.state
+                            .bracket_subagent(entry, at.clone(), keep, &mut projected);
                         self.state
                             .project_entry(entry, at, Some(self.log), &mut projected);
                         if keep {
@@ -443,14 +405,23 @@ impl Iterator for Replay<'_> {
 
             if !self.finished {
                 self.finished = true;
+                let after = |n: usize| after_cursor(&self.ends, self.cursor, n);
                 self.state
-                    .close_finished_runs(None, &self.live_subs, true, &mut self.pending);
+                    .close_runs(|_| true, &self.live_subs, after, &mut self.pending);
                 continue;
             }
 
             return None;
         }
     }
+}
+
+/// Whether run `n`'s last message lies after the cursor. A run without an
+/// end record that ended at or below it closes without events: whoever
+/// offered the cursor has seen all of it, and a view that starts after it
+/// never shows its box.
+fn after_cursor(ends: &HashMap<usize, u64>, cursor: Option<u64>, n: usize) -> bool {
+    cursor.is_none_or(|cursor| ends.get(&n).is_none_or(|end| *end > cursor))
 }
 
 /// Bracket state of one sub-agent run the walk has opened and not yet
@@ -475,9 +446,7 @@ struct OpenRun {
     /// How the run concluded, carried on the closing
     /// [`AgentEvent::SubAgentEnd`]. Every message of the run rewrites it
     /// (see [`ReplayState::bracket_subagent`]), so it speaks for the last
-    /// message the walk saw and not for the bracket as a whole. A
-    /// bracket holds all of the run's trailing entries, so this reads the
-    /// same however the run interleaves with other agents'.
+    /// message the walk saw and not for the bracket as a whole.
     conclusion: SubAgentConclusion,
 }
 
@@ -502,24 +471,20 @@ struct ReplayState {
     /// accumulator *as observed before* the next delta is emitted,
     /// matching the live agent's event order (see
     /// `aj_agent::Agent::prompt`: `UsageUpdate` carries the
-    /// pre-add total, and the per-turn delta is added afterwards).
+    /// pre-add total, and the per-response delta is added afterwards).
     usage_accumulators: HashMap<AgentId, Usage>,
     /// The sub-agent runs currently open, by `Sub(n)` index. Ordered so
     /// that closing several at once is deterministic.
     open_runs: BTreeMap<usize, OpenRun>,
+    /// The runs whose end record the walk has passed.
+    ended: HashSet<usize>,
     /// Every run the walk has entered, whether still open or already
     /// closed. Only the projected path contributes, which is what a caller
     /// concluding unconcluded runs needs (see [`Backfill::seen_subs`]).
     seen_subs: BTreeSet<usize>,
     /// The [`AgentEvent::SubAgentStart`] each sub-agent's run was opened
-    /// with, updated by settings edits and kept after the run closes.
-    ///
-    /// A background sub-agent's entries interleave with its parent's, so a
-    /// run the walk considers finished is closed at the parent's next entry
-    /// and re-opened at the sub's next one, with its spawn root well behind
-    /// us. Re-opening from the message alone would lose the task, the
-    /// background flag and the settings the root carries, and the client
-    /// would seed the child's footer from an empty settings snapshot.
+    /// with, updated by settings edits and kept after the run closes, so
+    /// a settings entry that trails the run still has a start to edit.
     spawned: HashMap<usize, AgentEvent>,
     /// Agents for which at least one `Message` entry has been
     /// projected. Notice-producing state entries emit a
@@ -529,7 +494,7 @@ struct ReplayState {
 }
 
 /// Default settings for a synthesized [`AgentEvent::SubAgentStart`]
-/// when the run carries no [`ConversationEntryKind::SubAgentSpawn`]
+/// when the run carries no [`LogEntryKind::SubAgentSpawn`]
 /// entry (legacy logs): empty provider/model, thinking "off", speed
 /// "standard".
 fn fallback_settings() -> AgentSettings {
@@ -559,8 +524,8 @@ fn fallback_settings() -> AgentSettings {
 /// on every message and this only speaks for assistant ones.
 ///
 /// This is how a resumed session tells a failed, truncated, or interrupted
-/// run from a clean one without a dedicated on-disk marker: the terminal
-/// message is persisted carrying the matching stop reason.
+/// run from a clean one when the run has no end record: the terminal
+/// message carries the matching stop reason.
 fn conclusion_from_stop_reason(stop_reason: &StopReason) -> SubAgentConclusion {
     match stop_reason {
         StopReason::Length => SubAgentConclusion::Truncated,
@@ -571,11 +536,13 @@ fn conclusion_from_stop_reason(stop_reason: &StopReason) -> SubAgentConclusion {
 
 /// Build the synthesized [`AgentEvent::SubAgentStart`] for sub-agent
 /// `n`. `background` is the persisted run mode (foreground for legacy
-/// logs and for balancing synthetic starts, which carry no mode).
+/// logs and for balancing synthetic starts, which carry no mode), and
+/// `call_id` the spawning call the entry names, if it names one.
 fn sub_start_event(
     n: usize,
     task: String,
     tool_name: String,
+    call_id: Option<String>,
     background: bool,
     settings: AgentSettings,
 ) -> AgentEvent {
@@ -584,6 +551,7 @@ fn sub_start_event(
         child: AgentId::Sub(n),
         task,
         tool_name,
+        call_id,
         background,
         settings,
     }
@@ -601,7 +569,7 @@ fn durable(at: Option<EntryRef>, event: AgentEvent) -> TaggedEvent {
 }
 
 /// One projected event that stands for no log entry of its own:
-/// bracketing frames and everything a live run emits without persisting.
+/// bracketing frames and everything a live agent emits without persisting.
 fn transient(event: AgentEvent) -> TaggedEvent {
     TaggedEvent {
         entry: None,
@@ -611,14 +579,26 @@ fn transient(event: AgentEvent) -> TaggedEvent {
 }
 
 impl ReplayState {
+    /// The state a walk of `log` starts from: the usage of the main
+    /// agent's responses before the log's window that the walk will not
+    /// meet. Empty for a log that holds its whole session.
+    fn carried(log: &LogSnapshot) -> Self {
+        let mut state = Self::default();
+        if let Some(usage) = log.carried() {
+            state
+                .usage_accumulators
+                .insert(AgentId::Main, usage.clone());
+        }
+        state
+    }
+
     /// Emit [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
     /// correlation events around a sub-agent's run, before the entry's
     /// own events are projected.
     ///
-    /// Transitions are keyed off `agent_id_for`: an entry for `Main` or a
-    /// different sub closes the runs that [`Self::close_finished_runs`]
-    /// considers finished. A message or spawn for a `Sub(n)` with no run
-    /// open opens one. The run's [`AgentEvent::SubAgentStart`] is emitted from its
+    /// A message or spawn for a `Sub(n)` with no run open opens one. The
+    /// caller closes the runs that have ended first (see
+    /// [`Self::close_runs`]). The run's [`AgentEvent::SubAgentStart`] is emitted from its
     /// `SubAgentSpawn` entry (task + settings snapshot); legacy logs
     /// whose sub threads lead with the task user message instead emit it
     /// at the run's first `Message` entry, with the task from its user
@@ -627,29 +607,34 @@ impl ReplayState {
     ///
     /// `keep` is false while the walk is dropping this entry's events (it
     /// sits at or below a suffix cursor), which is what makes the run's
-    /// start re-synthesizable later. `live_subs` is the set of runs whose
-    /// bracket must not be force-closed here.
+    /// start re-synthesizable later.
     fn bracket_subagent(
         &mut self,
-        entry: &ConversationEntry,
+        entry: &LogEntry,
         at: Option<EntryRef>,
         keep: bool,
-        live_subs: &BTreeSet<usize>,
         out: &mut VecDeque<TaggedEvent>,
     ) {
-        let Some(current) = agent_id_for(entry) else {
+        let Some(AgentId::Sub(n)) = agent_id_for(entry) else {
             return;
         };
-
-        let current_sub = match current {
-            AgentId::Sub(n) => Some(n),
-            AgentId::Main => None,
-        };
-        self.close_finished_runs(current_sub, live_subs, keep, out);
-
-        let Some(n) = current_sub else {
+        if let LogEntryKind::SubAgentEnd { conclusion, report } = &entry.entry {
+            // The run's own entry closes its box, as the live event it
+            // was written from did, and under the entry's position.
+            self.deliver_start(n, keep, out);
+            self.open_runs.remove(&n);
+            self.ended.insert(n);
+            out.push_back(durable(
+                at,
+                AgentEvent::SubAgentEnd {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(n),
+                    report: report.clone(),
+                    conclusion: *conclusion,
+                },
+            ));
             return;
-        };
+        }
         // Metadata must advance even when this entry is below the cursor.
         // Both cached starts can later reach the client.
         for start in self.spawned.get_mut(&n).into_iter().chain(
@@ -659,7 +644,7 @@ impl ReplayState {
         ) {
             if let AgentEvent::SubAgentStart { settings, .. } = start {
                 match &entry.entry {
-                    ConversationEntryKind::ModelChange {
+                    LogEntryKind::ModelChange {
                         provider,
                         model_id,
                         context_window,
@@ -668,33 +653,32 @@ impl ReplayState {
                         settings.model_id.clone_from(model_id);
                         settings.context_window = *context_window;
                     }
-                    ConversationEntryKind::ThinkingChange { level } => {
+                    LogEntryKind::ThinkingChange { level } => {
                         settings.thinking.clone_from(level);
                     }
                     _ => {}
                 }
             }
         }
-        if !matches!(
-            entry.entry,
-            ConversationEntryKind::Message { .. } | ConversationEntryKind::SubAgentSpawn { .. }
-        ) {
+        if !entry.entry.is_message() && !matches!(entry.entry, LogEntryKind::SubAgentSpawn { .. }) {
             self.deliver_start(n, keep, out);
             return;
         }
         self.seen_subs.insert(n);
+        if self.ended.contains(&n) {
+            // A later prompt to a finished sub-agent continues its thread
+            // without a bracket, as it does live.
+            return;
+        }
         let run = self.open_runs.entry(n).or_default();
-        if matches!(entry.entry, ConversationEntryKind::Message { .. }) {
+        if entry.entry.is_message() {
             // Every message of the run decides its conclusion afresh: an
             // assistant message overwrites this from its stop reason in
             // `capture_sub_report`, which runs on this same entry, while a
             // user or tool-result message leaves the clean close a run cut
-            // between inferences deserves. Resetting here rather than only
-            // when the bracket opens is what keeps the outcome a property
-            // of the run: a bracket that holds a `ToolUse` assistant
-            // message and the tool result answering it reads as the clean
-            // close it is, the same as when an interleaved entry splits
-            // the two into separate brackets.
+            // between inferences deserves: a run that ends on a `ToolUse`
+            // assistant message and the tool result answering it reads as
+            // the clean close it is.
             run.conclusion = SubAgentConclusion::Completed;
         }
         if run.start.is_some() {
@@ -705,9 +689,10 @@ impl ReplayState {
             return;
         }
         match &entry.entry {
-            ConversationEntryKind::SubAgentSpawn {
+            LogEntryKind::SubAgentSpawn {
                 task,
                 tool_name,
+                call_id,
                 background,
                 settings,
             } => {
@@ -717,6 +702,7 @@ impl ReplayState {
                         n,
                         task.clone(),
                         tool_name.clone(),
+                        call_id.clone(),
                         *background,
                         settings.clone(),
                     ),
@@ -725,21 +711,18 @@ impl ReplayState {
                     out,
                 );
             }
-            ConversationEntryKind::Message { .. } => {
-                // The run opens at one of its own messages, so its spawn
-                // entry is behind us: either an interleaved parent entry
-                // closed the bracket in between, or the log has no spawn
-                // entry at all (legacy logs lead with the task user
-                // message). The root's own start is the truth whenever we
-                // have seen one, and the legacy fallback reads the task off
-                // the user message and defaults the rest. Either way the
-                // start stays untagged: this entry's durable frame is its
-                // own `MessageEnd`.
+            LogEntryKind::Message { .. } => {
+                // The run opens at one of its own messages: the log has no
+                // spawn entry (legacy logs lead with the task user
+                // message). The fallback reads the task off the user
+                // message and defaults the rest. The start stays untagged:
+                // this entry's durable frame is its own `MessageEnd`.
                 let start = self.spawned.get(&n).cloned().unwrap_or_else(|| {
                     sub_start_event(
                         n,
                         subagent_task(entry),
                         String::new(),
+                        None,
                         false,
                         fallback_settings(),
                     )
@@ -749,22 +732,23 @@ impl ReplayState {
             // State entries ahead of any message don't open the
             // bracket; the first `Message` entry does. A compaction
             // marker likewise opens no bracket.
-            ConversationEntryKind::ModelChange { .. }
-            | ConversationEntryKind::OracleModelChange { .. }
-            | ConversationEntryKind::OracleThinkingChange { .. }
-            | ConversationEntryKind::OracleSpeedChange { .. }
-            | ConversationEntryKind::OracleVerbosityChange { .. }
-            | ConversationEntryKind::AccountChange { .. }
-            | ConversationEntryKind::ThinkingChange { .. }
-            | ConversationEntryKind::SpeedChange { .. }
-            | ConversationEntryKind::VerbosityChange { .. }
-            | ConversationEntryKind::EnvChange { .. }
-            | ConversationEntryKind::GoalChange { .. }
-            | ConversationEntryKind::CodeModeStore { .. }
-            | ConversationEntryKind::Context { .. }
-            | ConversationEntryKind::SystemPrompt { .. }
-            | ConversationEntryKind::Compaction { .. }
-            | ConversationEntryKind::CompactionFailed { .. } => {}
+            LogEntryKind::ModelChange { .. }
+            | LogEntryKind::OracleModelChange { .. }
+            | LogEntryKind::OracleThinkingChange { .. }
+            | LogEntryKind::OracleSpeedChange { .. }
+            | LogEntryKind::OracleVerbosityChange { .. }
+            | LogEntryKind::AccountChange { .. }
+            | LogEntryKind::ThinkingChange { .. }
+            | LogEntryKind::SpeedChange { .. }
+            | LogEntryKind::VerbosityChange { .. }
+            | LogEntryKind::EnvChange { .. }
+            | LogEntryKind::GoalChange { .. }
+            | LogEntryKind::CodeModeStore { .. }
+            | LogEntryKind::Context { .. }
+            | LogEntryKind::SystemPrompt { .. }
+            | LogEntryKind::SubAgentEnd { .. }
+            | LogEntryKind::Compaction { .. }
+            | LogEntryKind::CompactionFailed { .. } => {}
         }
     }
 
@@ -802,31 +786,33 @@ impl ReplayState {
         }
     }
 
-    /// Force-close every open run except the ones in `live_subs` and,
-    /// when the walk is entering `current`, that run.
+    /// Close every open run that `ended` names, except the ones in
+    /// `live_subs`.
     ///
-    /// A sub-agent's conclusion is never persisted, so this transition
-    /// heuristic is the only way a finished run's box gets concluded from
-    /// a log. It is right for a run that has finished and wrong for one
-    /// that is still going, which is exactly the distinction `live_subs`
-    /// carries: dead-log replay passes an empty set and closes
-    /// everything, while a live backfill keeps the host's running runs
-    /// open for their real `SubAgentEnd`.
-    fn close_finished_runs(
+    /// A run without an end record is concluded from where its entries
+    /// stop: the walk closes its box at the first entry it shows after the
+    /// run's last, or at the end of the log. Such a run is one recorded
+    /// before those existed, or dropped with its parent's cancelled turn.
+    /// A run its process abandoned is given an entry by the next open and
+    /// is not inferred. That is right for a run that has finished and
+    /// wrong for one that is still going, which is the distinction `live_subs`
+    /// carries: dead-log replay passes an empty set, while a live backfill
+    /// keeps the host's running runs open for their real `SubAgentEnd`.
+    fn close_runs(
         &mut self,
-        current: Option<usize>,
+        ended: impl Fn(usize) -> bool,
         live_subs: &BTreeSet<usize>,
-        keep: bool,
+        keep: impl Fn(usize) -> bool,
         out: &mut VecDeque<TaggedEvent>,
     ) {
         let finished: Vec<usize> = self
             .open_runs
             .keys()
             .copied()
-            .filter(|n| Some(*n) != current && !live_subs.contains(n))
+            .filter(|n| ended(*n) && !live_subs.contains(n))
             .collect();
         for n in finished {
-            self.close_run(n, keep, out);
+            self.close_run(n, keep(n), out);
         }
     }
 
@@ -839,12 +825,14 @@ impl ReplayState {
             return;
         };
         debug_assert!(run.start.is_some());
-        out.push_back(transient(AgentEvent::SubAgentEnd {
-            parent: AgentId::Main,
-            child: AgentId::Sub(n),
-            report: run.report,
-            conclusion: run.conclusion,
-        }));
+        if keep {
+            out.push_back(transient(AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(n),
+                report: run.report,
+                conclusion: run.conclusion,
+            }));
+        }
     }
 
     /// Translate one entry into zero or more events, appending them
@@ -856,12 +844,12 @@ impl ReplayState {
     /// of this entry is durable (see [`project_suffix`]).
     fn project_entry(
         &mut self,
-        entry: &ConversationEntry,
+        entry: &LogEntry,
         at: Option<EntryRef>,
         log: Option<&LogSnapshot>,
         out: &mut VecDeque<TaggedEvent>,
     ) {
-        if entry.thread == ThreadKind::User {
+        if entry.thread == ThreadKind::Main {
             // User messages do not change settings, so their snapshot is also
             // the parent-path baseline. Fold before the notice gate so silent
             // seed entries contribute just like visible settings changes.
@@ -869,7 +857,7 @@ impl ReplayState {
         }
         // The one meta entry with a face: the session's opening notice, on the
         // main agent and ahead of every message, which is where it stood live.
-        if let ConversationEntryKind::Context { context } = &entry.entry {
+        if let LogEntryKind::Context { context } = &entry.entry {
             out.push_back(durable(
                 at,
                 AgentEvent::Notice {
@@ -888,15 +876,15 @@ impl ReplayState {
         };
 
         match &entry.entry {
-            ConversationEntryKind::SystemPrompt { .. } => {
+            LogEntryKind::SystemPrompt { .. } => {
                 // Model-facing metadata; not user-visible.
             }
-            ConversationEntryKind::ModelChange {
+            LogEntryKind::ModelChange {
                 provider, model_id, ..
             }
-            | ConversationEntryKind::OracleModelChange { provider, model_id } => {
+            | LogEntryKind::OracleModelChange { provider, model_id } => {
                 let label = match &entry.entry {
-                    ConversationEntryKind::OracleModelChange { .. } => "Oracle model",
+                    LogEntryKind::OracleModelChange { .. } => "Oracle model",
                     _ => "Model",
                 };
                 self.settings_notice(
@@ -907,7 +895,7 @@ impl ReplayState {
                     out,
                 );
             }
-            ConversationEntryKind::AccountChange { provider, account } => {
+            LogEntryKind::AccountChange { provider, account } => {
                 let label = match account.as_deref() {
                     None => "Provider default",
                     Some("") => "Unnamed account",
@@ -915,10 +903,10 @@ impl ReplayState {
                 };
                 self.state_notice(agent_id, at, format!("{provider} account: {label}."), out);
             }
-            ConversationEntryKind::ThinkingChange { level }
-            | ConversationEntryKind::OracleThinkingChange { level } => {
+            LogEntryKind::ThinkingChange { level }
+            | LogEntryKind::OracleThinkingChange { level } => {
                 let label = match &entry.entry {
-                    ConversationEntryKind::OracleThinkingChange { .. } => "Oracle thinking effort",
+                    LogEntryKind::OracleThinkingChange { .. } => "Oracle thinking effort",
                     _ => "Thinking effort",
                 };
                 self.settings_notice(
@@ -929,25 +917,22 @@ impl ReplayState {
                     out,
                 );
             }
-            ConversationEntryKind::SpeedChange { speed }
-            | ConversationEntryKind::OracleSpeedChange { speed } => {
+            LogEntryKind::SpeedChange { speed } | LogEntryKind::OracleSpeedChange { speed } => {
                 let label = match &entry.entry {
-                    ConversationEntryKind::OracleSpeedChange { .. } => "Oracle speed",
+                    LogEntryKind::OracleSpeedChange { .. } => "Oracle speed",
                     _ => "Speed",
                 };
                 self.state_notice(agent_id, at, format!("{label} set to {speed}."), out);
             }
-            ConversationEntryKind::VerbosityChange { verbosity }
-            | ConversationEntryKind::OracleVerbosityChange { verbosity } => {
+            LogEntryKind::VerbosityChange { verbosity }
+            | LogEntryKind::OracleVerbosityChange { verbosity } => {
                 let label = match &entry.entry {
-                    ConversationEntryKind::OracleVerbosityChange { .. } => {
-                        "Oracle output verbosity"
-                    }
+                    LogEntryKind::OracleVerbosityChange { .. } => "Oracle output verbosity",
                     _ => "Output verbosity",
                 };
                 self.state_notice(agent_id, at, format!("{label} set to {verbosity}."), out);
             }
-            ConversationEntryKind::EnvChange { env } => {
+            LogEntryKind::EnvChange { env } => {
                 let keys = env
                     .keys()
                     .map(|key| format!("\"{}\"", key.escape_default()))
@@ -956,8 +941,8 @@ impl ReplayState {
                 self.state_notice(agent_id, at, format!("Environment set to [{keys}]."), out);
             }
             // Goals are carried by host state, not transcript events.
-            ConversationEntryKind::GoalChange { .. } => {}
-            ConversationEntryKind::CodeModeStore { writes } => {
+            LogEntryKind::GoalChange { .. } => {}
+            LogEntryKind::CodeModeStore { writes } => {
                 out.push_back(durable(
                     at,
                     AgentEvent::CodeModeStore {
@@ -966,15 +951,14 @@ impl ReplayState {
                     },
                 ));
             }
-            ConversationEntryKind::Context { .. } => {
+            LogEntryKind::Context { .. } => {
                 unreachable!("a context entry is projected before the thread is read")
             }
-            ConversationEntryKind::SubAgentSpawn { .. } => {
-                // Seed entry: projected as the synthesized
-                // SubAgentStart by `bracket_subagent`, never as a
-                // notice.
+            LogEntryKind::SubAgentSpawn { .. } | LogEntryKind::SubAgentEnd { .. } => {
+                // Projected as the run's `SubAgentStart` and `SubAgentEnd`
+                // by `bracket_subagent`, never as a notice.
             }
-            ConversationEntryKind::CompactionFailed {
+            LogEntryKind::CompactionFailed {
                 reason,
                 tokens_before,
                 error,
@@ -992,7 +976,7 @@ impl ReplayState {
                     },
                 ));
             }
-            ConversationEntryKind::Compaction {
+            LogEntryKind::Compaction {
                 tokens_before,
                 summary,
                 usage,
@@ -1012,8 +996,7 @@ impl ReplayState {
                     return;
                 };
                 let tokens_after =
-                    estimate_conversation_context(&log.linearize(&entry.id, ThreadFilter::USER))
-                        .tokens;
+                    estimate_branch_context(&log.linearize(&entry.id, ThreadFilter::MAIN)).tokens;
                 out.push_back(durable(
                     at,
                     AgentEvent::CompactionEnd {
@@ -1027,13 +1010,13 @@ impl ReplayState {
                     },
                 ));
             }
-            ConversationEntryKind::Message { message: agent_msg } => {
+            LogEntryKind::Message { message: agent_msg } => {
                 self.seen_message.insert(agent_id);
                 match &agent_msg.kind {
                     AgentMessageKind::Wire(Message::User(_))
                     | AgentMessageKind::TaskNotification(_)
                     | AgentMessageKind::InternalContext(_) => {
-                        // User prompts and task notices both replay as a
+                        // User prompts and task notifications both replay as a
                         // MessageStart/End pair around the entry, carrying the
                         // typed `AgentMessage` so the frontend rebuilds them on
                         // resume exactly as they rendered live. (The notice has
@@ -1069,7 +1052,7 @@ impl ReplayState {
                             self.project_tool_result(agent_id, at, agent_msg, tr, out);
                         }
                         Message::Assistant(assistant) => {
-                            // Audit calls are not inference turns: do not account
+                            // Audit calls are not inferences: do not account
                             // usage or replace a sub-agent's report. Paint starts
                             // here so an unfinished call remains visible on replay.
                             for block in &assistant.content {
@@ -1117,15 +1100,14 @@ impl ReplayState {
     fn settings_notice(
         &self,
         agent_id: AgentId,
-        entry: &ConversationEntryKind,
+        entry: &LogEntryKind,
         at: Option<EntryRef>,
         text: String,
         out: &mut VecDeque<TaggedEvent>,
     ) {
         if matches!(
             entry,
-            ConversationEntryKind::ModelChange { .. }
-                | ConversationEntryKind::ThinkingChange { .. }
+            LogEntryKind::ModelChange { .. } | LogEntryKind::ThinkingChange { .. }
         ) && let AgentId::Sub(n) = agent_id
             && let Some(AgentEvent::SubAgentStart { settings, .. }) = self.spawned.get(&n)
         {
@@ -1164,9 +1146,8 @@ impl ReplayState {
     ///
     /// Both overwrite rather than accumulate: the report is the most
     /// recent sub-agent assistant message's text, and the conclusion its
-    /// stop reason (see [`conclusion_from_stop_reason`]). The report is
-    /// bracket-scoped, so an interleaved run's box shows the report of its
-    /// last bracket. A no-op unless `agent_id` names an open run.
+    /// stop reason (see [`conclusion_from_stop_reason`]). A no-op unless
+    /// `agent_id` names an open run.
     fn capture_sub_report(
         &mut self,
         agent_id: AgentId,
@@ -1252,14 +1233,14 @@ impl ReplayState {
         // assistant message it holds the final report.
         self.capture_sub_report(agent_id, assistant);
 
-        // Synthesize the matching `UsageUpdate`. Live runs emit one
-        // per assistant turn on the bus; without this resumed
+        // Synthesize the matching `UsageUpdate`. The live agent emits one
+        // per assistant message on the bus; without this resumed
         // sessions would only paint the footer's context indicator
         // (and any other usage listener) starting from the first
         // post-resume turn, even though every persisted assistant
         // message has its `usage` on disk. Ordering matches the
         // live agent: `UsageUpdate.accumulated_*` reflects the total
-        // *before* this turn is folded in, then we add the per-turn
+        // *before* this message is folded in, then we add its
         // delta into the accumulator for the next emission.
         //
         // Only for an inference that completed, though. An attempt that
@@ -1272,7 +1253,7 @@ impl ReplayState {
         // what the entry records here is `stop_reason`.
         //
         // NOTE: the discriminator cannot be the token counts. A
-        // completed turn may legitimately report zero (a provider that
+        // completed response may legitimately report zero (a provider that
         // omits usage, and every scripted one), so "reported nothing"
         // and "reported zero" are the same state, and skipping on zero
         // would drop a `UsageUpdate` the live path did emit.
@@ -1295,7 +1276,7 @@ impl ReplayState {
     /// Project a tool_result message into a
     /// `ToolExecutionStart`/`End` pair (so the renderer paints the
     /// tool component) bracketed by a `MessageStart`/`End` pair (so
-    /// persistence/event-tape listeners see the same shape live runs
+    /// persistence/event-tape listeners see the same shape live agents
     /// produce). The `ToolDetails` payload is recovered through the session
     /// codec, falling back to a text-only synthesis off the wire content when
     /// absent or malformed.
@@ -1403,8 +1384,8 @@ fn text_fallback(tool_name: &str, content: &[UserContent]) -> ToolDetails {
 /// legacy logs without a `SubAgentSpawn` entry. That entry is the
 /// sub-agent's user prompt, whose concatenated text is the task; any
 /// other shape yields an empty task.
-fn subagent_task(entry: &ConversationEntry) -> String {
-    let ConversationEntryKind::Message { message } = &entry.entry else {
+fn subagent_task(entry: &LogEntry) -> String {
+    let LogEntryKind::Message { message } = &entry.entry else {
         return String::new();
     };
     let Some(Message::User(u)) = message.as_stored_wire() else {
@@ -1422,10 +1403,10 @@ fn subagent_task(entry: &ConversationEntry) -> String {
 /// Map an entry's [`ThreadKind`] / `agent_id` framing onto an
 /// [`AgentId`]. Returns `None` for [`ThreadKind::Meta`], whose
 /// entries (the system-prompt root) carry no user-visible payload.
-fn agent_id_for(entry: &ConversationEntry) -> Option<AgentId> {
+fn agent_id_for(entry: &LogEntry) -> Option<AgentId> {
     match entry.thread {
-        ThreadKind::User => Some(AgentId::Main),
-        ThreadKind::Subagent => entry.agent_id.map(AgentId::Sub),
+        ThreadKind::Main => Some(AgentId::Main),
+        ThreadKind::Sub => entry.agent_id.map(AgentId::Sub),
         ThreadKind::Meta => None,
     }
 }
@@ -1435,8 +1416,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::log::{ConversationLog, ConversationView};
-    use crate::persistence::ConversationPersistence;
+    use crate::log::{AgentLog, SessionLog};
+    use crate::persistence::ProjectSessions;
     use aj_agent::tool::DiffDetails;
     use aj_models::types::{
         AssistantContent, AssistantMessage, TextContent, ThinkingContent, ToolCall,
@@ -1477,19 +1458,19 @@ mod tests {
     #[test]
     fn oracle_settings_roundtrip_selected_ancestry_and_replay() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
         log.set_system_prompt("p".into()).unwrap();
-        log.append_model_change(ThreadFilter::USER, "main", "seed", 0)
+        log.append_model_change(ThreadFilter::MAIN, "main", "seed", 0)
             .unwrap();
-        log.append_thinking_change(ThreadFilter::USER, "medium")
+        log.append_thinking_change(ThreadFilter::MAIN, "medium")
             .unwrap();
-        log.append_speed_change(ThreadFilter::USER, "standard")
+        log.append_speed_change(ThreadFilter::MAIN, "standard")
             .unwrap();
-        log.append_verbosity_change(ThreadFilter::USER, "high")
+        log.append_verbosity_change(ThreadFilter::MAIN, "high")
             .unwrap();
         log.append_account_change("main", Some("work")).unwrap();
-        let legacy = ConversationView::user(&mut log)
+        let legacy = AgentLog::main(&mut log)
             .add_message(user_msg("legacy"))
             .unwrap();
         let change = log.append_oracle_model_change("openai", "oracle").unwrap();
@@ -1497,7 +1478,7 @@ mod tests {
         log.append_oracle_thinking_change("off").unwrap();
         log.append_oracle_speed_change("fast").unwrap();
         log.append_oracle_verbosity_change("low").unwrap();
-        let fork = ConversationView::user(&mut log)
+        let fork = AgentLog::main(&mut log)
             .add_message(user_msg("fork"))
             .unwrap();
         log.append_oracle_model_change("anthropic", "alternate")
@@ -1505,19 +1486,19 @@ mod tests {
         log.append_oracle_thinking_change("max").unwrap();
         log.append_oracle_speed_change("standard").unwrap();
         log.append_oracle_verbosity_change("default").unwrap();
-        let alternate = ConversationView::user(&mut log)
+        let alternate = AgentLog::main(&mut log)
             .add_message(user_msg("alternate"))
             .unwrap();
         log.set_head(fork.id.clone()).unwrap();
-        log.append_model_change(ThreadFilter::USER, "main", "changed", 0)
+        log.append_model_change(ThreadFilter::MAIN, "main", "changed", 0)
             .unwrap();
         log.append_oracle_thinking_change("high").unwrap();
-        let selected = ConversationView::user(&mut log)
+        let selected = AgentLog::main(&mut log)
             .add_message(user_msg("selected"))
             .unwrap();
         let session = log.session_id().to_string();
         drop(log);
-        let mut log = ConversationLog::resume(&persistence, &session).unwrap();
+        let mut log = SessionLog::resume(&persistence, &session).unwrap();
         assert_eq!(log.head(), Some(&selected.id));
         for (head, model, thinking, speed, verbosity) in [
             (&legacy.id, None, None, None, None),
@@ -1543,8 +1524,13 @@ mod tests {
                 Some("low"),
             ),
         ] {
+            // Settings are read off any branch. Selecting one takes holding it.
+            let settings = log.settings_at(head).unwrap();
+            if let Some(read) = log.branch_read(head).unwrap() {
+                log.install_branch(read.read().unwrap()).unwrap();
+            }
             log.set_head(head.clone()).unwrap();
-            let settings = log.settings_at(head);
+            assert_eq!(settings, log.settings_at(head).unwrap());
             assert_eq!(
                 settings.oracle_speed.as_deref(),
                 speed,
@@ -1613,13 +1599,13 @@ mod tests {
         for entry in log.entries_in_order() {
             if matches!(
                 entry.entry,
-                ConversationEntryKind::OracleModelChange { .. }
-                    | ConversationEntryKind::OracleThinkingChange { .. }
-                    | ConversationEntryKind::OracleSpeedChange { .. }
-                    | ConversationEntryKind::OracleVerbosityChange { .. }
+                LogEntryKind::OracleModelChange { .. }
+                    | LogEntryKind::OracleThinkingChange { .. }
+                    | LogEntryKind::OracleSpeedChange { .. }
+                    | LogEntryKind::OracleVerbosityChange { .. }
             ) {
-                assert_eq!(entry.thread, ThreadKind::User);
-                assert!(!entry.entry.is_punctuation());
+                assert_eq!(entry.thread, ThreadKind::Main);
+                assert!(!entry.entry.is_work());
             }
         }
     }
@@ -1627,18 +1613,18 @@ mod tests {
     #[test]
     fn branch_settings_follow_selected_ancestry_and_the_suffix_prefix() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).unwrap();
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).unwrap();
         let root = log.set_system_prompt("p".into()).unwrap();
-        log.append_model_change(ThreadFilter::USER, "provider", "seed", 0)
+        log.append_model_change(ThreadFilter::MAIN, "provider", "seed", 0)
             .unwrap();
-        log.append_thinking_change(ThreadFilter::USER, "high")
+        log.append_thinking_change(ThreadFilter::MAIN, "high")
             .unwrap();
         log.append_oracle_model_change("openai", "oracle").unwrap();
         log.append_oracle_thinking_change("low").unwrap();
         log.append_oracle_speed_change("fast").unwrap();
         log.append_oracle_verbosity_change("high").unwrap();
-        let first = ConversationView::user(&mut log)
+        let first = AgentLog::main(&mut log)
             .add_message(user_msg("first"))
             .unwrap();
         let expected = SessionSettings {
@@ -1650,9 +1636,9 @@ mod tests {
             oracle_verbosity: Some("high".into()),
             ..SessionSettings::default()
         };
-        log.append_model_change(ThreadFilter::USER, "abandoned", "model", 0)
+        log.append_model_change(ThreadFilter::MAIN, "abandoned", "model", 0)
             .unwrap();
-        log.append_thinking_change(ThreadFilter::USER, "off")
+        log.append_thinking_change(ThreadFilter::MAIN, "off")
             .unwrap();
         log.append_oracle_model_change("anthropic", "abandoned")
             .unwrap();
@@ -1661,7 +1647,7 @@ mod tests {
         log.append_oracle_verbosity_change("low").unwrap();
         log.append_account_change("abandoned", Some("account"))
             .unwrap();
-        let abandoned = ConversationView::user(&mut log)
+        let abandoned = AgentLog::main(&mut log)
             .add_message(user_msg("abandoned"))
             .unwrap();
 
@@ -1680,7 +1666,7 @@ mod tests {
 
         let checkpoint = log
             .append_compaction(
-                ThreadFilter::USER,
+                ThreadFilter::MAIN,
                 "summary".into(),
                 first.id.clone(),
                 Vec::new(),
@@ -1689,7 +1675,7 @@ mod tests {
                 aj_models::types::Usage::default(),
             )
             .unwrap();
-        let sibling = ConversationView::user(&mut log)
+        let sibling = AgentLog::main(&mut log)
             .add_message(user_msg("sibling"))
             .unwrap();
         for cursor in [
@@ -1729,8 +1715,8 @@ mod tests {
                         || tagged.branch_settings.is_none())
             }));
         }
-        assert_eq!(log.settings_at(&first.id), expected);
-        assert_eq!(log.settings_at(&sibling.id), expected);
+        assert_eq!(log.settings_at(&first.id).unwrap(), expected);
+        assert_eq!(log.settings_at(&sibling.id).unwrap(), expected);
         assert_eq!(
             log.head(),
             Some(&sibling.id),
@@ -1738,7 +1724,7 @@ mod tests {
         );
 
         log.set_head(root.id).unwrap();
-        let fresh = ConversationView::user(&mut log)
+        let fresh = AgentLog::main(&mut log)
             .add_message(user_msg("from root"))
             .unwrap();
         let projected = collect_suffix(&log.snapshot(), Some(sibling.seq), &BTreeSet::new());
@@ -1782,15 +1768,15 @@ mod tests {
 
     fn replay_events_with_raw_tool_details(details: Value) -> Vec<AgentEvent> {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
 
         let mut result = ToolResultMessage::text("tu-edit", "edit_file", "edited", false);
         result.timestamp = 42;
         result.details = Some(details);
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("edit it")).expect("user message");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
                 is_raw: false,
@@ -1820,13 +1806,13 @@ mod tests {
 
     /// The context a session was created with opens its replay: once, on the
     /// main agent, ahead of the first message, tagged with its own entry so a
-    /// re-attach dedups it, and rendered by the record's one renderer. It
+    /// re-attach dedups it, and rendered by the entry's one renderer. It
     /// survives a reopen and stays on every branch, being a fact about the
     /// session rather than about any head.
     #[test]
     fn the_recorded_context_opens_every_replay_of_the_session() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let context = crate::log::SessionContext {
             system_prompt: None,
             files: vec![crate::log::ContextFileRecord {
@@ -1841,14 +1827,14 @@ mod tests {
             }],
         };
         let (session_id, first, context_id) = {
-            let mut log = ConversationLog::create(&persistence).expect("create log");
+            let mut log = SessionLog::create(&persistence).expect("create log");
             log.set_system_prompt("p".into()).expect("sp");
             let context_id = log
                 .append_context(context.clone())
                 .expect("context record")
                 .id;
             let first = {
-                let mut view = ConversationView::user(&mut log);
+                let mut view = AgentLog::main(&mut log);
                 view.add_message(user_msg("first branch"))
                     .expect("user message");
                 view.add_message(assistant_msg(vec![AssistantContent::Text(
@@ -1860,7 +1846,7 @@ mod tests {
             (log.session_id().to_string(), first, context_id)
         };
 
-        let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let mut resumed = SessionLog::resume(&persistence, &session_id).expect("resume");
         let opening = |events: &[TaggedEvent]| -> (Option<String>, String) {
             let head = events.first().expect("a replay with entries");
             match &head.event {
@@ -1901,7 +1887,7 @@ mod tests {
             .set_head(resumed.system_prompt_id().cloned().expect("root"))
             .expect("branch from the root");
         {
-            let mut view = ConversationView::user(&mut resumed);
+            let mut view = AgentLog::main(&mut resumed);
             view.add_message(user_msg("second branch"))
                 .expect("user message");
         }
@@ -1920,11 +1906,11 @@ mod tests {
         use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
 
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("user message");
             view.add_message(AgentMessage::task_notification(TaskNotification::new(
                 "cargo build".into(),
@@ -1977,13 +1963,13 @@ mod tests {
 
     /// Build a seeded log exercising assistant text, thinking, tool
     /// use, and tool result with structured details.
-    fn seeded_log() -> (TempDir, ConversationLog) {
+    fn seeded_log() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("system prompt");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("user msg");
             view.add_message(assistant_msg_with_account(
                 vec![
@@ -2018,7 +2004,7 @@ mod tests {
         let snapshot = log.snapshot();
         let mut events = Replay::new(&snapshot);
 
-        assert_eq!(events.next_entry, 0);
+        assert_eq!(events.next, 1);
         assert!(events.pending.is_empty());
         assert!(events.state.seen_message.is_empty());
         assert!(events.state.tool_calls.is_empty());
@@ -2031,7 +2017,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(events.next_entry, 2);
+        assert_eq!(events.next, 3);
         assert_eq!(events.pending.len(), 1);
         assert!(events.state.tool_calls.is_empty());
         assert!(events.state.usage_accumulators.is_empty());
@@ -2138,8 +2124,8 @@ mod tests {
         // A log with only the system-prompt root produces zero
         // events: meta entries are structural framing.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into())
             .expect("set system prompt");
 
@@ -2156,14 +2142,14 @@ mod tests {
         // todo snapshots / sub-agent reports the same way live
         // runs do.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let diff_details = ToolDetails::Diff(DiffDetails::new("/tmp/x", "a", "b"));
 
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("edit it")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
                 is_raw: false,
@@ -2383,12 +2369,12 @@ mod tests {
     #[test]
     fn replay_routes_subagent_entries_to_sub_agent_id() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2399,7 +2385,7 @@ mod tests {
         };
 
         {
-            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            let mut view = AgentLog::sub(&mut log, user_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "reply".into(),
@@ -2420,12 +2406,12 @@ mod tests {
     #[test]
     fn replay_brackets_subagent_run_with_start_and_end() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2436,7 +2422,7 @@ mod tests {
         };
 
         {
-            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            let mut view = AgentLog::sub(&mut log, user_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "reply".into(),
@@ -2505,14 +2491,14 @@ mod tests {
 
     /// Build a log with one blocking sub-agent run whose final assistant
     /// message carries `stop_reason`.
-    fn subagent_log_with_stop_reason(stop_reason: StopReason) -> ConversationLog {
+    fn subagent_log_with_stop_reason(stop_reason: StopReason) -> SessionLog {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2523,7 +2509,7 @@ mod tests {
         };
 
         {
-            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            let mut view = AgentLog::sub(&mut log, user_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::Text(TextContent {
@@ -2588,14 +2574,14 @@ mod tests {
     /// keeps each run's pair contiguous (`a` call, `a` result, `b` call,
     /// `b` result). Nothing else differs, so a difference in what replays
     /// out of the two logs is one the interleaving alone caused.
-    fn log_with_two_aborted_subs(grouped: bool) -> (TempDir, ConversationLog) {
+    fn log_with_two_aborted_subs(grouped: bool) -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let parent_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("run two checks")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2611,6 +2597,7 @@ mod tests {
                 parent_head.clone(),
                 "first task",
                 "agent",
+                None,
                 false,
                 &sub_settings(),
             )
@@ -2621,6 +2608,7 @@ mod tests {
                 parent_head,
                 "second task",
                 "agent",
+                None,
                 false,
                 &other_sub_settings(),
             )
@@ -2670,7 +2658,7 @@ mod tests {
         };
         for (n, message) in steps {
             let head = heads[n - 1].clone();
-            let mut view = ConversationView::subagent(&mut log, head, n);
+            let mut view = AgentLog::sub(&mut log, head, n);
             view.add_message(message).expect("sub message");
             heads[n - 1] = view.head().cloned().expect("sub head");
         }
@@ -2724,7 +2712,7 @@ mod tests {
         }
     }
 
-    /// A normal multi-turn sub-agent run has intermediate `ToolUse`
+    /// A normal multi-round sub-agent run has intermediate `ToolUse`
     /// assistant messages but ends on `Stop`. The conclusion tracks the
     /// last assistant message, so the trailing `Stop` wins and the run
     /// reconstructs `Completed`, not `Failed`. This pins the overwrite
@@ -2732,12 +2720,12 @@ mod tests {
     #[test]
     fn replay_reconstructs_completed_for_a_tool_using_run_ending_in_stop() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2748,7 +2736,7 @@ mod tests {
         };
 
         {
-            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            let mut view = AgentLog::sub(&mut log, user_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
             // Intermediate tool-use inference (would map to Failed if it
             // were the terminal).
@@ -2784,12 +2772,12 @@ mod tests {
         // build the resuming main activity by appending to the user
         // thread head captured before the sub run.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2800,7 +2788,7 @@ mod tests {
         };
 
         {
-            let mut view = ConversationView::subagent(&mut log, user_head.clone(), 1);
+            let mut view = AgentLog::sub(&mut log, user_head.clone(), 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "reply".into(),
@@ -2811,7 +2799,7 @@ mod tests {
 
         // Resume main activity after the sub run.
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "back on main".into(),
                 text_signature: None,
@@ -2860,10 +2848,10 @@ mod tests {
         // message. Replay still emits a sensible event with the
         // fallback "tool" name and an empty args object.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             // Insert the tool_result with no preceding tool_call.
             view.add_message(tool_result_msg("orphan", "", "body", None))
                 .expect("orphan tr");
@@ -2911,19 +2899,19 @@ mod tests {
         }))
     }
 
-    /// Two persisted main-agent assistant turns produce two
+    /// Two persisted main-agent assistant messages produce two
     /// synthesized `UsageUpdate` events. The first carries its
-    /// per-turn deltas against a zero accumulator; the second
+    /// deltas against a zero accumulator; the second
     /// carries its deltas against an accumulator equal to the
-    /// first turn's contribution (live-agent ordering: emit
+    /// first message's contribution (live-agent ordering: emit
     /// before adding into the accumulator).
     #[test]
     fn replay_synthesizes_usage_update_per_assistant_message() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
                     text: "first".into(),
@@ -2994,11 +2982,11 @@ mod tests {
     #[test]
     fn replay_compaction_projects_reduced_occupancy_and_recorded_usage() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
 
         let first_kept = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("old request")).expect("u0");
             // The retained assistant reports a large (pre-compaction)
             // prompt; after compaction this usage is stale.
@@ -3028,7 +3016,7 @@ mod tests {
             kept.id
         };
         log.append_compaction(
-            ThreadFilter::USER,
+            ThreadFilter::MAIN,
             "PRICED SUMMARY".into(),
             first_kept,
             Vec::new(),
@@ -3104,11 +3092,11 @@ mod tests {
     #[test]
     fn replay_keeps_main_and_subagent_usage_accumulators_separate() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
@@ -3125,7 +3113,7 @@ mod tests {
         };
 
         {
-            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            let mut view = AgentLog::sub(&mut log, user_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
@@ -3175,21 +3163,21 @@ mod tests {
     #[test]
     fn replay_keeps_seed_settings_entries_silent() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
-        log.append_model_change(crate::log::ThreadFilter::USER, "anthropic", "claude-x", 0)
+        log.append_model_change(crate::log::ThreadFilter::MAIN, "anthropic", "claude-x", 0)
             .expect("mc");
-        log.append_thinking_change(crate::log::ThreadFilter::USER, "high")
+        log.append_thinking_change(crate::log::ThreadFilter::MAIN, "high")
             .expect("tc");
-        log.append_speed_change(crate::log::ThreadFilter::USER, "fast")
+        log.append_speed_change(crate::log::ThreadFilter::MAIN, "fast")
             .expect("sc");
         log.append_oracle_model_change("openai", "oracle").unwrap();
         log.append_oracle_thinking_change("off").unwrap();
         log.append_oracle_speed_change("standard").unwrap();
         log.append_oracle_verbosity_change("default").unwrap();
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
         }
 
@@ -3205,13 +3193,13 @@ mod tests {
     #[test]
     fn account_notices_follow_settings_gating_branch_selection_and_suffix_tags() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create");
         log.set_system_prompt("p".into()).expect("root");
         let seed = log
             .append_account_change("openai", Some("seed"))
             .expect("seed");
-        let fork = ConversationView::user(&mut log)
+        let fork = AgentLog::main(&mut log)
             .add_message(user_msg("hi"))
             .expect("message");
         let abandoned = log
@@ -3229,10 +3217,10 @@ mod tests {
                 .expect("change");
             expected.push((at, format!("{provider} account: {label}.")));
         }
-        ConversationView::user(&mut log)
+        AgentLog::main(&mut log)
             .add_message(user_msg("publish"))
             .expect("message");
-        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        let resumed = SessionLog::resume(&persistence, log.session_id()).expect("resume");
         let snapshot = resumed.snapshot();
         assert!(snapshot.project_state_entry(&seed.id).is_none());
         assert!(snapshot.project_state_entry(&abandoned.id).is_none());
@@ -3275,9 +3263,9 @@ mod tests {
     #[test]
     fn replay_keeps_a_resumed_env_seed_silent_and_never_projects_its_value() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let session_id = {
-            let mut log = ConversationLog::create(&persistence).expect("create log");
+            let mut log = SessionLog::create(&persistence).expect("create log");
             log.set_system_prompt("p".into()).expect("sp");
             log.append_env_change(BTreeMap::from([
                 ("BEADS_ACTOR".to_string(), "azurite".to_string()),
@@ -3285,12 +3273,12 @@ mod tests {
             ]))
             .expect("env seed");
             {
-                let mut view = ConversationView::user(&mut log);
+                let mut view = AgentLog::main(&mut log);
                 view.add_message(user_msg("hi")).expect("flush seed");
             }
             log.session_id().to_string()
         };
-        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let resumed = SessionLog::resume(&persistence, &session_id).expect("resume");
 
         let events: Vec<AgentEvent> = replay(&resumed).collect();
         assert_eq!(
@@ -3318,21 +3306,21 @@ mod tests {
     #[test]
     fn replay_env_edits_emit_only_ascii_escaped_keys_and_match_state_projection() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create");
         let root = log.set_system_prompt("p".into()).expect("root");
         let legacy = log
             .append(
                 Some(root.id),
                 ThreadKind::Meta,
                 None,
-                ConversationEntryKind::EnvChange {
+                LogEntryKind::EnvChange {
                     env: BTreeMap::from([("LEGACY".into(), "legacy-secret".into())]),
                 },
             )
             .expect("legacy baseline");
         let seed = log.append_env_change(BTreeMap::new()).expect("seed");
-        ConversationView::user(&mut log)
+        AgentLog::main(&mut log)
             .add_message(user_msg("hi"))
             .expect("publish");
         let edit = log
@@ -3342,8 +3330,7 @@ mod tests {
             )]))
             .expect("edit");
         let clear = log.append_env_change(BTreeMap::new()).expect("clear");
-        log.flush_pending().expect("flush");
-        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        let resumed = SessionLog::resume(&persistence, log.session_id()).expect("resume");
         let snapshot = resumed.snapshot();
         assert!(snapshot.project_state_entry(&legacy.id).is_none());
         assert!(snapshot.project_state_entry(&seed.id).is_none());
@@ -3384,18 +3371,18 @@ mod tests {
     #[test]
     fn replay_emits_notice_for_mid_session_settings_entries() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
         }
-        log.append_model_change(crate::log::ThreadFilter::USER, "openai", "gpt-x", 0)
+        log.append_model_change(crate::log::ThreadFilter::MAIN, "openai", "gpt-x", 0)
             .expect("mc");
-        log.append_thinking_change(crate::log::ThreadFilter::USER, "medium")
+        log.append_thinking_change(crate::log::ThreadFilter::MAIN, "medium")
             .expect("tc");
-        log.append_speed_change(crate::log::ThreadFilter::USER, "fast")
+        log.append_speed_change(crate::log::ThreadFilter::MAIN, "fast")
             .expect("sc");
 
         let events: Vec<AgentEvent> = replay(&log).collect();
@@ -3426,12 +3413,12 @@ mod tests {
     #[test]
     fn replay_subagent_spawn_entry_drives_sub_agent_start() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -3450,13 +3437,13 @@ mod tests {
             speed: "fast".into(),
             verbosity: "high".into(),
         };
-        log.append_subagent_spawn(1, user_head, "subtask", "agent", true, &settings)
+        log.append_subagent_spawn(1, user_head, "subtask", "agent", None, true, &settings)
             .expect("spawn entry");
         {
             let sub_head = log
-                .latest_leaf(crate::log::ThreadFilter::subagent(1))
+                .latest_leaf(crate::log::ThreadFilter::sub(1))
                 .expect("sub leaf");
-            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            let mut view = AgentLog::sub(&mut log, sub_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "reply".into(),
@@ -3514,12 +3501,12 @@ mod tests {
     #[test]
     fn replay_foreground_spawn_entry_stays_foreground() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.head().cloned().expect("head present")
         };
@@ -3532,13 +3519,13 @@ mod tests {
             speed: "fast".into(),
             verbosity: "high".into(),
         };
-        log.append_subagent_spawn(1, user_head, "subtask", "agent", false, &settings)
+        log.append_subagent_spawn(1, user_head, "subtask", "agent", None, false, &settings)
             .expect("spawn entry");
         {
             let sub_head = log
-                .latest_leaf(crate::log::ThreadFilter::subagent(1))
+                .latest_leaf(crate::log::ThreadFilter::sub(1))
                 .expect("sub leaf");
-            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            let mut view = AgentLog::sub(&mut log, sub_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
         }
 
@@ -3566,12 +3553,12 @@ mod tests {
     #[test]
     fn replay_subagent_with_leading_settings_entries_brackets_via_legacy_path() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -3585,21 +3572,21 @@ mod tests {
         // appends, then the task message and a reply.
         log.append(
             Some(user_head),
-            crate::log::ThreadKind::Subagent,
+            crate::log::ThreadKind::Sub,
             Some(1),
-            ConversationEntryKind::ModelChange {
+            LogEntryKind::ModelChange {
                 provider: "anthropic".into(),
                 model_id: "claude-x".into(),
                 context_window: 0,
             },
         )
         .expect("mc");
-        let sub = crate::log::ThreadFilter::subagent(1);
+        let sub = crate::log::ThreadFilter::sub(1);
         log.append_thinking_change(sub, "high").expect("tc");
         log.append_speed_change(sub, "fast").expect("sc");
         {
             let sub_head = log.latest_leaf(sub).expect("sub leaf");
-            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            let mut view = AgentLog::sub(&mut log, sub_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "reply".into(),
@@ -3657,17 +3644,17 @@ mod tests {
     #[test]
     fn replay_subagent_legacy_log_uses_fallback_settings() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.head().cloned().expect("head present")
         };
         {
-            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            let mut view = AgentLog::sub(&mut log, user_head, 1);
             view.add_message(user_msg("subtask")).expect("u");
         }
 
@@ -3694,14 +3681,14 @@ mod tests {
     /// Build a log with a main thread and one foreground sub-agent run
     /// that produces assistant text, a tool call, a tool result, and a
     /// concluding report, then main resumes.
-    fn log_with_foreground_sub() -> (TempDir, ConversationLog) {
+    fn log_with_foreground_sub() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -3720,13 +3707,11 @@ mod tests {
             speed: "fast".into(),
             verbosity: "default".into(),
         };
-        log.append_subagent_spawn(1, user_head, "subtask", "agent", false, &settings)
+        log.append_subagent_spawn(1, user_head, "subtask", "agent", None, false, &settings)
             .expect("spawn");
         {
-            let sub_leaf = log
-                .latest_leaf(ThreadFilter::subagent(1))
-                .expect("sub leaf");
-            let mut view = ConversationView::subagent(&mut log, sub_leaf, 1);
+            let sub_leaf = log.latest_leaf(ThreadFilter::sub(1)).expect("sub leaf");
+            let mut view = AgentLog::sub(&mut log, sub_leaf, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
                 is_raw: false,
@@ -3746,7 +3731,7 @@ mod tests {
 
         // Main resumes after the sub run.
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "back on main".into(),
                 text_signature: None,
@@ -3762,14 +3747,14 @@ mod tests {
     /// while it is still open, then the sub concludes and main
     /// concludes. In append order the sub's entries straddle a main
     /// entry, so full replay opens and closes the sub bracket twice.
-    fn log_with_background_sub() -> (TempDir, ConversationLog) {
+    fn log_with_background_sub() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -3781,13 +3766,21 @@ mod tests {
 
         let settings = super::fallback_settings();
         let mut sub_head = log
-            .append_subagent_spawn(1, user_head.clone(), "bg subtask", "agent", true, &settings)
+            .append_subagent_spawn(
+                1,
+                user_head.clone(),
+                "bg subtask",
+                "agent",
+                None,
+                true,
+                &settings,
+            )
             .expect("spawn")
             .id;
 
         // First sub turn.
         sub_head = {
-            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            let mut view = AgentLog::sub(&mut log, sub_head, 1);
             view.add_message(user_msg("bg subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub step one".into(),
@@ -3800,7 +3793,7 @@ mod tests {
         // Main takes a turn while the background sub is still open, so
         // the sub's remaining entry lands after this one in append order.
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "main while bg runs".into(),
                 text_signature: None,
@@ -3810,7 +3803,7 @@ mod tests {
 
         // Sub resumes and concludes.
         {
-            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            let mut view = AgentLog::sub(&mut log, sub_head, 1);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "bg final report".into(),
                 text_signature: None,
@@ -3820,7 +3813,7 @@ mod tests {
 
         // Main concludes.
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "main done".into(),
                 text_signature: None,
@@ -3849,16 +3842,13 @@ mod tests {
         assert_eq!(sub_reports(&full), vec!["final sub report".to_string()]);
     }
 
-    /// A background sub whose entries interleave with the parent's opens
-    /// and closes its bracket twice, reporting per bracket.
+    /// A background sub whose entries interleave with the parent's keeps
+    /// one bracket and reports once, with its final text.
     #[test]
-    fn replay_reports_each_bracket_of_an_interleaved_background_sub() {
+    fn replay_reports_an_interleaved_background_sub_once() {
         let (_dir, log) = log_with_background_sub();
         let full: Vec<AgentEvent> = replay(&log).collect();
-        assert_eq!(
-            sub_reports(&full),
-            vec!["sub step one".to_string(), "bg final report".to_string()],
-        );
+        assert_eq!(sub_reports(&full), vec!["bg final report".to_string()]);
     }
 
     /// The concatenated text of every `MessageEnd` for `agent` (user
@@ -3920,22 +3910,22 @@ mod tests {
 
     #[test]
     fn path_aware_replay_excludes_sibling_branch() {
-        // Two user-thread branches off a common parent. Replay must
+        // Two main-thread branches off a common parent. Replay must
         // project only the branch the head is on, not the sibling. This
         // pins the concurrent-writer interleaving fix.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let common = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("common")).expect("common").id
         };
 
         // Branch A off the common parent.
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("alpha")).expect("alpha");
         }
         let alpha = log.head().cloned().expect("alpha head");
@@ -3943,7 +3933,7 @@ mod tests {
         // Rewind and grow branch B off the same parent (a sibling on disk).
         log.set_head(common).expect("rewind to common");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("beta")).expect("beta");
         }
         let beta = log.head().cloned().expect("beta head");
@@ -3968,18 +3958,18 @@ mod tests {
     #[test]
     fn path_aware_replay_includes_sub_on_path_excludes_sub_on_abandoned_branch() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let common = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("common")).expect("common").id
         };
 
-        // Branch A: an assistant turn that spawns sub-agent 1.
+        // Branch A: an assistant message that spawns sub-agent 1.
         let a_a = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "branch A".into(),
                 text_signature: None,
@@ -3993,13 +3983,14 @@ mod tests {
                 a_a.clone(),
                 "sub A task",
                 "agent",
+                None,
                 false,
                 &fallback_settings(),
             )
             .expect("spawn 1")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, spawn_a, 1);
+            let mut view = AgentLog::sub(&mut log, spawn_a, 1);
             view.add_message(user_msg("sub A prompt")).expect("sub a u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub A report".into(),
@@ -4008,10 +3999,10 @@ mod tests {
             .expect("sub a a");
         }
 
-        // Branch B off the common parent: another assistant turn spawns sub 2.
+        // Branch B off the common parent: another assistant message spawns sub 2.
         log.set_head(common).expect("rewind to common");
         let a_b = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "branch B".into(),
                 text_signature: None,
@@ -4020,11 +4011,19 @@ mod tests {
             .id
         };
         let spawn_b = log
-            .append_subagent_spawn(2, a_b, "sub B task", "agent", false, &fallback_settings())
+            .append_subagent_spawn(
+                2,
+                a_b,
+                "sub B task",
+                "agent",
+                None,
+                false,
+                &fallback_settings(),
+            )
             .expect("spawn 2")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, spawn_b, 2);
+            let mut view = AgentLog::sub(&mut log, spawn_b, 2);
             view.add_message(user_msg("sub B prompt")).expect("sub b u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub B report".into(),
@@ -4065,18 +4064,18 @@ mod tests {
         // the active branch may replay, even though the abandoned run
         // carries the same id.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let common = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("common")).expect("common").id
         };
 
-        // Branch A: an assistant turn spawns sub-agent 1.
+        // Branch A: an assistant message spawns sub-agent 1.
         let a_a = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "branch A".into(),
                 text_signature: None,
@@ -4090,13 +4089,14 @@ mod tests {
                 a_a.clone(),
                 "sub A task",
                 "agent",
+                None,
                 false,
                 &fallback_settings(),
             )
             .expect("spawn A")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, spawn_a, 1);
+            let mut view = AgentLog::sub(&mut log, spawn_a, 1);
             view.add_message(user_msg("sub A prompt")).expect("sub a u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub A report".into(),
@@ -4105,11 +4105,11 @@ mod tests {
             .expect("sub a a");
         }
 
-        // Branch B off the common parent: another assistant turn spawns a
+        // Branch B off the common parent: another assistant message spawns a
         // sub-agent reusing the SAME id 1, the collision this test pins.
         log.set_head(common).expect("rewind to common");
         let a_b = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "branch B".into(),
                 text_signature: None,
@@ -4118,11 +4118,19 @@ mod tests {
             .id
         };
         let spawn_b = log
-            .append_subagent_spawn(1, a_b, "sub B task", "agent", false, &fallback_settings())
+            .append_subagent_spawn(
+                1,
+                a_b,
+                "sub B task",
+                "agent",
+                None,
+                false,
+                &fallback_settings(),
+            )
             .expect("spawn B")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, spawn_b, 1);
+            let mut view = AgentLog::sub(&mut log, spawn_b, 1);
             view.add_message(user_msg("sub B prompt")).expect("sub b u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub B report".into(),
@@ -4170,16 +4178,16 @@ mod tests {
         // SubAgentSpawn root). Anchored on the active path, it must
         // still be included.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("common")).expect("common");
         }
         let a1 = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
                 text_signature: None,
@@ -4190,7 +4198,7 @@ mod tests {
         // Legacy sub thread: first entry is the task user message,
         // anchored at the active-path assistant message.
         {
-            let mut view = ConversationView::subagent(&mut log, a1, 1);
+            let mut view = AgentLog::sub(&mut log, a1, 1);
             view.add_message(user_msg("legacy sub task"))
                 .expect("sub u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
@@ -4222,20 +4230,20 @@ mod tests {
     /// A log that exercises every projection shape the durable tagging
     /// rules care about, with a sub-agent run left open at end of log.
     ///
-    /// Append positions, which the suffix tests use as cursors:
+    /// Positions, which the suffix tests use as cursors:
     /// 1 system prompt, 2 seed model change, 3 user, 4 assistant with a
     /// tool call, 5 tool result, 6 mid-session thinking change,
     /// 7 assistant, 8 compaction, 9 sub-agent spawn root, 10 sub user,
     /// 11 sub assistant.
-    fn open_sub_log() -> (TempDir, ConversationLog) {
+    fn open_sub_log() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
-        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x", 0)
+        log.append_model_change(ThreadFilter::MAIN, "anthropic", "claude-x", 0)
             .expect("seed model change");
         let first_kept = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             let user = view.add_message(user_msg("hi")).expect("user msg");
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::ToolCall(ToolCall {
@@ -4254,10 +4262,10 @@ mod tests {
                 .expect("tool result");
             user.id
         };
-        log.append_thinking_change(ThreadFilter::USER, "high")
+        log.append_thinking_change(ThreadFilter::MAIN, "high")
             .expect("mid-session thinking change");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
                     text: "done".into(),
@@ -4271,7 +4279,7 @@ mod tests {
             .expect("second assistant");
         }
         log.append_compaction(
-            ThreadFilter::USER,
+            ThreadFilter::MAIN,
             "summary".into(),
             first_kept,
             Vec::new(),
@@ -4282,10 +4290,18 @@ mod tests {
         .expect("compaction");
         let parent_head = log.head().cloned().expect("head present");
         let spawn = log
-            .append_subagent_spawn(1, parent_head, "do thing", "oracle", true, &sub_settings())
+            .append_subagent_spawn(
+                1,
+                parent_head,
+                "do thing",
+                "oracle",
+                None,
+                true,
+                &sub_settings(),
+            )
             .expect("spawn root");
         {
-            let mut view = ConversationView::subagent(&mut log, spawn.id, 1);
+            let mut view = AgentLog::sub(&mut log, spawn.id, 1);
             view.add_message(user_msg("subtask")).expect("sub user");
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
@@ -4334,18 +4350,18 @@ mod tests {
     /// Two background sub-agents spawned in one parent turn, interleaving
     /// with each other and with the parent in append order.
     ///
-    /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
+    /// Positions: 1 system prompt, 2 user, 3 parent assistant,
     /// 4 spawn root of sub 1, 5 spawn root of sub 2, 6 sub-1 user, 7
     /// sub-2 user, 8 sub-1 assistant, 9 parent assistant, 10 sub-2
     /// assistant, 11 sub-1 report, 12 sub-2 report.
-    fn log_with_two_background_subs() -> (TempDir, ConversationLog) {
+    fn log_with_two_background_subs() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let parent_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating twice".into(),
@@ -4361,6 +4377,7 @@ mod tests {
                 parent_head.clone(),
                 "first bg task",
                 "agent",
+                None,
                 true,
                 &sub_settings(),
             )
@@ -4372,6 +4389,7 @@ mod tests {
                 parent_head,
                 "second bg task",
                 "agent",
+                None,
                 true,
                 &other_sub_settings(),
             )
@@ -4379,19 +4397,19 @@ mod tests {
             .id;
 
         first = {
-            let mut view = ConversationView::subagent(&mut log, first, 1);
+            let mut view = AgentLog::sub(&mut log, first, 1);
             view.add_message(user_msg("first bg task"))
                 .expect("sub 1 u");
             view.head().cloned().expect("sub 1 head")
         };
         second = {
-            let mut view = ConversationView::subagent(&mut log, second, 2);
+            let mut view = AgentLog::sub(&mut log, second, 2);
             view.add_message(user_msg("second bg task"))
                 .expect("sub 2 u");
             view.head().cloned().expect("sub 2 head")
         };
         first = {
-            let mut view = ConversationView::subagent(&mut log, first, 1);
+            let mut view = AgentLog::sub(&mut log, first, 1);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub one step".into(),
                 text_signature: None,
@@ -4403,7 +4421,7 @@ mod tests {
         // The parent takes a turn while both subs are open, so each sub's
         // remaining entries land after it in append order.
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "main while both run".into(),
                 text_signature: None,
@@ -4412,7 +4430,7 @@ mod tests {
         }
 
         second = {
-            let mut view = ConversationView::subagent(&mut log, second, 2);
+            let mut view = AgentLog::sub(&mut log, second, 2);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub two step".into(),
                 text_signature: None,
@@ -4421,7 +4439,7 @@ mod tests {
             view.head().cloned().expect("sub 2 head")
         };
         {
-            let mut view = ConversationView::subagent(&mut log, first, 1);
+            let mut view = AgentLog::sub(&mut log, first, 1);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub one report".into(),
                 text_signature: None,
@@ -4429,7 +4447,7 @@ mod tests {
             .expect("sub 1 report");
         }
         {
-            let mut view = ConversationView::subagent(&mut log, second, 2);
+            let mut view = AgentLog::sub(&mut log, second, 2);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub two report".into(),
                 text_signature: None,
@@ -4443,16 +4461,16 @@ mod tests {
     /// A legacy sub-agent run: no `SubAgentSpawn` root, the sub thread
     /// leads with its task user message.
     ///
-    /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
+    /// Positions: 1 system prompt, 2 user, 3 parent assistant,
     /// 4 sub user, 5 sub assistant.
-    fn log_with_legacy_sub() -> (TempDir, ConversationLog) {
+    fn log_with_legacy_sub() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let parent_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -4462,7 +4480,7 @@ mod tests {
             view.head().cloned().expect("head")
         };
         {
-            let mut view = ConversationView::subagent(&mut log, parent_head, 1);
+            let mut view = AgentLog::sub(&mut log, parent_head, 1);
             view.add_message(user_msg("legacy subtask")).expect("sub u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "legacy report".into(),
@@ -4474,26 +4492,26 @@ mod tests {
         (dir, log)
     }
 
-    /// A user-thread branch point with an abandoned sibling, head left on
+    /// A main-thread branch point with an abandoned sibling, head left on
     /// the active branch.
     ///
-    /// Append positions: 1 system prompt, 2 user "common", 3 active
+    /// Positions: 1 system prompt, 2 user "common", 3 active
     /// assistant, 4 abandoned user, 5 abandoned assistant, 6 active user,
     /// 7 active assistant. Entries 4 and 5 are off the head's path, so
     /// the projection skips them and its tagged positions have a gap in
     /// the middle rather than only at the front.
-    fn log_with_abandoned_sibling_branch() -> (TempDir, ConversationLog) {
+    fn log_with_abandoned_sibling_branch() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let common = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("common")).expect("common").id
         };
         let active = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "active reply".into(),
                 text_signature: None,
@@ -4504,7 +4522,7 @@ mod tests {
 
         log.set_head(common).expect("rewind to the branch point");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("abandoned"))
                 .expect("abandoned u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
@@ -4517,7 +4535,7 @@ mod tests {
         log.set_head(active)
             .expect("head back on the active branch");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("more")).expect("more");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "final reply".into(),
@@ -4529,18 +4547,18 @@ mod tests {
         (dir, log)
     }
 
-    /// One assistant turn carrying three tool calls, followed by the
+    /// One assistant message carrying three tool calls, followed by the
     /// three tool results.
     ///
-    /// Append positions: 1 system prompt, 2 user, 3 assistant with the
+    /// Positions: 1 system prompt, 2 user, 3 assistant with the
     /// batch, 4/5/6 the tool results.
-    fn tool_batch_log() -> (TempDir, ConversationLog) {
+    fn tool_batch_log() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("read three files")).expect("u");
             view.add_message(assistant_msg(
                 (1..=3)
@@ -4570,17 +4588,17 @@ mod tests {
 
     /// A settings change on a sub-agent's own thread, mid-run.
     ///
-    /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
+    /// Positions: 1 system prompt, 2 user, 3 parent assistant,
     /// 4 spawn root, 5 sub user, 6 sub assistant, 7 sub thinking change,
     /// 8 sub assistant.
-    fn log_with_sub_settings_change() -> (TempDir, ConversationLog) {
+    fn log_with_sub_settings_change() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
         let parent_head = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -4590,11 +4608,19 @@ mod tests {
             view.head().cloned().expect("head")
         };
         let sub_head = log
-            .append_subagent_spawn(1, parent_head, "subtask", "agent", false, &sub_settings())
+            .append_subagent_spawn(
+                1,
+                parent_head,
+                "subtask",
+                "agent",
+                None,
+                false,
+                &sub_settings(),
+            )
             .expect("spawn root")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            let mut view = AgentLog::sub(&mut log, sub_head, 1);
             view.add_message(user_msg("subtask")).expect("sub u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "working".into(),
@@ -4602,13 +4628,11 @@ mod tests {
             })]))
             .expect("sub a");
         }
-        log.append_thinking_change(ThreadFilter::subagent(1), "high")
+        log.append_thinking_change(ThreadFilter::sub(1), "high")
             .expect("sub thinking change");
         {
-            let leaf = log
-                .latest_leaf(ThreadFilter::subagent(1))
-                .expect("sub leaf");
-            let mut view = ConversationView::subagent(&mut log, leaf, 1);
+            let leaf = log.latest_leaf(ThreadFilter::sub(1)).expect("sub leaf");
+            let mut view = AgentLog::sub(&mut log, leaf, 1);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "sub report".into(),
                 text_signature: None,
@@ -4658,7 +4682,7 @@ mod tests {
     /// dead-log replay: same events in the same order, EOF closes
     /// included. Every deviation is driven by a cursor or by `live_subs`,
     /// which is what lets the two paths share one state machine.
-    fn assert_full_suffix_matches_replay(log: &ConversationLog, label: &str) {
+    fn assert_full_suffix_matches_replay(log: &SessionLog, label: &str) {
         let replayed: Vec<Value> = replay(log).map(|event| wire(&event)).collect();
         let backfill = collect_suffix(&log.snapshot(), None, &BTreeSet::new());
         assert_eq!(
@@ -4674,7 +4698,7 @@ mod tests {
 
     #[test]
     fn a_cursorless_suffix_with_no_live_subs_equals_replay() {
-        let fixtures: Vec<(&str, (TempDir, ConversationLog))> = vec![
+        let fixtures: Vec<(&str, (TempDir, SessionLog))> = vec![
             ("seeded main-thread", seeded_log()),
             ("foreground sub", log_with_foreground_sub()),
             ("background sub", log_with_background_sub()),
@@ -4785,12 +4809,10 @@ mod tests {
         assert_eq!(backfill.open_subs, live([1, 2]));
     }
 
-    /// A finished background run is closed at the parent's next entry and
-    /// re-opens at its own next one. The re-opened bracket has to carry the
-    /// spawn root's task, mode and settings: a client seeds the child's footer
-    /// from them, so a default snapshot leaves it with no model line at all.
+    /// A finished background run whose entries interleave with its
+    /// parent's and another run's has one bracket, opened by its spawn root.
     #[test]
-    fn a_finished_background_run_reopens_with_its_spawn_root_s_start() {
+    fn an_interleaved_finished_background_run_starts_once() {
         let (_dir, log) = log_with_two_background_subs();
         let backfill = collect_suffix(&log.snapshot(), None, &BTreeSet::new());
 
@@ -4808,10 +4830,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            starts.len() > 2,
-            "the interleaving closes and re-opens both runs: {starts:#?}",
-        );
+        let runs: Vec<usize> = starts.iter().map(|(n, ..)| *n).collect();
+        assert_eq!(runs, [1, 2], "the interleaving re-opens neither run");
         for (n, task, background, settings) in starts {
             let (expected_task, expected_settings) = match n {
                 1 => ("first bg task", sub_settings()),
@@ -4824,9 +4844,55 @@ mod tests {
         }
     }
 
-    /// The transition close is the only way a finished run's box gets
-    /// concluded from a log (a conclusion is never persisted), so it must
-    /// still fire for every run the caller does not name as live.
+    /// A run that recorded its end projects that entry as its one
+    /// `SubAgentEnd`, under the entry's position and with what the parent
+    /// was handed. A later prompt to the sub-agent continues its thread and
+    /// brackets nothing, whether or not that turn is still running.
+    #[test]
+    fn a_recorded_end_closes_the_box_for_good() {
+        let (_dir, mut log) = log_with_foreground_sub();
+        let end = log
+            .append_subagent_end(1, SubAgentConclusion::Failed, "sub-agent failed: boom")
+            .expect("append the end")
+            .expect("the sub has a thread");
+        AgentLog::main(&mut log)
+            .add_message(user_msg("thanks"))
+            .expect("u");
+        let leaf = log.latest_leaf(ThreadFilter::sub(1)).expect("leaf");
+        AgentLog::sub(&mut log, leaf, 1)
+            .add_message(user_msg("keep going"))
+            .expect("the side thread");
+
+        for live in [BTreeSet::new(), live([1])] {
+            let backfill = collect_suffix(&log.snapshot(), None, &live);
+            let brackets: Vec<(&str, Option<u64>)> = backfill
+                .events
+                .iter()
+                .filter_map(|tagged| {
+                    let seq = tagged.entry.as_ref().map(|entry| entry.seq);
+                    match &tagged.event {
+                        AgentEvent::SubAgentStart { .. } => Some(("start", seq)),
+                        AgentEvent::SubAgentEnd {
+                            report, conclusion, ..
+                        } => {
+                            assert_eq!(report, "sub-agent failed: boom");
+                            assert_eq!(*conclusion, SubAgentConclusion::Failed);
+                            Some(("end", seq))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            assert_eq!(brackets.len(), 2, "{brackets:?}");
+            assert_eq!(brackets[0].0, "start");
+            assert_eq!(brackets[1], ("end", Some(end.seq)));
+            assert!(backfill.open_subs.is_empty());
+        }
+    }
+
+    /// A run without an end record, one recorded before those existed or
+    /// dropped with its parent's cancelled turn, is concluded from where
+    /// its messages stop, for every run the caller does not name as live.
     #[test]
     fn a_finished_run_is_still_concluded() {
         let (_dir, log) = log_with_foreground_sub();
@@ -4953,8 +5019,8 @@ mod tests {
     #[test]
     fn an_empty_log_projects_an_empty_backfill() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let log = SessionLog::create(&persistence).expect("create log");
         let snapshot = log.snapshot();
         for cursor in [None, Some(0), Some(1), Some(u64::MAX)] {
             let backfill = collect_suffix(&snapshot, cursor, &BTreeSet::new());
@@ -5019,7 +5085,7 @@ mod tests {
                 } => Some(usage.clone()),
                 _ => None,
             })
-            .expect("the above-cursor assistant turn projects a UsageUpdate");
+            .expect("the above-cursor assistant message projects a UsageUpdate");
         assert_eq!(usage.turn_input, 20);
         assert_eq!(
             usage.accumulated_input, 10,
@@ -5032,7 +5098,7 @@ mod tests {
     fn suffix_inside_an_open_sub_resynthesizes_its_start() {
         let (_dir, log) = open_sub_log();
         // Cursor inside the sub's run: its spawn root (9) and first
-        // message (10) are below the cursor, its assistant turn is not.
+        // message (10) are below the cursor, its assistant message is not.
         let backfill = collect_suffix(&log.snapshot(), Some(10), &live([1]));
 
         let first = backfill.events.first().expect("suffix is not empty");
@@ -5042,6 +5108,7 @@ mod tests {
                 child,
                 task,
                 tool_name,
+                call_id: _,
                 background,
                 settings,
             } => {
@@ -5135,17 +5202,17 @@ mod tests {
     #[test]
     fn a_backfill_reports_only_the_runs_on_the_projected_path() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         let common = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("common")).expect("common").id
         };
 
         // The active branch delegates to sub 1.
         let active = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "active".into(),
                 text_signature: None,
@@ -5159,13 +5226,14 @@ mod tests {
                 active.clone(),
                 "active task",
                 "agent",
+                None,
                 false,
                 &fallback_settings(),
             )
             .expect("spawn 1")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, spawn_active, 1);
+            let mut view = AgentLog::sub(&mut log, spawn_active, 1);
             view.add_message(user_msg("active prompt")).expect("sub u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "active report".into(),
@@ -5177,7 +5245,7 @@ mod tests {
         // An abandoned sibling delegates to sub 2.
         log.set_head(common).expect("rewind to the branch point");
         let abandoned = {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "abandoned".into(),
                 text_signature: None,
@@ -5191,13 +5259,14 @@ mod tests {
                 abandoned,
                 "abandoned task",
                 "agent",
+                None,
                 false,
                 &fallback_settings(),
             )
             .expect("spawn 2")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, spawn_abandoned, 2);
+            let mut view = AgentLog::sub(&mut log, spawn_abandoned, 2);
             view.add_message(user_msg("abandoned prompt"))
                 .expect("sub u");
         }
@@ -5296,27 +5365,35 @@ mod tests {
         for before_first_message in [false, true] {
             for interleaved in [false, true] {
                 let dir = fresh_sessions_dir();
-                let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-                let mut log = ConversationLog::create(&persistence).unwrap();
+                let persistence = ProjectSessions::new(dir.path().to_path_buf());
+                let mut log = SessionLog::create(&persistence).unwrap();
                 log.set_system_prompt("p".into()).unwrap();
-                let parent = ConversationView::user(&mut log)
+                let parent = AgentLog::main(&mut log)
                     .add_message(user_msg("delegate"))
                     .unwrap()
                     .id;
                 let spawn = log
-                    .append_subagent_spawn(1, parent, "subtask", "agent", true, &sub_settings())
+                    .append_subagent_spawn(
+                        1,
+                        parent,
+                        "subtask",
+                        "agent",
+                        None,
+                        true,
+                        &sub_settings(),
+                    )
                     .unwrap();
                 if !before_first_message {
-                    ConversationView::subagent(&mut log, spawn.id, 1)
+                    AgentLog::sub(&mut log, spawn.id, 1)
                         .add_message(user_msg("subtask"))
                         .unwrap();
                 }
-                let sub = ThreadFilter::subagent(1);
+                let sub = ThreadFilter::sub(1);
                 let model = log
                     .append_model_change(sub, "other", "new-model", 123_456)
                     .unwrap();
                 if interleaved {
-                    ConversationView::user(&mut log)
+                    AgentLog::main(&mut log)
                         .add_message(user_msg("meanwhile"))
                         .unwrap();
                 }
@@ -5361,14 +5438,13 @@ mod tests {
                     );
                 }
                 let leaf = log.latest_leaf(sub).unwrap();
-                ConversationView::subagent(&mut log, leaf, 1)
+                AgentLog::sub(&mut log, leaf, 1)
                     .add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                         text: "report".into(),
                         text_signature: None,
                     })]))
                     .unwrap();
-                log.flush_pending().unwrap();
-                let resumed = ConversationLog::resume(&persistence, log.session_id()).unwrap();
+                let resumed = SessionLog::resume(&persistence, log.session_id()).unwrap();
                 let snapshot = resumed.snapshot();
                 let full: Vec<_> = project_suffix(&snapshot, None, &BTreeSet::new()).collect();
                 for (entry, event) in &expected {
@@ -5406,7 +5482,7 @@ mod tests {
     #[test]
     fn legacy_sub_settings_keep_unknown_model_and_capacity() {
         let (_dir, mut log) = log_with_legacy_sub();
-        let sub = ThreadFilter::subagent(1);
+        let sub = ThreadFilter::sub(1);
         let thinking = log.append_thinking_change(sub, "high").unwrap();
         let expected = AgentSettings {
             thinking: "high".into(),
@@ -5433,12 +5509,12 @@ mod tests {
     #[test]
     fn trailing_sub_settings_do_not_reopen_a_finished_report() {
         let (_dir, mut log) = log_with_sub_settings_change();
-        ConversationView::user(&mut log)
+        AgentLog::main(&mut log)
             .add_message(user_msg("finished"))
             .unwrap();
         let before: Vec<_> = replay(&log).map(|e| wire(&e)).collect();
         let edit = log
-            .append_model_change(ThreadFilter::subagent(1), "other", "new-model", 321_000)
+            .append_model_change(ThreadFilter::sub(1), "other", "new-model", 321_000)
             .unwrap();
         let snapshot = log.snapshot();
         let suffix: Vec<_> =

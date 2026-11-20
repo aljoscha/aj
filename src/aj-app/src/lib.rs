@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use aj_agent::TaskRegistry;
 use aj_conf::Config;
-use aj_session::{ConversationPersistence, SessionMetadata};
+use aj_session::{ProjectSessions, SessionMetadata};
 use anyhow::Result;
 
 pub mod actions;
@@ -42,6 +42,7 @@ pub mod oracle;
 pub mod outbound;
 pub mod print;
 pub mod prompt_history;
+pub mod recovery;
 pub mod scripted;
 pub mod session;
 pub mod session_info;
@@ -110,65 +111,225 @@ pub(crate) async fn shutdown_background_tasks_owned(registry: &TaskRegistry) -> 
     graceful
 }
 
-/// `aj list-sessions`: list existing conversation sessions
+/// `aj list-sessions`: list existing sessions
 /// for the current project, latest first.
 ///
 /// Output: one row per session, as [`session_line`] formats it. Archived
 /// sessions are marked, not dropped: a listing lists, and only the
 /// interactive pickers filter. The underlying iteration and size formatting
-/// live in [`ConversationPersistence::list_sessions`] (`aj-session`);
+/// live in [`ProjectSessions::list_sessions`] (`aj-session`);
 /// this function resolves the store and prints what [`session_listing`]
 /// answers.
 pub fn handle_list_sessions() -> Result<()> {
-    let sessions_dir = Config::get_sessions_dir_path()?;
-    for line in session_listing(&ConversationPersistence::new(sessions_dir))? {
+    for line in session_listing(&current_project_persistence()?)? {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Compose the global session store with the current project's legacy bucket.
+/// Existing bucket identities remain stable across explicit JSONL migration.
+pub fn current_project_persistence() -> Result<ProjectSessions> {
+    project_persistence(Config::get_sessions_dir_path()?)
+}
+
+/// The current project's sessions in the shared database, with
+/// `sessions_dir` as its legacy JSONL and writer-lock directory.
+fn project_persistence(sessions_dir: std::path::PathBuf) -> Result<ProjectSessions> {
+    Ok(ProjectSessions::for_project(
+        Config::session_database_path()?,
+        sessions_dir,
+        Config::project_id()?,
+    ))
+}
+
+/// Explicit, offline migration. This never opens an agent or runs recovery
+/// actions. The session store owns validation, locking, and atomic import.
+pub fn handle_migrate_session(session_id: Option<&str>, dry_run: bool) -> Result<()> {
+    if let Some(id) = session_id {
+        let store = project_persistence(Config::sessions_dir_path()?)?;
+        let result = if dry_run {
+            store.check_jsonl_migration(id)?
+        } else {
+            store.migrate_jsonl(id)?
+        };
+        println!("{id}: {result}. Source files were left unchanged.");
+        return Ok(());
+    }
+    let (mut imported, mut already, mut planned, mut failed) = (0, 0, 0, 0);
+    aj_session::migrate_all_jsonl(
+        &Config::session_database_path()?,
+        &Config::sessions_root_path()?,
+        dry_run,
+        |report| {
+            let subject = match report.session_id {
+                Some(id) => format!("{}/{id}", report.project_id),
+                None => report.project_id,
+            };
+            match report.result {
+                Ok(result) => {
+                    match result {
+                        aj_session::MigrationResult::Imported => imported += 1,
+                        aj_session::MigrationResult::AlreadyImported => already += 1,
+                        aj_session::MigrationResult::WouldImport => planned += 1,
+                    }
+                    println!("{subject}: {result}");
+                }
+                Err(error) => {
+                    failed += 1;
+                    println!("{subject}: failed: {error}");
+                }
+            }
+        },
+    )?;
+    println!(
+        "{imported} imported, {already} already imported, {planned} would import, {failed} failed. Source files were left unchanged."
+    );
+    anyhow::ensure!(failed == 0, "{failed} migration checks or imports failed");
+    Ok(())
+}
+
+pub fn handle_export_session(session_id: &str, directory: &std::path::Path) -> Result<()> {
+    let store = project_persistence(Config::sessions_dir_path()?)?;
+    let path = store.export_jsonl(session_id, directory)?;
+    println!("{session_id}: exported to {}", path.display());
+    Ok(())
+}
+
+pub fn handle_import_session(file: &std::path::Path) -> Result<()> {
+    let store = project_persistence(Config::sessions_dir_path()?)?;
+    let id = store.import_jsonl(file)?;
+    println!("{id}: imported into SQLite. The source file was left unchanged.");
+    Ok(())
+}
+
+/// Report storage problems in the global session database, then the
+/// commands it records as running. Exits nonzero when it finds a problem.
+/// A task record is not one. Changes nothing.
+pub fn handle_doctor() -> Result<()> {
+    let store = project_persistence(Config::sessions_dir_path()?)?;
+    let database = store.sqlite_path();
+    let Some(problems) = store.check_database()? else {
+        println!("{}: no session database yet", database.display());
+        return Ok(());
+    };
+    for problem in &problems {
+        println!("{problem}");
+    }
+    // A database with a problem may not be readable this far.
+    match task_records_report(&store) {
+        Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
+        Err(error) => println!("task records: could not be read: {error:#}"),
+    }
+    anyhow::ensure!(
+        problems.is_empty(),
+        "{}: {} problems found",
+        database.display(),
+        problems.len()
+    );
+    println!("{}: ok", database.display());
+    Ok(())
+}
+
+/// The lines `doctor` prints for the commands `persistence`'s database
+/// records as running, in every project and session: a count, then one
+/// line a command with its session, the agent that started it, its task
+/// id, its pid and start time, whether that process is still running, and
+/// the command.
+///
+/// A process is the command's when it has the recorded pid, leads its
+/// process group and started at the recorded time, which is the check a
+/// host makes before it watches or signals one. A row whose process is not
+/// running is one the next open of its session settles.
+///
+/// Separate from the printing so the store's answer is what a test reads.
+pub fn task_records_report(persistence: &ProjectSessions) -> Result<Vec<String>> {
+    /// How much of a command a line shows.
+    const SHOWN: usize = 80;
+    let commands = persistence.task_records()?;
+    let mut lines = vec![format!("task records: {}", commands.len())];
+    for (project, session, task) in commands {
+        let agent = match task.owner {
+            aj_agent::events::AgentId::Main => "main".to_string(),
+            aj_agent::events::AgentId::Sub(n) => format!("sub {n}"),
+        };
+        let process = aj_tools::tools::bash::DetachedProcess {
+            pid: task.pid,
+            start_time: task.process_start,
+            output_path: task.output_path,
+            exit_path: task.exit_path,
+        };
+        let state = if process.alive() {
+            "running"
+        } else {
+            "not running"
+        };
+        let command: String = task
+            .command
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = match command.char_indices().nth(SHOWN) {
+            Some((cut, _)) => format!("{}...", &command[..cut]),
+            None => command,
+        };
+        lines.push(format!(
+            "  {project}/{session}  {agent}  task #{}  pid {}  started {}  {state}  {command}",
+            task.id,
+            task.pid,
+            task.started_at.format("%Y-%m-%dT%H:%M:%SZ"),
+        ));
+    }
+    Ok(lines)
 }
 
 /// The lines `list-sessions` prints for `persistence`, latest first, or the
 /// one line that says the store holds nothing.
 ///
 /// Separate from the printing so the store's answer is what a test reads. The
-/// archived set is one directory read for the whole listing, since the
-/// sidecar's existence is the bit. A `meta/` directory that cannot be read
-/// costs the rows their markers and not the caller its listing: the bit is
-/// display metadata.
-fn session_listing(persistence: &ConversationPersistence) -> Result<Vec<String>> {
+/// archived set is enumerated once for the whole listing. An archive metadata
+/// read failure costs the listing its markers, not its rows. The host directory
+/// makes the same trade (see `host::store`).
+fn session_listing(persistence: &ProjectSessions) -> Result<Vec<String>> {
     let sessions = persistence.list_sessions()?;
     if sessions.is_empty() {
-        return Ok(vec![
-            "No conversation sessions found for this project.".to_string(),
-        ]);
+        return Ok(vec!["No sessions found for this project.".to_string()]);
     }
     let archived: HashSet<String> = match persistence.enumerate_archived() {
-        Ok(sidecars) => sidecars
-            .into_iter()
-            .map(|sidecar| sidecar.session_id)
-            .collect(),
+        Ok(ids) => ids.into_iter().collect(),
         Err(err) => {
-            tracing::warn!("could not read the store's archived sidecars: {err}");
+            tracing::warn!("could not read the store's archived sessions: {err}");
             HashSet::new()
         }
     };
-    Ok(sessions
-        .iter()
-        .map(|session| session_line(session, archived.contains(&session.session_id)))
-        .collect())
+    let mut lines = Vec::new();
+    for session in &sessions {
+        // A session that vanished since the listing has no size to show.
+        let size = persistence.session_size(&session.session_id)?;
+        let archived = archived.contains(&session.session_id);
+        lines.push(session_line(session, size.unwrap_or(0), archived));
+    }
+    Ok(lines)
 }
 
 /// One `list-sessions` row: `<session_id> (modified: <utc-ts>, <size>)`, with a
-/// trailing ` [archived]` when the session is archived.
+/// trailing ` [archived]` when the session is archived. The size of the
+/// session's history stands in for the session's length.
 ///
 /// The marker trails the metadata so the ids stay left-aligned down the column
 /// and every row that carries one carries it at the end.
-fn session_line(session: &SessionMetadata, archived: bool) -> String {
+fn session_line(session: &SessionMetadata, size_bytes: u64, archived: bool) -> String {
+    let size = if size_bytes < 1024 {
+        format!("{size_bytes}B")
+    } else if size_bytes < 1024 * 1024 {
+        format!("{}KB", size_bytes / 1024)
+    } else {
+        format!("{}MB", size_bytes / (1024 * 1024))
+    };
     format!(
-        "{} (modified: {}, {}){}",
+        "{} (modified: {}, {size}){}",
         session.session_id,
         session.modified_display(),
-        session.size_display(),
         if archived { " [archived]" } else { "" }
     )
 }
@@ -197,15 +358,15 @@ mod tests {
 
     /// A row modified at a fixed instant, so a test can pin the whole line and
     /// not only the marker.
-    fn row(session_id: &str, size_bytes: u64) -> SessionMetadata {
+    fn row(session_id: &str) -> SessionMetadata {
         let modified_at = DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant");
-        SessionMetadata::new(session_id.to_string(), modified_at, size_bytes)
+        SessionMetadata::new(session_id.to_string(), modified_at, 7)
     }
 
     #[test]
     fn an_archived_session_is_marked() {
         assert_eq!(
-            session_line(&row("2024-01-01-00-00-00", 2048), true),
+            session_line(&row("2024-01-01-00-00-00"), 2048, true),
             "2024-01-01-00-00-00 (modified: 2023-11-14 22:13:20 UTC, 2KB) [archived]",
             "an archived session printed with no marker, or with the rest of the row changed",
         );
@@ -214,7 +375,7 @@ mod tests {
     #[test]
     fn an_unarchived_session_is_not_marked() {
         assert_eq!(
-            session_line(&row("2024-01-01-00-00-00", 2048), false),
+            session_line(&row("2024-01-01-00-00-00"), 2048, false),
             "2024-01-01-00-00-00 (modified: 2023-11-14 22:13:20 UTC, 2KB)",
             "an unarchived session printed a marker, or the row lost its id, time, or size",
         );
@@ -222,10 +383,10 @@ mod tests {
 
     #[test]
     fn the_marker_is_all_that_archiving_adds() {
-        let session = row("2024-02-03-04-05-06", 10);
+        let session = row("2024-02-03-04-05-06");
         assert_eq!(
-            session_line(&session, true),
-            format!("{} [archived]", session_line(&session, false)),
+            session_line(&session, 10, true),
+            format!("{} [archived]", session_line(&session, 10, false)),
             "archiving a session changed more of its row than the trailing marker",
         );
     }
@@ -237,15 +398,15 @@ mod tests {
     /// second mint would either collide or cost the test a wall-clock second.
     /// What the listing reads of a session is its first line and its file
     /// stat, and the copy answers both.
-    fn store_with_two_sessions() -> (TempDir, ConversationPersistence, String, String) {
+    fn store_with_two_sessions() -> (TempDir, ProjectSessions, String, String) {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
-        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+        use aj_session::{LogEntryKind, SessionLog, ThreadKind};
 
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let kept = {
-            let mut log = ConversationLog::create(&persistence).expect("create log");
+            let mut log = SessionLog::create(&persistence).expect("create log");
             // The listing reads each session's first line to tell the current
             // format from the old one, so a log with nothing written is not a
             // session it lists.
@@ -254,9 +415,9 @@ mod tests {
             let root = log.system_prompt_id().cloned().expect("system prompt id");
             log.append(
                 Some(root),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(Message::User(UserMessage::text("a prompt"))),
                 },
             )
@@ -264,16 +425,20 @@ mod tests {
             log.session_id().to_string()
         };
         let put_away = "2024-02-03-04-05-06-007".to_string();
-        let log_path = |id: &str| persistence.sessions_dir().join(format!("{id}.jsonl"));
-        std::fs::copy(log_path(&kept), log_path(&put_away)).expect("a second session in the store");
+        // A JSONL copy of the first session under another id.
+        let copy = persistence
+            .export_jsonl(&kept, &dir.path().join("exported"))
+            .expect("export the first session");
+        let second = persistence.sessions_dir().join(format!("{put_away}.jsonl"));
+        std::fs::copy(copy, second).expect("a second session in the store");
         persistence
             .write_archived(&put_away, true)
             .expect("archive the second session");
         (dir, persistence, kept, put_away)
     }
 
-    /// The listing reads the store's own sidecars: the marker follows the
-    /// session that has one, and every session is listed either way.
+    /// The marker follows the store's archive metadata, and every session is
+    /// listed either way.
     #[test]
     fn the_listing_marks_the_sessions_the_store_says_are_archived() {
         let (_dir, persistence, kept, put_away) = store_with_two_sessions();
@@ -293,7 +458,7 @@ mod tests {
         );
         assert!(
             !line_for(&kept).contains("[archived]"),
-            "a session with no sidecar printed as archived: {}",
+            "an unarchived session printed as archived: {}",
             line_for(&kept),
         );
     }

@@ -153,7 +153,7 @@ pub const COMMANDS: &[Command] = &[
         name: "resume",
         title: "resume",
         category: "session",
-        description: "Resume a different conversation session.",
+        description: "Resume a different session.",
         action_id: None,
         action: CommandAction::OpenSessionSelector,
     },
@@ -212,6 +212,14 @@ pub const COMMANDS: &[Command] = &[
         description: "Export this session to a shareable HTML file.",
         action_id: None,
         action: CommandAction::ExportHtml,
+    },
+    Command {
+        name: "continue",
+        title: "continue",
+        category: "session",
+        description: "Resume a turn that was interrupted, without a new message.",
+        action_id: None,
+        action: CommandAction::Continue,
     },
     Command {
         name: "compact",
@@ -413,7 +421,7 @@ pub enum CommandAction {
     /// it's safe mid-turn.
     ExportHtml,
     /// Start a fresh session. The current session is preserved on
-    /// disk; the host creates a new [`ConversationLog`], swaps it
+    /// disk; the host creates a new [`SessionLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the
     /// scrollback.
     NewSession,
@@ -423,6 +431,8 @@ pub enum CommandAction {
     /// owns the turn machinery `handle_command` lacks), so the
     /// `handle_command` arm for it is a no-op.
     Compact,
+    /// Resume the main agent's interrupted turn.
+    Continue,
     /// Show the command reference. The host opens the help overlay
     /// listing every entry in [`COMMANDS`].
     Help,

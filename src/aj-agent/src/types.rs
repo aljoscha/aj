@@ -3,7 +3,7 @@
 //! [`TokenUsage`] is a structured token-count snapshot the renderer formats.
 //! It rides on [`crate::events::AgentEvent::UsageUpdate`] or
 //! [`crate::events::AgentEvent::CompactionEnd`] after every accounted
-//! assistant turn or committed compaction.
+//! assistant message or committed compaction.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// `accumulated_* + turn_*`. Field names mirror the unified usage
 /// shape (`input`, `output`, `cache_read`, `cache_write`).
 ///
-/// Polling [`crate::Agent::accumulated_usage`] *between* turns
+/// Polling [`crate::Agent::accumulated_usage`] *between* operations
 /// returns the post-add total (i.e. the next `UsageUpdate` event's
 /// `accumulated_* + turn_*`), so a consumer that needs the
 /// "current running total at any instant" can either read the

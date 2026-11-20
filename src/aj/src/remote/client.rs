@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
 
+use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
 use aj_app::host::{AttachRequest, CommandOutcome, ListFrames};
 use aj_wire::{
@@ -139,6 +140,7 @@ pub(crate) enum RemoteCommand {
     Archive(ArchiveRequest),
     Head(HeadRequest),
     KillTask(TaskId),
+    Continue,
 }
 
 impl RemoteCommand {
@@ -159,6 +161,7 @@ impl RemoteCommand {
             Self::Archive(_) => "archive".to_string(),
             Self::Head(_) => "head".to_string(),
             Self::KillTask(task) => format!("tasks/{task}/kill"),
+            Self::Continue => "continue".to_string(),
         }
     }
 
@@ -177,7 +180,7 @@ impl RemoteCommand {
             Self::Tag(request) => encode(request),
             Self::Archive(request) => encode(request),
             Self::Head(request) => encode(request),
-            Self::KillTask(_) => Ok(b"{}".to_vec()),
+            Self::KillTask(_) | Self::Continue => Ok(b"{}".to_vec()),
         }
     }
 
@@ -379,6 +382,23 @@ impl RemoteClient {
             .send()
             .await?;
         decode(refusal(response).await?).await
+    }
+
+    pub(crate) async fn history(
+        &self,
+        session: &str,
+        agent: AgentId,
+        before: u64,
+        limit: u64,
+    ) -> Result<aj_wire::HistoryPage, RemoteError> {
+        let agent = match agent {
+            AgentId::Main => String::new(),
+            AgentId::Sub(n) => format!("&agent={n}"),
+        };
+        self.get(&format!(
+            "/v1/sessions/{session}/history?before={before}&limit={limit}{agent}"
+        ))
+        .await
     }
 
     pub(crate) async fn export_html(

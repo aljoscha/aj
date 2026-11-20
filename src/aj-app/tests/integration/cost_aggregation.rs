@@ -12,7 +12,7 @@ use aj_models::registry::{ModelCost, calculate_cost};
 use aj_models::types::{
     AssistantContent, AssistantMessage, Message, StopReason, TextContent, Usage, UserMessage,
 };
-use aj_session::{ConversationEntryKind, ConversationLog, ConversationPersistence, ThreadKind};
+use aj_session::{LogEntryKind, ProjectSessions, SessionLog, ThreadKind};
 use tempfile::TempDir;
 
 /// Dollars per million tokens, the shape the catalog stores rates in.
@@ -63,22 +63,22 @@ fn priced(
     })
 }
 
-/// A persisted log carrying `responses` on the user thread, preceded by
+/// A persisted log carrying `responses` on the main thread, preceded by
 /// a prompt. The `TempDir` owns the scratch directory the log writes
 /// into and is returned so it outlives the log.
-fn log_with(responses: Vec<Message>) -> (TempDir, ConversationLog) {
+fn log_with(responses: Vec<Message>) -> (TempDir, SessionLog) {
     let dir = tempfile::tempdir().expect("scratch dir");
-    let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-    let mut log = ConversationLog::create(&persistence).expect("create log");
+    let persistence = ProjectSessions::new(dir.path().to_path_buf());
+    let mut log = SessionLog::create(&persistence).expect("create log");
     log.set_system_prompt("system".to_string())
         .expect("system prompt");
     let mut head = log.system_prompt_id().cloned().expect("system prompt id");
     head = log
         .append(
             Some(head),
-            ThreadKind::User,
+            ThreadKind::Main,
             None,
-            ConversationEntryKind::Message {
+            LogEntryKind::Message {
                 message: AgentMessage::wire(Message::User(UserMessage::text("go"))),
             },
         )
@@ -88,9 +88,9 @@ fn log_with(responses: Vec<Message>) -> (TempDir, ConversationLog) {
         head = log
             .append(
                 Some(head),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(response),
                 },
             )
@@ -147,7 +147,7 @@ fn a_mixed_model_session_totals_the_sum_of_its_per_response_costs() {
     );
 
     let (_dir, log) = log_with(vec![on_dear, on_cheap]);
-    let stats = log.stats();
+    let stats = log.stats().unwrap();
     let rows = digest(&to_wire(&stats), None);
 
     assert_eq!(
@@ -200,7 +200,7 @@ fn a_session_that_burned_tokens_never_reports_zero_cost() {
             50_000,
         ),
     ]);
-    let stats = log.stats();
+    let stats = log.stats().unwrap();
     let rows = digest(&to_wire(&stats), None);
 
     let tokens = row(&rows, "total tokens");

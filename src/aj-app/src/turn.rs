@@ -8,11 +8,13 @@
 //! compaction policy lives in exactly one place rather than being
 //! duplicated across the two frontends' loops.
 //!
-//! Delivering queued work (task notices, follow-up messages) is *not*
-//! the driver's job: the host starts a [`TurnStart::Wake`] turn when an
-//! agent goes idle with work pending, and that wake turn is itself
-//! driven here. Mid-turn steering is drained inside the agent's own
-//! turn loop, a layer below this.
+//! A turn for user input starts as a [`TurnStart::Wake`]. Whoever accepts
+//! a prompt saves it as the agent's pending input (see
+//! [`crate::session::accept_prompt`]) and wakes the agent, and the wake
+//! turn takes the input from the queue with any task notifications. The host
+//! starts the same wake when an agent goes idle with work pending.
+//! Mid-turn steering is drained inside the agent's own round loop, a layer
+//! below this.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,11 +23,9 @@ use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
 use aj_agent::{Agent, TaskRegistry, TurnError, sub_agent_session_id};
 use aj_conf::Config;
 use aj_models::errors::is_context_overflow;
-use aj_models::types::UserContent;
+use aj_session::Journal;
 use aj_session::compaction::should_compact;
-use aj_session::{AppendHandoff, ConversationLog};
 use aj_tools::builtin_tools_for_model;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -51,18 +51,51 @@ fn tools_for_turn(
     tools
 }
 
+/// What the `agent` tool builds a sub-agent running `model` from under
+/// `config`: the main agent's tools without the ones that are the main
+/// agent's alone, and no prompt suffix. `session_id` is the session's
+/// prompt-cache key.
+pub(crate) fn sub_agent_config(
+    config: &Config,
+    model: &crate::session_setup::ModelConfig,
+    session_id: Option<String>,
+) -> aj_agent::tool::SpawnAgentConfig {
+    let mut stream_options = model.stream_options.clone();
+    stream_options.session_id = session_id;
+    aj_agent::tool::SpawnAgentConfig {
+        provider: Arc::clone(&model.provider),
+        model_info: Arc::clone(&model.model_info),
+        stream_options,
+        thinking: model.thinking.clone(),
+        speed: model.speed.clone(),
+        thinking_display: String::new(),
+        tools: tools_for_turn(
+            &builtin_tool_options(config),
+            &config.disabled_tools,
+            model.model_info.family.as_deref(),
+            false,
+        ),
+        system_prompt_suffix: String::new(),
+    }
+}
+
+/// What the model is told when the user continues an interrupted turn.
+const CONTINUE_CONTEXT: &str = "The previous turn was interrupted before it finished. \
+A tool call whose result says it was interrupted may or may not have run. \
+Check its effects before repeating it. Then continue where the turn left off.";
+
 /// How a turn sequence begins.
 pub enum TurnStart {
     /// Application-generated goal continuation, not a user-authored prompt.
     Goal(String),
-    /// A typed user prompt. Drives [`Agent::prompt`].
-    Prompt(String),
-    /// CLI launch content (text + `@file`/image blocks). Drives
-    /// [`Agent::prompt_with_content`].
-    Content(Vec<UserContent>),
-    /// Drain queued notices/messages and run. Drives [`Agent::wake`]; a
-    /// no-op (no events) when nothing is pending. Started by the host
-    /// when an idle agent has queued work.
+    /// Resume a turn that was cut short, with no new user message. The
+    /// model is told the turn was interrupted and what that means for
+    /// tool calls whose results were never saved.
+    Continue,
+    /// Take the agent's pending input and task notifications and run. This is
+    /// how a turn starts for a prompt, which is pending input by then.
+    /// Drives [`Agent::wake`], which does nothing and emits no event when
+    /// nothing is pending.
     Wake,
     /// Compact only — no turn. Drives `run_compaction` and returns.
     Compact {
@@ -86,7 +119,7 @@ pub struct TurnPolicy {
     /// disables the threshold trigger (print mode, sub-agents).
     pub auto_threshold: Option<f64>,
     /// `Some(t)`: compact after a completed tool batch before continuing
-    /// inference, without ending the run. `None` disables this boundary.
+    /// inference, without ending the turn. `None` disables this boundary.
     pub during_turn_threshold: Option<f64>,
     /// Shared verbatim budget for original user messages and the recent tail.
     pub keep_recent: u64,
@@ -95,7 +128,7 @@ pub struct TurnPolicy {
 /// Build the per-agent [`TurnPolicy`]. The Main agent gets reactive
 /// overflow recovery and threshold compaction (both gated on
 /// `auto_compact`); a sub-agent continuation gets neither, since
-/// compaction operates on the log's USER (Main) thread. Queued-work
+/// compaction operates on the log's USER (Main) thread. Pending-work
 /// delivery is not a policy knob — the loop wakes idle agents directly.
 fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnPolicy {
     let c = config.lock().expect("config mutex poisoned");
@@ -237,12 +270,6 @@ pub struct Turns {
     /// cancel entry and its running mark and read busy forever, wedging
     /// the session (see [`Joined`]).
     tasks: HashMap<tokio::task::Id, AgentId>,
-    /// The session's compaction append handoff, threaded into every
-    /// `drive_turn` this spawns. A host that fans events out installs its
-    /// own so a compaction's `CompactionEnd` reaches the fan-out tagged
-    /// with the checkpoint entry; a host that does not gets the default,
-    /// which nothing reads.
-    handoff: AppendHandoff,
 }
 
 /// One turn the host was driving, as its join set reported it.
@@ -257,19 +284,8 @@ pub struct Joined {
 }
 
 impl Turns {
-    /// An empty set of driven turns with a handoff nothing reads.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// An empty set of driven turns that files compaction checkpoints on
-    /// `handoff`, which must be the same handoff the session's event
-    /// forwarder takes them from.
-    pub fn with_handoff(handoff: AppendHandoff) -> Self {
-        Self {
-            handoff,
-            ..Self::default()
-        }
     }
 
     /// Whether no driven turn is in flight.
@@ -301,12 +317,10 @@ impl Turns {
     }
 
     /// Fire every driven turn's cancel token, leaving the turns in flight
-    /// to wind themselves down.
-    ///
-    /// This is the graceful counterpart to [`Self::shutdown`]: a
-    /// cancelled turn emits its synthetic aborted `MessageEnd`s and error
-    /// tool results, so the transcript stays consistent, which an abort
-    /// does not. The caller then drains [`Self::join_next`].
+    /// to wind themselves down as a user's cancel does: a cancelled turn
+    /// writes its aborted message and its error tool results. The caller
+    /// then drains [`Self::join_next`]. A host that lets a session go
+    /// uses [`Self::shutdown`] instead, which writes nothing.
     pub fn cancel_all(&self) {
         for token in self.cancels.values() {
             token.cancel();
@@ -326,8 +340,8 @@ impl Turns {
     /// mint the per-sequence cancel token (kept in the cancel map,
     /// which the host's Ctrl+C fires), and drive `start` plus its
     /// automatic continuations via [`drive_turn`]. Returns `false`
-    /// without spawning when `target` has no live handle (e.g. a
-    /// resumed sub-agent).
+    /// without spawning when `target` has no live handle: a sub-agent
+    /// the host has not built from its stored run.
     ///
     /// The compaction [`TurnPolicy`] is read from live `config` at each
     /// compaction boundary. The session's staged run config
@@ -357,8 +371,7 @@ impl Turns {
         let config_for_turn = Arc::clone(config);
         let run_config_for_turn = Arc::clone(&core.run_config);
         let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
-        let log = Arc::clone(&core.log);
-        let handoff = self.handoff.clone();
+        let journal = core.journal.clone();
         let cleanup = core.task_registry.track_cleanup();
         let turn_cancel = match target {
             AgentId::Sub(n) => core
@@ -374,8 +387,7 @@ impl Turns {
             let mut a = handle.lock().await;
             let result = drive_turn(
                 &mut a,
-                &log,
-                &handoff,
+                &journal,
                 move || turn_policy(target, &config_for_policy),
                 start,
                 |agent: &mut Agent| {
@@ -397,10 +409,9 @@ impl Turns {
     }
 
     /// Spawn a wake turn on `owner` if it is idle, delivering queued
-    /// notices / messages. This is the single post-turn wake path: the
-    /// driver itself does not deliver queued work, so the host starts a
-    /// wake here whenever an agent has work pending and no turn in
-    /// flight. A busy owner is left alone (its running turn drains
+    /// notices / messages. This is the post-turn wake path: the host
+    /// starts a wake here whenever an agent has work pending and no turn
+    /// in flight. A busy owner is left alone (its running turn drains
     /// steering mid-flight). Both wake triggers may fire for the same
     /// notice; `Agent::wake` returns `Empty` (emitting nothing) once
     /// the queue is drained, so the loser is a cheap no-op.
@@ -500,8 +511,10 @@ impl Turns {
         idled
     }
 
-    /// Abort every in-flight turn and await them. Clears the cancel
-    /// map, since nothing is driven afterwards.
+    /// Abort every in-flight turn where it stands and await them. An
+    /// aborted turn runs none of its cancellation path, so it writes
+    /// nothing more, as a turn whose host died. Clears the cancel map,
+    /// since nothing is driven afterwards.
     pub async fn shutdown(&mut self) {
         self.set.shutdown().await;
         self.cancels.clear();
@@ -547,7 +560,7 @@ pub fn running_work_counts<'a>(
 ///
 /// `reconfigure` applies staged run-config at run start and idle compaction
 /// boundaries (interactive's `apply_turn_config`; a no-op in print mode).
-/// Mid-turn compaction uses the active run's model configuration. `policy`
+/// Mid-turn compaction uses the active turn's model configuration. `policy`
 /// is read at each compaction boundary, so settings edits affect the next
 /// check without changing a compaction already underway.
 /// Returns the final turn result: `Ok` when the sequence
@@ -559,12 +572,11 @@ pub fn running_work_counts<'a>(
 /// The single `cancel` token covers the whole sequence: one fire stops
 /// the in-flight inference and every continuation.
 ///
-/// `handoff` is the session's compaction append handoff, threaded to
-/// every `run_compaction` this drives (see [`AppendHandoff`]).
+/// `journal` is the session's, which every `run_compaction` this drives
+/// records its checkpoint through.
 pub async fn drive_turn(
     agent: &mut Agent,
-    log: &Arc<TokioMutex<ConversationLog>>,
-    handoff: &AppendHandoff,
+    journal: &Journal,
     policy: impl Fn() -> TurnPolicy + Send + Sync + 'static,
     start: TurnStart,
     mut reconfigure: impl FnMut(&mut Agent),
@@ -573,22 +585,19 @@ pub async fn drive_turn(
     reconfigure(agent);
     let policy = Arc::new(policy);
     // The hook owns only application resources, never an agent lock. It is
-    // replaced for every driven run and is not inherited by spawned agents.
+    // replaced for every driven turn and is not inherited by spawned agents.
     // Install it even when disabled so a settings edit can enable it mid-turn.
     agent.set_before_continuation(Some({
-        let log = Arc::clone(log);
-        let handoff = handoff.clone();
+        let journal = journal.clone();
         let policy = Arc::clone(&policy);
         let hook: aj_agent::hooks::BeforeContinuationHook = Arc::new(move |agent, cancel| {
-            let log = Arc::clone(&log);
-            let handoff = handoff.clone();
+            let journal = journal.clone();
             let policy = policy();
             Box::pin(async move {
                 if let Some(threshold) = policy.during_turn_threshold {
                     compact_over_threshold(
                         agent,
-                        &log,
-                        &handoff,
+                        &journal,
                         threshold,
                         policy.keep_recent,
                         cancel,
@@ -609,8 +618,7 @@ pub async fn drive_turn(
         } => {
             return run_compaction(
                 agent,
-                log,
-                handoff,
+                journal,
                 reason,
                 instructions.as_deref(),
                 policy().keep_recent,
@@ -624,8 +632,15 @@ pub async fn drive_turn(
                 .prompt_context(text, Some("Continuing goal.".into()), cancel.clone())
                 .await
         }
-        TurnStart::Prompt(text) => agent.prompt(text, cancel.clone()).await,
-        TurnStart::Content(content) => agent.prompt_with_content(content, cancel.clone()).await,
+        TurnStart::Continue => {
+            agent
+                .prompt_context(
+                    CONTINUE_CONTEXT.into(),
+                    Some("Continuing the interrupted turn.".into()),
+                    cancel.clone(),
+                )
+                .await
+        }
         TurnStart::Wake => agent.wake(cancel.clone()).await.map(|_| ()),
     };
 
@@ -660,8 +675,7 @@ pub async fn drive_turn(
             reconfigure(agent);
             run_compaction(
                 agent,
-                log,
-                handoff,
+                journal,
                 CompactionReason::Overflow,
                 None,
                 policy.keep_recent,
@@ -671,8 +685,8 @@ pub async fn drive_turn(
             .into_turn_result()?;
             // `run_compaction` trims the trailing failed assistant from
             // the reseed, so the transcript ends in a user/tool-result
-            // message and `continue_run`'s precondition holds.
-            result = agent.continue_run(cancel.clone()).await;
+            // message and `continue_turn`'s precondition holds.
+            result = agent.continue_turn(cancel.clone()).await;
             continue;
         }
 
@@ -683,7 +697,7 @@ pub async fn drive_turn(
         }
 
         // 3. Threshold compaction. Terminal for the sequence: the next
-        //    turn happens on the next prompt or wake. If queued work is
+        //    turn happens on the next prompt or wake. If pending work is
         //    waiting, the loop wakes the agent after this returns and
         //    that turn runs against the freshly reduced context — so we
         //    compact first rather than letting an over-threshold context
@@ -691,8 +705,7 @@ pub async fn drive_turn(
         if let Some(threshold) = policy.auto_threshold {
             compact_over_threshold(
                 agent,
-                log,
-                handoff,
+                journal,
                 threshold,
                 policy.keep_recent,
                 cancel.clone(),
@@ -708,8 +721,7 @@ pub async fn drive_turn(
 /// Each call follows new inference work, so a no-op never spins on stale usage.
 async fn compact_over_threshold(
     agent: &mut Agent,
-    log: &Arc<TokioMutex<ConversationLog>>,
-    handoff: &AppendHandoff,
+    journal: &Journal,
     threshold: f64,
     keep_recent: u64,
     cancel: CancellationToken,
@@ -721,8 +733,7 @@ async fn compact_over_threshold(
         reconfigure(agent);
         run_compaction(
             agent,
-            log,
-            handoff,
+            journal,
             CompactionReason::Threshold,
             None,
             keep_recent,
@@ -785,7 +796,7 @@ mod tests {
     use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
     use aj_conf::Config;
     use aj_models::types::{AssistantContent, AssistantMessage};
-    use aj_session::{AppendHandoff, ConversationEntryKind, ConversationPersistence, ThreadFilter};
+    use aj_session::{LogEntryKind, ProjectSessions, ThreadFilter};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -794,7 +805,7 @@ mod tests {
     };
     use crate::compaction::{CompactionOutcome, run_compaction};
     use crate::test_support::{
-        build_test_agent, finalized_text_message, finalized_text_message_with_usage,
+        build_test_agent, finalized_text_message, finalized_text_message_with_usage, queue_prompt,
         scripted_run_config, scripted_run_config_with_window,
     };
 
@@ -846,9 +857,9 @@ mod tests {
     #[test]
     fn main_turn_rebuilds_the_catalog_from_the_live_config() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![]);
-        let (mut agent, _log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, _journal) = build_test_agent(&persistence, &run_config);
         let config = Mutex::new(Config::default());
         let overrides = Mutex::new(HashMap::new());
         assert!(agent.tool_names().contains(&"bash"), "enabled at build");
@@ -868,9 +879,9 @@ mod tests {
     #[test]
     fn sub_turn_without_an_override_stamps_nothing() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![]);
-        let (mut agent, _log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, _journal) = build_test_agent(&persistence, &run_config);
         let config = Mutex::new(Config::default());
         let overrides = Mutex::new(HashMap::new());
         let tools: Vec<String> = agent.tool_names().iter().map(|n| n.to_string()).collect();
@@ -913,19 +924,19 @@ mod tests {
     #[tokio::test]
     async fn overflow_recovers_and_retries_succeeds() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![
             overflow_error_message(),
             finalized_text_message("recovered"),
         ]);
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, journal) = build_test_agent(&persistence, &run_config);
         let policy = recover_policy();
+        queue_prompt(&agent, "hi");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("hi".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -950,17 +961,17 @@ mod tests {
     #[tokio::test]
     async fn repeat_overflow_returns_wrapped_giveup() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config =
             scripted_run_config(vec![overflow_error_message(), overflow_error_message()]);
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, journal) = build_test_agent(&persistence, &run_config);
         let policy = recover_policy();
+        queue_prompt(&agent, "hi");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("hi".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -984,10 +995,10 @@ mod tests {
     #[tokio::test]
     async fn overflow_giveup_emits_guidance_warning() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config =
             scripted_run_config(vec![overflow_error_message(), overflow_error_message()]);
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, journal) = build_test_agent(&persistence, &run_config);
 
         let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&warnings);
@@ -998,12 +1009,12 @@ mod tests {
         }));
 
         let policy = recover_policy();
+        queue_prompt(&agent, "hi");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("hi".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -1022,21 +1033,21 @@ mod tests {
     #[tokio::test]
     async fn overflow_not_recovered_when_policy_disabled() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![overflow_error_message()]);
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, journal) = build_test_agent(&persistence, &run_config);
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
             during_turn_threshold: None,
             keep_recent: 20_000,
         };
+        queue_prompt(&agent, "hi");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("hi".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -1058,21 +1069,21 @@ mod tests {
     #[tokio::test]
     async fn successful_turn_without_triggers_returns_ok() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![finalized_text_message("done")]);
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, journal) = build_test_agent(&persistence, &run_config);
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
             during_turn_threshold: None,
             keep_recent: 20_000,
         };
+        queue_prompt(&agent, "hi");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("hi".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -1088,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn over_threshold_turn_compacts_once() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         // Window 1000; the threshold turn reports 900 prompt tokens
         // (> 0.85 * 1000), which is sufficient to compact. The recent turn
         // fits in the tail, while the large older answer must be summarized.
@@ -1100,7 +1111,7 @@ mod tests {
             ],
             1000,
         );
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, journal) = build_test_agent(&persistence, &run_config);
         // Warm-up turn so the log carries prior context for the
         // threshold compaction to summarize.
         agent
@@ -1113,12 +1124,12 @@ mod tests {
             during_turn_threshold: None,
             keep_recent: 10,
         };
+        queue_prompt(&agent, "next");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("next".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -1140,14 +1151,14 @@ mod tests {
     #[tokio::test]
     async fn compaction_after_branch_switch_summarizes_active_path() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![
             finalized_text_message(&"shared answer ".repeat(400)),
             finalized_text_message("active answer"),
             finalized_text_message("abandoned answer"),
             finalized_text_message("SUMMARY of shared work"),
         ]);
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, log, journal) = build_test_agent(&persistence, &run_config);
 
         // Turn 1 builds the common prefix; its tail is the divergence
         // point both branches chain from.
@@ -1196,13 +1207,13 @@ mod tests {
                 .set_head(active_head.clone())
                 .expect("head to branch A");
             let active_ids: HashSet<String> = guard
-                .linearize(&active_head, ThreadFilter::USER)
+                .linearize(&active_head, ThreadFilter::MAIN)
                 .entries()
                 .iter()
                 .map(|e| e.id.clone())
                 .collect();
             let abandoned_ids: HashSet<String> = guard
-                .linearize(&abandoned_head, ThreadFilter::USER)
+                .linearize(&abandoned_head, ThreadFilter::MAIN)
                 .entries()
                 .iter()
                 .map(|e| e.id.clone())
@@ -1212,8 +1223,7 @@ mod tests {
 
         let outcome = run_compaction(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             CompactionReason::Manual,
             None,
             100,
@@ -1233,7 +1243,7 @@ mod tests {
                 .entries_in_order()
                 .iter()
                 .find_map(|e| match &e.entry {
-                    ConversationEntryKind::Compaction {
+                    LogEntryKind::Compaction {
                         first_kept_entry_id,
                         ..
                     } => Some(first_kept_entry_id.clone()),
@@ -1274,24 +1284,24 @@ mod tests {
     #[tokio::test]
     async fn under_threshold_turn_does_not_compact() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let run_config = scripted_run_config_with_window(
             vec![finalized_text_message_with_usage("ok", 100)],
             1000,
         );
-        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        let (mut agent, _log, journal) = build_test_agent(&persistence, &run_config);
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: Some(0.85),
             during_turn_threshold: None,
             keep_recent: 10,
         };
+        queue_prompt(&agent, "hi");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("hi".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )

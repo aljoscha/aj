@@ -19,7 +19,7 @@ use aj_app::test_support::{
     build_tagged_test_agent, finalized_text_message, scripted_run_config,
 };
 use aj_models::types::{AssistantContent, AssistantError, ErrorCategory, StopReason, ToolCall};
-use aj_session::{ConversationPersistence, LogSnapshot, TaggedEvent, project_suffix};
+use aj_session::{LogSnapshot, ProjectSessions, TaggedEvent, project_suffix};
 use aj_wire::{DurableEvent, Frame};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +43,7 @@ struct Client {
 impl Client {
     /// A client that attached the session as soon as it was created: the
     /// host serves the block of the seeded log, which holds the session's
-    /// creation records (its context notice) and no turn yet.
+    /// creation entries (its context notice) and no turn yet.
     fn attached(seeded: &LogSnapshot) -> Self {
         let mut this = Self {
             client: SessionClient::new(SESSION.to_string()),
@@ -138,6 +138,7 @@ fn event_frame(epoch: &str, tagged: &TaggedEvent) -> Frame {
 /// The `state` an attach block opens with.
 fn state_frame(epoch: &str, working: bool) -> Frame {
     Frame::State {
+        turn_interrupted: false,
         session: SESSION.to_string(),
         epoch: epoch.to_string(),
         opens_block: true,
@@ -157,6 +158,7 @@ fn caught_up_frame(epoch: &str, last_seq: u64) -> Frame {
         last_seq,
         tasks: Default::default(),
         queues: Default::default(),
+        history_start: None,
     }
 }
 
@@ -328,7 +330,7 @@ async fn recorded_turn(
     prompt: &str,
 ) -> Recorded {
     let dir = TempDir::new().expect("tempdir");
-    let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+    let persistence = ProjectSessions::new(dir.path().to_path_buf());
     let run_config = scripted_run_config(messages);
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
     let seeded = log.lock().await.snapshot();
@@ -340,7 +342,14 @@ async fn recorded_turn(
 
     let mut recorded = Vec::new();
     while let Ok(frame) = frames.try_recv() {
-        recorded.push(frame);
+        // A turn appends only what its events stand for. The first turn
+        // also creates the session, which stores the seeded records and
+        // publishes their position.
+        match frame {
+            aj_session::Committed::Event(frame) => recorded.push(frame),
+            aj_session::Committed::Position(seq) if seq == seeded.last_seq() => {}
+            position => panic!("a turn published a bare position: {position:?}"),
+        }
     }
     let snapshot = log.lock().await.snapshot();
     Recorded {
@@ -360,7 +369,7 @@ fn uninterrupted(run: &Recorded) -> Client {
     client
 }
 
-/// The comparison needs a completed conversation, not two equally empty folds.
+/// The comparison needs a completed turn, not two equally empty folds.
 /// Check the user-visible fixture content independently of the projection.
 fn assert_completed_turn(chat: &ChatState, prompt: &str, answer: &str) {
     let entries = chat
@@ -387,7 +396,7 @@ fn assert_completed_turn(chat: &ChatState, prompt: &str, answer: &str) {
     assert_eq!(
         entries
             .iter()
-            .filter(|entry| matches!(entry.kind, EntryKind::TurnUsage(_)))
+            .filter(|entry| matches!(entry.kind, EntryKind::RoundUsage(_)))
             .count(),
         2,
         "both successful inferences report usage, including zero-token usage"
@@ -494,7 +503,7 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
         .filter(|entry| {
             matches!(
                 entry.entry,
-                aj_session::ConversationEntryKind::Message { ref message }
+                aj_session::LogEntryKind::Message { ref message }
                     if matches!(message.as_stored_wire(), Some(aj_models::types::Message::Assistant(_)))
             )
         })
@@ -535,7 +544,7 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                CanonicalEntry::TurnUsage { source_entry, .. } => Some(source_entry.clone()),
+                CanonicalEntry::RoundUsage { source_entry, .. } => Some(source_entry.clone()),
                 _ => None,
             })
             .collect()

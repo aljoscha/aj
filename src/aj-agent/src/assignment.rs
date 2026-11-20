@@ -65,7 +65,7 @@ impl ForegroundAssignment {
     }
 
     // Reserve terminal delivery before publishing AgentEnd. The host can
-    // wake independent queued work as soon as it observes that event.
+    // wake independent pending work as soon as it observes that event.
     pub(crate) fn take_reply(&self) -> Option<oneshot::Sender<Report>> {
         self.reply.lock().expect("assignment mutex poisoned").take()
     }

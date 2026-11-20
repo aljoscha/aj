@@ -51,7 +51,7 @@ use aj_models::oauth::OAuthError;
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
 use aj_models::{ThinkingConfig, thinking_config_from_name};
-use aj_session::{ConversationPersistence, PromptEntry, ThreadFilter};
+use aj_session::{ProjectSessions, PromptEntry, ThreadFilter};
 use aj_wire::SessionPreview;
 use aj_wire::{
     CredentialMutation, CredentialOutcome, CredentialOverview, StoredCredentialMetadata,
@@ -218,7 +218,7 @@ struct World {
     auth: AuthStorage,
     /// This process's project sessions store. The ring bootstrap reads it only
     /// for local runs. Host-facing overlays read through Control.
-    persistence: ConversationPersistence,
+    persistence: ProjectSessions,
     /// Environment armed for every create this invocation performs. It stays
     /// with the frontend rather than the host so unrelated remote creates on
     /// an embedded server cannot inherit the launcher's identity.
@@ -258,7 +258,7 @@ enum StartupSession {
 /// implicit request to create a session. Store read failures are propagated.
 fn startup_session(
     command: Option<&CliCommand>,
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
 ) -> Result<StartupSession> {
     Ok(match command {
         Some(CliCommand::Continue {
@@ -272,7 +272,7 @@ fn startup_session(
             Some(latest) => StartupSession::Resume(latest),
             None => {
                 return Err(anyhow!(
-                    "no conversation sessions to resume; invoke `aj` to start a new session"
+                    "no sessions to resume; invoke `aj` to start a new session"
                 ));
             }
         },
@@ -292,7 +292,7 @@ async fn build_world(
     layers: ConfigLayers,
     diagnostics: &[ConfigDiagnostic],
     auth: &AuthStorage,
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     idle_grace: Option<Duration>,
 ) -> Result<World> {
     let config = layers.effective();
@@ -503,7 +503,7 @@ async fn build_connect_world(
     layers: ConfigLayers,
     diagnostics: &[ConfigDiagnostic],
     auth: &AuthStorage,
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
 ) -> Result<World> {
     let config = layers.effective();
     let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
@@ -1108,9 +1108,9 @@ enum Focus {
 ///
 /// What a change has to say about itself, the confirmation as much as the
 /// refusal, is feedback about this client's gesture rather than anything in
-/// either session's conversation, so it goes to the toast stack. Folding it
+/// either session's transcript, so it goes to the toast stack. Folding it
 /// would put it in a transcript the switch is in the middle of replacing, and
-/// on a session with no conversation yet there is not even one on screen to
+/// on a session with no transcript yet there is not even one on screen to
 /// carry it (the splash is).
 ///
 /// Every arm works in both modes. Creating and resuming go through the control
@@ -1622,7 +1622,7 @@ fn fail_pending_transition(
 /// transcript wholesale, so a confirmation folded into it would be describing
 /// the switch from inside what the switch just built, and a refusal would land
 /// on the branch the user was trying to leave. What a fold is still right for
-/// here is the lost stream: that is about the conversation on screen no longer
+/// here is the lost stream: that is about the transcript on screen no longer
 /// being fed, not about the gesture.
 async fn branch_focused_session(
     app: &mut AsyncApp,
@@ -1731,7 +1731,7 @@ fn head_refusal(branching: bool, err: &ControlError) -> String {
     } else if err.unknown_entry() {
         "Can't switch: that branch is no longer in this session.".to_string()
     } else {
-        format!("Failed to branch the conversation: {}", peer_refusal(err))
+        format!("Failed to branch the session: {}", peer_refusal(err))
     }
 }
 
@@ -1795,7 +1795,7 @@ async fn refresh_local_handles(
 /// turn) vs a tree-view switch that only moved the head.
 fn branch_switch_notice(prompt_present: bool) -> &'static str {
     if prompt_present {
-        "Branched the conversation from an earlier message."
+        "Branched the session from an earlier message."
     } else {
         "Switched to the selected branch."
     }
@@ -1926,7 +1926,7 @@ fn warning_event(text: &str) -> AgentEvent {
 
 /// One warning per skill-discovery diagnostic of a fresh session's env. Empty
 /// for a resume, whose assembled prompt is fixed in its log and so is not
-/// governed by the env read now. The `Context:` listing itself is a record in
+/// governed by the env read now. The `Context:` listing itself is an entry in
 /// the session log and arrives with the attach block.
 ///
 /// Both the process-start path ([`build_world`]) and the in-process
@@ -2293,7 +2293,7 @@ fn credential_picker_rows(
 /// Kept outside the overlay stack because the flow is async and
 /// long-running rather than a synchronous confirm/cancel selector, but
 /// paired with the dialog overlay it pushed. Carries the provider's
-/// display name (for the completion notice), the cancel flag the dialog
+/// display name (for the task notification), the cancel flag the dialog
 /// (Esc/Ctrl+C) flips, and the spawned task's handle the loop awaits.
 struct LoginSession {
     provider_name: String,
@@ -3197,7 +3197,7 @@ fn replace_editor_preserving_draft(editor: &Rc<RefCell<TextArea>>, message: &str
 /// event, so what it has to say stands in the chrome for exactly as long as
 /// the mode does. A toast would expire under a user still deciding what to
 /// type, and a transcript fold would put a fact about this client's editor
-/// into a conversation that has nothing to do with it.
+/// into a transcript that has nothing to do with it.
 fn branch_armed_hint() -> String {
     format!(
         "branching \u{00b7} type a message \u{00b7} {} cancels",
@@ -3210,7 +3210,7 @@ fn branch_armed_hint() -> String {
 ///
 /// A refused gesture is a completed client action with nothing left pending,
 /// so it toasts rather than folding: the gesture never reached the
-/// conversation, and the mode it collided with is already named in the
+/// transcript, and the mode it collided with is already named in the
 /// editor's chrome.
 fn branch_armed_refusal(what: &str) -> String {
     format!(
@@ -3248,8 +3248,8 @@ async fn handle_submit(world: &mut World, text: String) -> bool {
 
 /// Send a prompt command and fold the host's reason when it refuses.
 ///
-/// Every refusal here is one the host alone can decide: an agent with no
-/// live handle (a resumed sub-agent), an attachment that cannot be queued
+/// Every refusal here is one the host alone can decide: a sub-agent the
+/// selected branch does not show, an attachment that cannot be queued
 /// behind a busy agent. Its wording is user-facing, and a remote client
 /// shows the same string.
 async fn prompt_host(world: &mut World, command: Command) -> bool {
@@ -3896,6 +3896,18 @@ async fn apply_command_action(
         }
         CommandAction::ArchiveSession => {
             apply_archive(world, !focused_archived(world)).await;
+            ActionEffect::Redraw
+        }
+        CommandAction::Continue => {
+            // The host decides whether there is a turn to resume, and its
+            // refusal says why not.
+            if let Err(err) = world
+                .control
+                .command(world.session(), Command::Continue)
+                .await
+            {
+                fold_notice(world, &err.to_string());
+            }
             ActionEffect::Redraw
         }
         CommandAction::Compact => {
@@ -5539,6 +5551,87 @@ async fn fill_host_skills(fetch: SkillsFetch) {
     }
 }
 
+/// A history fetch's answer, with the session it was asked for.
+type HistoryFetched = (String, Result<aj_wire::HistoryPage, ControlError>);
+
+/// Fetch the page of the shown agent's history before what the focused
+/// transcript shows, when its view wants one and no fetch is in flight. The transcript decides
+/// whether it wants more (the reader is near the top of what is loaded, or
+/// pressed Home), and the next page is asked for once this one has landed.
+fn fetch_wanted_history(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    tx: &UnboundedSender<HistoryFetched>,
+    fetching: &mut bool,
+) {
+    if *fetching {
+        return;
+    }
+    let Some(limit) = shell.borrow().view().transcript.borrow().history_wanted() else {
+        return;
+    };
+    if shell
+        .borrow()
+        .view()
+        .transcript
+        .borrow_mut()
+        .take_history_announce()
+    {
+        shell.borrow().show_toast("Loading earlier history…");
+    }
+    let (agent, before) = {
+        let chat = world.directory.chat();
+        let chat = chat.borrow();
+        (chat.active_view(), chat.history_start(chat.active_view()))
+    };
+    let (control, session, tx) = (
+        world.control.clone(),
+        world.session().to_string(),
+        tx.clone(),
+    );
+    *fetching = true;
+    tokio::spawn(async move {
+        let page = control.history(&session, agent, before, limit).await;
+        let _ = tx.send((session, page));
+    });
+}
+
+/// Put a fetched page in front of its session's transcript. A page for a
+/// session, epoch or position this client has moved on from is dropped by
+/// the fold. A failure stops further fetches until the reader scrolls again.
+fn apply_fetched_history(world: &mut World, shell: &Rc<RefCell<Shell>>, fetched: HistoryFetched) {
+    let (session, page) = fetched;
+    match page {
+        Ok(page) => {
+            // A dropped page answers a question this client no longer asks
+            // (another epoch or position). Asking again at once would get
+            // the same answer, so wait for the reader to scroll.
+            if !world.directory.apply_history(&session, page) && session == world.session() {
+                shell
+                    .borrow()
+                    .view()
+                    .transcript
+                    .borrow_mut()
+                    .pause_history();
+            }
+        }
+        Err(err) => {
+            shell
+                .borrow()
+                .view()
+                .transcript
+                .borrow_mut()
+                .pause_history();
+            let notice = if err.unknown_endpoint() {
+                "This host cannot page earlier history. Update the host and try again.".to_string()
+            } else {
+                format!("Could not load earlier history: {}", peer_refusal(&err))
+            };
+            fold_notice(world, &notice);
+        }
+    }
+}
+
 /// Fetch host-rendered HTML and save it on this client off the drive loop.
 /// The result notice names the local destination, including over a connection.
 fn spawn_session_export(control: &Control, session: &str, tx: &UnboundedSender<String>) {
@@ -5820,13 +5913,13 @@ struct ChatSlot {
 
 impl Widget for ChatSlot {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        let conversation = self.chat.borrow().has_conversation();
+        let has_messages = self.chat.borrow().has_messages();
         let (rebuilding, connection) = {
             let status = self.status.borrow();
             (status.rebuilding, status.connection)
         };
         let refused = matches!(connection, Connection::Refused | Connection::Unreachable);
-        if rebuilding || (!conversation && connection != Connection::Connected && !refused) {
+        if rebuilding || (!has_messages && connection != Connection::Connected && !refused) {
             // A flex parent's measuring pass draws under an unbounded height,
             // and the slot has no inherent height, so report zero there.
             return Surface::with_size(vaxis::vxfw::Size {
@@ -5836,7 +5929,7 @@ impl Widget for ChatSlot {
         }
         // Even an empty session has refusal and retry guidance to show. Use the
         // transcript for those notices, not the ready-to-chat splash.
-        let child = if conversation || refused {
+        let child = if has_messages || refused {
             draw_widget(&to_widget_ref(Rc::clone(&self.transcript)), ctx)
         } else {
             draw_widget(&to_widget_ref(Rc::clone(&self.splash)), ctx)
@@ -6060,7 +6153,7 @@ struct Shell {
     /// settings window through `apply_setting_change`, which shares this cell.
     show_frame_stats: Rc<Cell<bool>>,
     /// How every session's transcript is presented. Seeded from config by the
-    /// run loop, written by the settings window and the display shortcuts,
+    /// main loop, written by the settings window and the display shortcuts,
     /// and shared into each [`SessionView`]'s transcript, which reads it at
     /// draw time.
     display: Rc<RefCell<TranscriptDisplay>>,
@@ -6168,7 +6261,7 @@ impl Shell {
         cwd: PathBuf,
     ) -> Shell {
         let window_title = aj_app::session::window_title(APP_TITLE, session_id, &cwd);
-        // Defaults until the run loop seeds it from config, like
+        // Defaults until the main loop seeds it from config, like
         // `show_frame_stats` below.
         let display = Rc::new(RefCell::new(TranscriptDisplay::default()));
         let toasts: ToastStack = Rc::new(RefCell::new(Vec::new()));
@@ -6201,7 +6294,7 @@ impl Shell {
             Rc::clone(&chrome),
             Rc::clone(&quit_hint_warning),
         ));
-        // Off by default; the run loop seeds it from `config.show_frame_stats`
+        // Off by default; the main loop seeds it from `config.show_frame_stats`
         // after building the Shell, matching the other display toggles.
         let show_frame_stats = Rc::new(Cell::new(false));
         let frame_stats: Rc<Cell<Option<FrameStats>>> = Rc::new(Cell::new(None));
@@ -6218,7 +6311,7 @@ impl Shell {
         // The strip runs the full height beside the column, not beside the chat
         // alone: it is about the connection rather than the transcript, and a
         // strip that stopped at the editor would leave the session list looking
-        // like part of the conversation. The split owns the divider and the
+        // like part of the transcript. The split owns the divider and the
         // geometry. Hidden layouts give the whole viewport to the session.
         let sidebar = Rc::new(RefCell::new(SidebarState::default()));
         let sidebar_strip = Rc::new(RefCell::new(SessionSidebar::new(
@@ -7152,7 +7245,7 @@ impl Widget for Shell {
             if self.view().branch_anchor.borrow().is_some() {
                 self.disarm_branch();
                 // A cancel is a client action that has completed: the mode is
-                // gone, nothing is pending, and the conversation was never
+                // gone, nothing is pending, and the session was never
                 // part of it. That is a toast, not a fold.
                 self.show_toast("Branch cancelled.");
                 ctx.consume_and_redraw();
@@ -7278,8 +7371,7 @@ pub async fn run(args: Args) -> Result<()> {
     )?;
 
     let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
-    let sessions_dir = Config::get_sessions_dir_path()?;
-    let persistence = ConversationPersistence::new(sessions_dir);
+    let persistence = aj_app::current_project_persistence()?;
 
     // Connect mode dials the host before anything touches the terminal, so an
     // unreachable host or a protocol mismatch reports on the normal screen.
@@ -7469,7 +7561,7 @@ pub async fn run(args: Args) -> Result<()> {
     })
     .await;
 
-    // The alt screen wiped the conversation from the terminal, so the
+    // The alt screen wiped the transcript from the terminal, so the
     // normal screen gets the resume hint.
     banner.print();
     run_result
@@ -7926,6 +8018,10 @@ async fn drive(
     // Session HTML export renders and writes off the loop, delivering only its
     // result notice string back here.
     let (export_tx, mut export_rx) = unbounded_channel::<String>();
+    // Pages of earlier history are fetched off the loop, one at a time. The
+    // flag is the fetch in flight, and its result comes back here.
+    let (history_tx, mut history_rx) = unbounded_channel::<HistoryFetched>();
+    let mut history_fetching = false;
     // Shared UI redraw pings from off-thread work. Widgets that spawn
     // their own tasks (the OAuth login, the usage overlay's fetch and
     // consume) run on tokio, off this `!Send` thread, so they can't call
@@ -8041,6 +8137,7 @@ async fn drive(
             app.request_redraw();
         }
         sync_sidebar(world, shell);
+        fetch_wanted_history(world, shell, &history_tx, &mut history_fetching);
         sync_program_status(app, world, &mut program_status, login_session.as_ref());
         // Entry ids restart when the model is replaced. Clear image lookups
         // and terminal allocations before painting, while the terminal handle
@@ -8166,6 +8263,15 @@ async fn drive(
             maybe_export = export_rx.recv() => {
                 if let Some(notice) = maybe_export {
                     fold_notice(world, &notice);
+                    app.request_redraw();
+                }
+            }
+
+            // --- Earlier history page ---
+            maybe_page = history_rx.recv() => {
+                if let Some(fetched) = maybe_page {
+                    history_fetching = false;
+                    apply_fetched_history(world, shell, fetched);
                     app.request_redraw();
                 }
             }
@@ -8850,13 +8956,13 @@ impl ExitBanner {
                 resume_hint: Some(format_remote_resume_hint(url, world.session())),
             };
         }
-        // Offer local resume once there is persisted user-thread state.
+        // Offer local resume once there is persisted main-thread state.
         let resume_eligible = match world.local.as_ref() {
             Some(handles) => handles
                 .log
                 .lock()
                 .await
-                .latest_leaf(ThreadFilter::USER)
+                .latest_leaf(ThreadFilter::MAIN)
                 .is_some(),
             None => false,
         };
@@ -8917,7 +9023,7 @@ mod tests {
     use aj_app::test_support::CanonicalState;
     use aj_models::auth::AuthCredential;
     use aj_models::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
-    use aj_session::{AppendFault, AppendFaultFixture};
+    use aj_session::fail_sqlite_commits;
     use async_trait::async_trait;
     use tempfile::TempDir;
     use tokio::sync::Notify;
@@ -9100,25 +9206,35 @@ mod tests {
     /// A fresh log writes nothing until its first append, so a store seeded
     /// with a bare `create` would read empty for reasons that have nothing to
     /// do with what a test is asking about.
-    fn seed_session(persistence: &ConversationPersistence) -> String {
+    fn seed_session(persistence: &ProjectSessions) -> String {
+        let mut log = aj_session::SessionLog::create(persistence).expect("create");
+        seed(&mut log);
+        log.session_id().to_string()
+    }
+
+    /// [`seed_session`] as a JSONL file that has not been imported, whose
+    /// label and archive marker live in sidecars.
+    fn seed_jsonl_session(persistence: &ProjectSessions) -> String {
+        aj_session::jsonl_session(persistence, seed).0
+    }
+
+    fn seed(log: &mut aj_session::SessionLog) {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
-        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+        use aj_session::{LogEntryKind, ThreadKind};
 
-        let mut log = ConversationLog::create(persistence).expect("create");
         log.set_system_prompt("system".to_string())
             .expect("system prompt");
         let root = log.system_prompt_id().cloned().expect("system prompt id");
         log.append(
             Some(root),
-            ThreadKind::User,
+            ThreadKind::Main,
             None,
-            ConversationEntryKind::Message {
+            LogEntryKind::Message {
                 message: AgentMessage::wire(Message::User(UserMessage::text("a prompt"))),
             },
         )
         .expect("a prompt");
-        log.session_id().to_string()
     }
 
     #[test]
@@ -9548,6 +9664,7 @@ mod tests {
             &mut lifecycle,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(7),
                 task: "inspect the picker wiring".into(),
@@ -9740,7 +9857,7 @@ mod tests {
         layers.user.spill_dir = spill_dir_in(dir);
         let args = Args::parse_from(["aj", "--scripted", demo]);
         let auth = AuthStorage::for_test(dir.path().join("auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let world = build_world(&args, layers, &[], &auth, &persistence, idle_grace)
             .await
             .expect("build world");
@@ -9942,7 +10059,7 @@ mod tests {
     async fn resumed_world(dir: &TempDir, demo: &str, session_id: &str) -> World {
         let args = Args::parse_from(["aj", "--scripted", demo, "continue", session_id]);
         let auth = AuthStorage::for_test(dir.path().join("auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let world = build_world(&args, default_layers(), &[], &auth, &persistence, None)
             .await
             .expect("build resumed world");
@@ -10030,7 +10147,7 @@ mod tests {
             level: NoticeLevel,
             text: String,
         },
-        TurnUsage {
+        RoundUsage {
             line: String,
         },
         TaskNotification {
@@ -10079,7 +10196,7 @@ mod tests {
                 level: n.level,
                 text: n.text.clone(),
             },
-            EntryKind::TurnUsage(u) => EntryShape::TurnUsage { line: u.line() },
+            EntryKind::RoundUsage(u) => EntryShape::RoundUsage { line: u.line() },
             EntryKind::TaskNotification(n) => EntryShape::TaskNotification {
                 label: n.label.clone(),
                 outcome: n.outcome,
@@ -10483,19 +10600,39 @@ mod tests {
     #[tokio::test]
     async fn aborted_session_resume_loads_and_observes() {
         let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "parallel-agents").await;
+        let args = Args::parse_from(["aj", "--scripted", "parallel-agents"]);
+        let auth = AuthStorage::for_test(dir.path().join("auth.json"));
+        let persistence = store_in(&dir);
+        let mut world = launched(
+            build_world(
+                &args,
+                layers_spilling_into(&dir),
+                &[],
+                &auth,
+                &persistence,
+                None,
+            )
+            .await
+            .expect("build JSONL tail-repair fixture"),
+        )
+        .await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.session().to_string();
-        let log_path = {
-            let log = world.handles().log.lock().await;
-            log.path().to_path_buf()
-        };
-        // Let the host go so nothing holds the log open while it is rewritten
-        // on disk, and so the resume below can take the session's lock.
+        let written = world.session().to_string();
+        // Let the host go, so the resume below can take the session's lock.
         shut_down(&world).await;
+        // The session as a JSONL file under an id of its own, which is what
+        // an interrupted append tears.
+        let exported = persistence
+            .export_jsonl(&written, &dir.path().join("exported"))
+            .expect("export the session");
+        let session_id = "2000-01-01-00-00-00-000".to_string();
+        let log_path = persistence
+            .sessions_dir()
+            .join(format!("{session_id}.jsonl"));
+        std::fs::copy(exported, &log_path).expect("a JSONL session");
 
         // Truncate mid sub-agent run: keep every complete line up to the last
-        // sub-agent line, then tear that line in half. `ConversationLog::resume`
+        // sub-agent line, then tear that line in half. `SessionLog::resume`
         // repairs the log by dropping the torn final line, so that sub-agent's
         // run is cut short with only its earlier messages flushed. This is the
         // aborted shape the spec wants (no terminal record, torn final line).
@@ -10663,7 +10800,7 @@ mod tests {
     }
 
     /// A resumed session opens with the context it was created with. The
-    /// listing is a record in the log beside the frozen prompt it describes,
+    /// listing is an entry in the log beside the frozen prompt it describes,
     /// so it replays exactly once, at the top, and reads the same as it did the
     /// day the session was made.
     #[tokio::test]
@@ -10705,7 +10842,7 @@ mod tests {
     async fn world_from_argv(dir: &TempDir, argv: &[&str]) -> Result<World> {
         let args = Args::parse_from(argv);
         let auth = AuthStorage::for_test(dir.path().join("auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let world = build_world(
             &args,
             layers_spilling_into(dir),
@@ -10719,11 +10856,11 @@ mod tests {
     }
 
     /// This run's session store, for reading a sidecar back.
-    fn store_in(dir: &TempDir) -> ConversationPersistence {
-        ConversationPersistence::new(dir.path().join("sessions"))
+    fn store_in(dir: &TempDir) -> ProjectSessions {
+        ProjectSessions::new(dir.path().join("sessions"))
     }
 
-    fn listed_session_ids(persistence: &ConversationPersistence) -> Vec<String> {
+    fn listed_session_ids(persistence: &ProjectSessions) -> Vec<String> {
         persistence
             .list_sessions()
             .expect("list the fixture")
@@ -10734,6 +10871,7 @@ mod tests {
 
     /// `--tag` names the session a local run creates: the label lands on the
     /// created session, through the host's own create rather than beside it.
+    /// The session has no message yet, so the store holds nothing for it.
     #[tokio::test]
     async fn the_tag_flag_names_the_session_a_local_run_creates() {
         let dir = TempDir::new().expect("tempdir");
@@ -10744,12 +10882,13 @@ mod tests {
         .await
         .expect("build world");
 
+        let rows = world.control.sessions().await.expect("session list");
+        let row = rows.sessions.iter().find(|row| row.id == world.session());
         assert_eq!(
-            store_in(&dir)
-                .read_tag(world.session())
-                .expect("read the sidecar"),
-            Some("fix-auth".to_string()),
+            row.expect("the created session is listed").tag.as_deref(),
+            Some("fix-auth"),
         );
+        assert!(listed_session_ids(&store_in(&dir)).is_empty());
         shut_down(&world).await;
     }
 
@@ -10764,7 +10903,7 @@ mod tests {
     async fn bare_continue_opens_the_newest_unarchived_session_through_the_composed_build() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = store_in(&dir);
-        let older = seed_session(&persistence);
+        let older = seed_jsonl_session(&persistence);
         // Minted by hand rather than created, because ids come from the clock
         // and two creates inside one test can collide.
         let newer = "2999-01-01-00-00-00-000";
@@ -10820,10 +10959,7 @@ mod tests {
                     Err(error) => {
                         if id.is_none() {
                             let message = format!("{error:#}");
-                            assert!(
-                                message.contains("no conversation sessions to resume"),
-                                "{message}"
-                            );
+                            assert!(message.contains("no sessions to resume"), "{message}");
                             assert!(message.contains("invoke `aj`"), "{message}");
                         }
                     }
@@ -10854,7 +10990,7 @@ mod tests {
     async fn bare_continue_fails_through_the_composed_build_when_the_store_cannot_be_read() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = store_in(&dir);
-        let only = seed_session(&persistence);
+        let only = seed_jsonl_session(&persistence);
         assert_eq!(
             listed_session_ids(&persistence),
             vec![only.clone()],
@@ -10878,12 +11014,10 @@ mod tests {
         match world_from_argv(&dir, &["aj", "--scripted", "streaming-text", "continue"]).await {
             Err(_) => {
                 assert_eq!(
-                    std::fs::read_dir(dir.path().join("sessions"))
-                        .expect("the sessions directory is still readable")
-                        .filter_map(|entry| entry.ok())
-                        .filter(|entry| entry.path().extension().and_then(|s| s.to_str())
-                            == Some("jsonl"))
-                        .count(),
+                    persistence
+                        .list_sessions()
+                        .expect("the session records are still readable")
+                        .len(),
                     1,
                     "the refused run minted no session",
                 );
@@ -10981,39 +11115,6 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// A label the store cannot write does not stop the run. The session was
-    /// minted and is durable user state, so the shell opens on it and says the
-    /// label did not land, leaving the user to retag rather than re-create.
-    #[tokio::test]
-    async fn a_launch_tag_the_store_refuses_still_opens_the_session() {
-        let dir = TempDir::new().expect("tempdir");
-        // `meta/` occupied by a file is a sidecar write that cannot land.
-        let sessions = dir.path().join("sessions");
-        std::fs::create_dir_all(&sessions).expect("the store directory");
-        std::fs::write(sessions.join("meta"), "not a directory").expect("block the sidecar");
-
-        let world = world_from_argv(
-            &dir,
-            &["aj", "--scripted", "streaming-text", "--tag", "fix-auth"],
-        )
-        .await
-        .expect("the run starts on the session it minted");
-
-        let notices = main_notices(&world);
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.contains(world.session()) && notice.contains("not applied")),
-            "the warning names the session that exists: {notices:?}",
-        );
-        assert_eq!(
-            store_in(&dir).read_tag(world.session()).ok().flatten(),
-            None,
-            "and the label really did not land",
-        );
-        shut_down(&world).await;
-    }
-
     /// An illegal label is refused before anything is minted, so the run
     /// reports on the normal screen and leaves no session behind.
     #[tokio::test]
@@ -11047,7 +11148,7 @@ mod tests {
     /// The complete fresh-session block keeps config diagnostics, skill
     /// diagnostics, sandbox, auth, and tmux warnings in their promised order.
     /// Its environment portion is absent for a resume, whose prompt is fixed in
-    /// its log. The context listing is not in this block: it is a record in
+    /// its log. The context listing is not in this block: it is an entry in
     /// the log and arrives with the attach block.
     #[test]
     fn fresh_session_notice_block_has_one_order_and_fresh_environment() {
@@ -11322,15 +11423,15 @@ mod tests {
 
     /// The store `scripted_world_with` sites its sessions in, for a test that
     /// reaches around the host to take a lock of its own.
-    fn store_of(dir: &TempDir) -> ConversationPersistence {
-        ConversationPersistence::new(dir.path().join("sessions"))
+    fn store_of(dir: &TempDir) -> ProjectSessions {
+        ProjectSessions::new(dir.path().join("sessions"))
     }
 
     /// A switch refused because another writer holds the session's lock says
     /// so, and it says so on a fresh session that has never persisted a turn.
     ///
     /// The refusal belongs to the gesture, not to either session's
-    /// conversation, so it lands on the toast stack. That is also what makes
+    /// transcript, so it lands on the toast stack. That is also what makes
     /// it survive here: a fresh session shows the splash rather than a
     /// transcript, so a refusal folded into the chat model has nothing on
     /// screen carrying it.
@@ -11352,7 +11453,7 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         let fresh = world.session().to_string();
         assert!(
-            !world.chat.borrow().has_conversation(),
+            !world.chat.borrow().has_messages(),
             "the session we are refused from has never persisted a turn",
         );
         assert!(
@@ -11408,7 +11509,7 @@ mod tests {
         let drawn = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
             drawn.contains("In use by another process."),
-            "refusal guidance is visible even without a conversation: {drawn}"
+            "refusal guidance is visible even without a message: {drawn}"
         );
         assert!(
             world.directory.rows().iter().any(|row| row.id == fresh),
@@ -11534,8 +11635,8 @@ mod tests {
 
     /// A switch that took reports itself in a toast and leaves both
     /// transcripts exactly as it found them: the one it left and the one it
-    /// arrived at. Neither session's conversation gained a row for a gesture
-    /// that is not part of either conversation.
+    /// arrived at. Neither session's transcript gained a row for a gesture
+    /// that is not part of either transcript.
     ///
     /// Counted rather than searched, so a confirmation folded under any
     /// wording fails here.
@@ -12819,7 +12920,7 @@ mod tests {
         auto_submit_launch(&mut world, Vec::new()).await;
         fold_ready_frames(&mut world);
         assert!(!world.client().working());
-        assert!(!world.chat.borrow().has_conversation());
+        assert!(!world.chat.borrow().has_messages());
         shut_down(&world).await;
     }
 
@@ -12882,8 +12983,8 @@ mod tests {
         // carries the message the turn ran.
         let logged = {
             let log = world.handles().log.lock().await;
-            let head = log.latest_leaf(ThreadFilter::USER).expect("a head");
-            log.linearize(&head, ThreadFilter::USER)
+            let head = log.latest_leaf(ThreadFilter::MAIN).expect("a head");
+            log.linearize(&head, ThreadFilter::MAIN)
                 .agent_messages()
                 .iter()
                 .filter_map(|message| match message.as_stored_wire() {
@@ -12946,15 +13047,14 @@ mod tests {
     #[tokio::test]
     async fn a_persistence_failure_re_attaches_a_fresh_materialization() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let persistence = store_in(&dir);
+        let id = seed_session(&persistence);
+        let (mut world, shell) = with_shell(resumed_world(&dir, "streaming-text", &id).await);
         install_unpaced_demo(&world, "streaming-text");
         run_prompt(&mut world, "seed").await;
         let failed_session = world.session().to_string();
         let failed_log = Arc::clone(&world.handles().log);
-        let fault = AppendFaultFixture::new(AppendFault::WriteZero);
-        fault
-            .install(&mut *world.handles().log.lock().await)
-            .expect("install zero-write fault");
+        fail_sqlite_commits(&mut *world.handles().log.lock().await);
 
         handle_submit(&mut world, "hi".to_string()).await;
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -12993,14 +13093,17 @@ mod tests {
         assert_eq!(world.session(), failed_session);
         assert!(
             !Arc::ptr_eq(&failed_log, &world.handles().log),
-            "the rejoin reused the fused ConversationLog"
+            "the rejoin reused the fused SessionLog"
         );
         install_unpaced_demo(&world, "streaming-text");
         handle_submit(&mut world, "again".to_string()).await;
         settle(&mut world).await;
-        assert!(
-            user_rows(&world).iter().any(|text| text == "again"),
-            "the rematerialized session ran the prompt: {:?}",
+        // The failed host had accepted "hi", so it was saved and the
+        // rejoin restored it as pending. The next prompt joins it.
+        assert_eq!(
+            user_rows(&world).last().map(String::as_str),
+            Some("hi\nagain"),
+            "the rematerialized session ran both prompts: {:?}",
             user_rows(&world),
         );
         shut_down(&world).await;
@@ -13577,7 +13680,7 @@ mod tests {
             "task tracked to exited 0: {:?}",
             chat.tasks(),
         );
-        // The completion notice arrived as a typed task-notification
+        // The task notification arrived as a typed task-notification
         // entry (not a user prompt), so navigation and export branch on
         // it.
         assert!(
@@ -13745,7 +13848,10 @@ mod tests {
     /// tests that touch both (the editor lives on the Shell, the queues
     /// on the world).
     async fn world_and_shell(dir: &TempDir, demo: &str) -> (World, Rc<RefCell<Shell>>) {
-        let world = scripted_world(dir, demo).await;
+        with_shell(scripted_world(dir, demo).await)
+    }
+
+    fn with_shell(world: World) -> (World, Rc<RefCell<Shell>>) {
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
@@ -13769,7 +13875,7 @@ mod tests {
     ) -> (World, Rc<RefCell<Shell>>) {
         let args = Args::parse_from(["aj", "--scripted", demo, "--env", env]);
         let auth = AuthStorage::for_test(dir.path().join("auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let world = build_world(
             &args,
             layers_spilling_into(dir),
@@ -19141,6 +19247,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         fold_ready_frames(&mut world);
         let mut frame = aj_wire::Frame::State {
+            turn_interrupted: false,
             session: world.session().into(),
             epoch: world.client().cursor().unwrap().epoch,
             opens_block: false,
@@ -19206,6 +19313,7 @@ mod tests {
             last_seq: 0,
             tasks: Default::default(),
             queues: Default::default(),
+            history_start: None,
         });
         assert!(!world.client().rebuilding());
         assert!(sync_status(&world));
@@ -19231,6 +19339,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         fold_ready_frames(&mut world);
         let frame = aj_wire::Frame::State {
+            turn_interrupted: false,
             session: world.session().into(),
             epoch: world.client().cursor().unwrap().epoch,
             opens_block: false,
@@ -19287,6 +19396,7 @@ mod tests {
                     child: AgentId::Sub(n),
                     task: "Inspect the implementation".into(),
                     tool_name: tool.into(),
+                    call_id: None,
                     background: true,
                     settings: settings.clone(),
                 },
@@ -19329,7 +19439,8 @@ mod tests {
                 .await
                 .unwrap()
                 .settings,
-            aj_app::session_info::to_wire(&world.handles().log.lock().await.stats()).settings,
+            aj_app::session_info::to_wire(&world.handles().log.lock().await.stats().unwrap())
+                .settings,
             "session info reports recorded facts, not runtime defaults"
         );
         apply_command(
@@ -19575,6 +19686,7 @@ mod tests {
             &mut world,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(7),
                 task: "speed selector fixture".into(),
@@ -19653,7 +19765,7 @@ mod tests {
             assert_eq!(world.client().settings().unwrap().speed, name);
             let log = handles.log.lock().await;
             assert_eq!(
-                log.linearize(log.head().unwrap(), ThreadFilter::USER)
+                log.linearize(log.head().unwrap(), ThreadFilter::MAIN)
                     .settings()
                     .speed
                     .as_deref(),
@@ -19738,7 +19850,7 @@ mod tests {
                 .log
                 .lock()
                 .await
-                .latest_leaf(ThreadFilter::USER)
+                .latest_leaf(ThreadFilter::MAIN)
                 .is_some()
         };
         assert!(recorded, "thinking change recorded on the session log");
@@ -20249,6 +20361,7 @@ mod tests {
         let events = [
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "do the thing".into(),
@@ -20437,6 +20550,7 @@ mod tests {
             &mut world,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -20515,6 +20629,7 @@ mod tests {
             &mut world,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -20598,6 +20713,7 @@ mod tests {
             &mut world,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -20662,6 +20778,7 @@ mod tests {
             &mut world,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -20716,6 +20833,7 @@ mod tests {
             &mut world,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -20800,6 +20918,7 @@ mod tests {
             &mut world,
             AgentEvent::SubAgentStart {
                 tool_name: "agent".into(),
+                call_id: None,
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -20890,7 +21009,7 @@ mod tests {
 
     /// Esc typed at the real terminal, through the real loop: the branch is
     /// disarmed, the cancel toast is painted, the standing hint is gone from
-    /// the chrome, and the conversation gained nothing. Every wire in the
+    /// the chrome, and the transcript gained nothing. Every wire in the
     /// path is live here, from the key bytes to the composed frame.
     #[tokio::test]
     async fn a_typed_escape_cancels_the_branch_and_toasts_it() {
@@ -22094,7 +22213,7 @@ mod tests {
     fn branch_switch_notice_distinguishes_b_flow_from_tree_switch() {
         assert_eq!(
             branch_switch_notice(true),
-            "Branched the conversation from an earlier message."
+            "Branched the session from an earlier message."
         );
         assert_eq!(
             branch_switch_notice(false),
@@ -22116,7 +22235,7 @@ mod tests {
         let (message, old_head) = {
             let log = world.handles().log.lock().await;
             let message = log.entries_in_order().into_iter().find(|entry| matches!(&entry.entry,
-                aj_session::ConversationEntryKind::Message { message }
+                aj_session::LogEntryKind::Message { message }
                 if matches!(message.as_stored_wire(), Some(aj_models::types::Message::User(_)))
             )).unwrap().id.clone();
             (message, log.head().unwrap().clone())
@@ -22341,7 +22460,7 @@ mod tests {
         assert_eq!(
             main_notices(&world),
             folded,
-            "and folds nothing into the conversation",
+            "and folds nothing into the transcript",
         );
         assert_eq!(
             shell.borrow().view().editor.borrow().text(),
@@ -22353,7 +22472,7 @@ mod tests {
     /// Steer and dequeue are refused while a branch anchor is armed, keeping
     /// the anchor and the editor draft intact (both are incoherent with a
     /// pending branch). The refusal is a completed client gesture, so it
-    /// toasts rather than folding into a conversation it never reached.
+    /// toasts rather than folding into a transcript it never reached.
     #[tokio::test]
     async fn steer_and_dequeue_refused_while_branch_armed() {
         let dir = TempDir::new().expect("tempdir");
@@ -22522,7 +22641,7 @@ mod tests {
     #[tokio::test]
     async fn armed_submit_branches_before_the_anchored_message() {
         use aj_models::types::Message;
-        use aj_session::ConversationEntryKind;
+        use aj_session::LogEntryKind;
 
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
@@ -22540,7 +22659,7 @@ mod tests {
                 .find(|e| {
                     matches!(
                         &e.entry,
-                        ConversationEntryKind::Message { message }
+                        LogEntryKind::Message { message }
                             if matches!(message.as_stored_wire(), Some(Message::User(_)))
                     )
                 })
@@ -22666,7 +22785,7 @@ mod tests {
             let message = {
                 let log = handles.log.lock().await;
                 log.entries_in_order().into_iter().find(|entry| matches!(&entry.entry,
-                    aj_session::ConversationEntryKind::Message { message }
+                    aj_session::LogEntryKind::Message { message }
                     if matches!(message.as_stored_wire(), Some(aj_models::types::Message::User(_)))
                 )).unwrap().id.clone()
             };
@@ -22693,12 +22812,11 @@ mod tests {
             .await;
             let original = handles.run_config.lock().unwrap().settings();
             let (old_head, old_count, original_recorded) = {
-                let mut log = handles.log.lock().await;
-                log.flush_pending().unwrap();
+                let log = handles.log.lock().await;
                 (
                     log.head().unwrap().clone(),
                     log.entries_in_order().len(),
-                    log.linearize(log.head().unwrap(), ThreadFilter::USER)
+                    log.linearize(log.head().unwrap(), ThreadFilter::MAIN)
                         .settings(),
                 )
             };
@@ -22855,14 +22973,14 @@ mod tests {
             assert_eq!(host.environment(&session).await.unwrap(), expected_env);
             {
                 let log = handles.log.lock().await;
-                let new = log.linearize(log.head().unwrap(), ThreadFilter::USER);
+                let new = log.linearize(log.head().unwrap(), ThreadFilter::MAIN);
                 assert!(
                     !new.entries().iter().any(|entry| entry.id == message),
                     "the branch replaces the anchored message"
                 );
             }
             // The old branch retains its own choices, rather than inheriting
-            // either the draft or the new branch's explicit state records.
+            // either the draft or the new branch's explicit state entries.
             host.command(
                 &session,
                 Command::Head {
@@ -22875,7 +22993,7 @@ mod tests {
             {
                 let log = handles.log.lock().await;
                 let recorded = log
-                    .linearize(log.head().unwrap(), ThreadFilter::USER)
+                    .linearize(log.head().unwrap(), ThreadFilter::MAIN)
                     .settings();
                 assert_eq!(
                     recorded, original_recorded,
@@ -22929,7 +23047,7 @@ mod tests {
         assert!(
             toast_lines(&shell)
                 .iter()
-                .any(|t| t.contains("Failed to branch the conversation") && t.contains("running")),
+                .any(|t| t.contains("Failed to branch the session") && t.contains("running")),
             "a live turn refuses the branch switch: {:?}",
             toast_lines(&shell),
         );
@@ -22944,7 +23062,7 @@ mod tests {
         assert!(
             toast_lines(&shell)
                 .iter()
-                .any(|t| t.contains("Failed to branch the conversation")),
+                .any(|t| t.contains("Failed to branch the session")),
             "a running background task refuses the branch switch: {:?}",
             toast_lines(&shell),
         );
@@ -22967,7 +23085,7 @@ mod tests {
             !main_notices(&world)
                 .iter()
                 .any(|n| n.contains("branch") || n.contains("Branch")),
-            "and none of it was folded into the conversation: {:?}",
+            "and none of it was folded into the transcript: {:?}",
             main_notices(&world),
         );
         shut_down(&world).await;
@@ -23077,8 +23195,15 @@ mod tests {
         });
         handles.queues.append_follow_up(AgentId::Main, "parked");
         let parked = world.directory.chat_for(&first).expect("a parked chat");
+        // The first prompt's drain left the main agent an empty queue.
+        let nothing_queued = |chat: &ChatState| {
+            let empty = |queue: &aj_wire::AgentQueue| {
+                queue.steering.is_empty() && queue.follow_up.is_empty()
+            };
+            chat.queue().queues.iter().all(empty)
+        };
         assert!(
-            parked.borrow().tasks().is_empty() && parked.borrow().queue().queues.is_empty(),
+            parked.borrow().tasks().is_empty() && nothing_queued(&parked.borrow()),
             "the staging published nothing, or this measures nothing",
         );
 
@@ -23716,15 +23841,15 @@ mod tests {
         use aj_models::types::{
             AssistantContent, AssistantMessage, Message, TextContent, UserMessage,
         };
-        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+        use aj_session::{LogEntryKind, SessionLog, ThreadKind};
 
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
-        let user = |t: &str| ConversationEntryKind::Message {
+        let user = |t: &str| LogEntryKind::Message {
             message: AgentMessage::wire(Message::User(UserMessage::text(t))),
         };
-        let assistant = |t: &str| ConversationEntryKind::Message {
+        let assistant = |t: &str| LogEntryKind::Message {
             message: AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::Text(TextContent {
                     text: t.to_string(),
@@ -23734,20 +23859,20 @@ mod tests {
             })),
         };
 
-        // A fork on disk: shared prefix, then branch A and branch B off it.
+        // A branch on disk: shared prefix, then branch A and branch B off it.
         let (session_id, branch_a, branch_b) = {
-            let mut log = ConversationLog::create(&persistence).expect("create log");
+            let mut log = SessionLog::create(&persistence).expect("create log");
             log.set_system_prompt("prompt".to_string())
                 .expect("system prompt");
             let sp = log.system_prompt_id().cloned().expect("system prompt id");
             let shared = log
-                .append(Some(sp), ThreadKind::User, None, user("shared question"))
+                .append(Some(sp), ThreadKind::Main, None, user("shared question"))
                 .expect("shared")
                 .id;
             let fork = log
                 .append(
                     Some(shared),
-                    ThreadKind::User,
+                    ThreadKind::Main,
                     None,
                     assistant("shared answer"),
                 )
@@ -23756,14 +23881,14 @@ mod tests {
             let branch_a = log
                 .append(
                     Some(fork.clone()),
-                    ThreadKind::User,
+                    ThreadKind::Main,
                     None,
                     user("branch A prompt"),
                 )
                 .expect("branch A")
                 .id;
             let branch_b = log
-                .append(Some(fork), ThreadKind::User, None, user("branch B prompt"))
+                .append(Some(fork), ThreadKind::Main, None, user("branch B prompt"))
                 .expect("branch B")
                 .id;
             (log.session_id().to_string(), branch_a, branch_b)
@@ -23789,7 +23914,7 @@ mod tests {
             _ => panic!("a branch request maps to a branch exit"),
         }
 
-        // Move the head onto branch A (the run loop's branch path with no
+        // Move the head onto branch A (the main loop's branch path with no
         // prompt).
         apply_focus_request(
             &mut app,
@@ -23907,20 +24032,20 @@ mod tests {
     async fn armed_submit_refused_at_root_message() {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
-        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+        use aj_session::{LogEntryKind, SessionLog, ThreadKind};
 
         let dir = TempDir::new().expect("tempdir");
         // Hand-build an ancient-file fixture: a single root user message with
         // no system prompt and no seeded settings, so its `parent_id` is None.
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let (session_id, root_id) = {
-            let mut log = ConversationLog::create(&persistence).expect("create log");
+            let mut log = SessionLog::create(&persistence).expect("create log");
             let root_id = log
                 .append(
                     None,
-                    ThreadKind::User,
+                    ThreadKind::Main,
                     None,
-                    ConversationEntryKind::Message {
+                    LogEntryKind::Message {
                         message: AgentMessage::wire(Message::User(UserMessage::text("root"))),
                     },
                 )
@@ -24059,7 +24184,7 @@ mod tests {
         assert!(
             toast_lines(&shell)
                 .iter()
-                .any(|t| t == "Branched the conversation from an earlier message."),
+                .any(|t| t == "Branched the session from an earlier message."),
             "under the branch-with-prompt confirmation: {:?}",
             toast_lines(&shell),
         );
@@ -24102,7 +24227,7 @@ mod tests {
 
         async fn with_args(dir: &TempDir, args: Args) -> RemoteHost {
             let auth = AuthStorage::for_test(dir.path().join("auth.json"));
-            let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+            let persistence = ProjectSessions::new(dir.path().join("sessions"));
             let ComposedHost { host, .. } =
                 compose_host(&args, layers_spilling_into(dir), &auth, &persistence, None)
                     .expect("compose a host");
@@ -24334,7 +24459,7 @@ mod tests {
             .await
             .expect("connect to the scripted host");
         let auth = AuthStorage::for_test(dir.path().join("client-auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("client-sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("client-sessions"));
         let world =
             build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
                 .await
@@ -24979,7 +25104,7 @@ mod tests {
 
         let expected = RefusalFeedback {
             actions: [
-                FeedbackObservation::toast(format!("Failed to branch the conversation: {REASON}")),
+                FeedbackObservation::toast(format!("Failed to branch the session: {REASON}")),
                 FeedbackObservation::notice(format!("Could not archive the session: {REASON}")),
                 FeedbackObservation::notice(format!("Could not set the session tag: {REASON}")),
                 FeedbackObservation::notice(format!("Could not read the session tree: {REASON}")),
@@ -25502,7 +25627,7 @@ mod tests {
             .log
             .lock()
             .await
-            .latest_leaf(ThreadFilter::USER)
+            .latest_leaf(ThreadFilter::MAIN)
             .expect("a persisted user message");
         arm_branch(&shell.borrow().view().branch_anchor, head.clone());
         let before = main_notices(&world).len();
@@ -25651,7 +25776,7 @@ mod tests {
         sync_status(&world);
         sync_keymap_ctx(&world, &shell);
         app.request_redraw();
-        app.render(&root).expect("render B's conversation");
+        app.render(&root).expect("render B's transcript");
         app.handle_input(key(Key::TAB, Modifiers::empty()));
         assert!(shell.borrow().view().transcript.borrow().in_focus_mode());
         app.handle_input(key(Key::ESCAPE, Modifiers::empty()));
@@ -25853,7 +25978,7 @@ mod tests {
             let entries = chat.transcript(AgentId::Main)?.entries();
             entries
                 .iter()
-                .any(|entry| matches!(entry.kind, EntryKind::TurnUsage(_)))
+                .any(|entry| matches!(entry.kind, EntryKind::RoundUsage(_)))
                 .then_some(())
         })
         .await;
@@ -28091,9 +28216,12 @@ mod tests {
             shell.borrow().take_tag_edit().is_none(),
             "and asked the peer for nothing",
         );
+        // The session has no entry yet, so its label lives with the host.
+        let rows = world.control.sessions().await.expect("session list");
+        let row = rows.sessions.iter().find(|row| row.id == session);
         assert_eq!(
-            store_in(&dir).read_tag(&session).expect("read the sidecar"),
-            Some("fix-auth".to_string()),
+            row.expect("the session is listed").tag.as_deref(),
+            Some("fix-auth"),
             "so the label the editor could not show still stands",
         );
         shut_down(&world).await;
@@ -28257,7 +28385,7 @@ mod tests {
 
         let (stats, log_path) = {
             let log = world.handles().log.lock().await;
-            (log.stats(), log.path().to_path_buf())
+            (log.stats().unwrap(), log.path().to_path_buf())
         };
         assert_eq!(
             stats
@@ -28268,7 +28396,10 @@ mod tests {
             Some(env_value),
             "the real stats extraction sees the focused log's environment",
         );
-        let persisted = std::fs::read_to_string(log_path).expect("read the punctuated log");
+        let entries = ProjectSessions::new(log_path.parent().unwrap().to_path_buf())
+            .read_entries(world.session())
+            .expect("read persisted records");
+        let persisted = serde_json::to_string(&entries).unwrap();
         assert!(
             persisted.contains("\"type\":\"env_change\"")
                 && persisted.contains(env_key)
@@ -28494,7 +28625,7 @@ mod tests {
                                 "session_id": id, "modified": "2026-01-01T00:00:00Z",
                                 "created_at": "2026-01-01T00:00:00Z",
                                 "last_message_at": "2026-01-01T00:00:00Z",
-                                "size_bytes": 0, "message_count": 1,
+                                "message_count": 1,
                                 "first_user_message": format!("preview of {id}"),
                                 "tag": null, "archived": false
                             })
@@ -29180,7 +29311,7 @@ mod tests {
         assert_eq!(
             strip_labels(&shell)[0],
             "s-01",
-            "the wheel moved the run down a row",
+            "the wheel moved the window down a row",
         );
 
         app.handle_input(wheel_up_at(1, 2));
@@ -29777,6 +29908,7 @@ mod tests {
         credential_warning: Option<&str>,
     ) -> String {
         serde_json::to_string(&aj_wire::Frame::State {
+            turn_interrupted: false,
             session: session.to_string(),
             epoch: epoch.to_string(),
             opens_block: true,
@@ -29818,7 +29950,7 @@ mod tests {
         .expect("a durable notice frame")
     }
 
-    /// A durable user message inside a block. A conversation is what makes the
+    /// A durable user message inside a block. A message is what makes the
     /// chat slot draw the transcript rather than the empty-state splash.
     fn block_user(session: &str, epoch: &str, seq: u64, text: &str) -> String {
         let message = aj_agent::message::AgentMessage::wire(aj_models::types::Message::User(
@@ -29850,6 +29982,7 @@ mod tests {
             last_seq,
             tasks: Default::default(),
             queues: Default::default(),
+            history_start: None,
         })
         .expect("a caught_up frame")
     }
@@ -30135,7 +30268,7 @@ mod tests {
             .await
             .expect("connect to the scripted host");
         let auth = AuthStorage::for_test(client_dir.path().join("client-auth.json"));
-        let persistence = ConversationPersistence::new(client_dir.path().join("client-sessions"));
+        let persistence = ProjectSessions::new(client_dir.path().join("client-sessions"));
         let mut world =
             build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
                 .await
@@ -30813,7 +30946,7 @@ mod tests {
                 .filter(|text| text.starts_with("Lost the "))
                 .collect()
         }
-        // A conversation, so the transcript rather than the splash is painted.
+        // A message, so the transcript rather than the splash is painted.
         assert!(handle_submit(&mut world, "hello".to_string()).await);
         settle(&mut world).await;
         assert!(
@@ -31158,7 +31291,7 @@ mod tests {
         );
         assert!(
             !toast_lines(&shell).iter().any(|toast| {
-                toast == "Branched the conversation from an earlier message."
+                toast == "Branched the session from an earlier message."
                     || toast == "Switched to the selected branch."
             }),
             "passive recovery emitted delayed action success: {:?}",
@@ -32313,21 +32446,21 @@ mod tests {
     /// path, so a fixture cannot end up pointing at a directory nothing reads.
     /// Asserts the scanner finds the prompt, because a store that holds none
     /// leaves the tests below measuring nothing.
-    fn store_holding_a_prompt(persistence: &ConversationPersistence, prompt: &str) {
+    fn store_holding_a_prompt(persistence: &ProjectSessions, prompt: &str) {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
-        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+        use aj_session::{LogEntryKind, SessionLog, ThreadKind};
 
         {
-            let mut log = ConversationLog::create(persistence).expect("create log");
+            let mut log = SessionLog::create(persistence).expect("create log");
             log.set_system_prompt("system".to_string())
                 .expect("system prompt");
             let root = log.system_prompt_id().cloned().expect("system prompt id");
             log.append(
                 Some(root),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(Message::User(UserMessage::text(prompt))),
                 },
             )
@@ -33051,9 +33184,12 @@ mod tests {
             }
         })
         .await;
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let path = persistence.sessions_dir().join(format!("{session}.jsonl"));
-        let before = std::fs::read(&path).expect("persisted env-less session");
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
+        let records = || {
+            let entries = persistence.read_entries(&session).unwrap();
+            serde_json::to_value(entries).unwrap()
+        };
+        let before = records();
 
         let world = connect_world(&dir, &remote, &["--env", "BEADS_ACTOR=other-session"]).await;
         assert_eq!(
@@ -33082,22 +33218,19 @@ mod tests {
         drop(world);
 
         assert_eq!(
-            std::fs::read(&path).expect("session bytes after attach"),
+            records(),
             before,
             "connect backfilled the existing session log"
         );
         let resumed =
-            aj_session::ConversationLog::resume(&persistence, &session).expect("resume host log");
+            aj_session::SessionLog::resume(&persistence, &session).expect("resume host log");
         assert_eq!(resumed.session_env(), None);
         assert_eq!(
             resumed
                 .entries_in_order()
                 .iter()
                 .filter(|entry| {
-                    matches!(
-                        entry.entry,
-                        aj_session::ConversationEntryKind::EnvChange { .. }
-                    )
+                    matches!(entry.entry, aj_session::LogEntryKind::EnvChange { .. })
                 })
                 .count(),
             0,
@@ -33699,7 +33832,7 @@ mod tests {
         assert!(
             toast_lines(&shell)
                 .iter()
-                .any(|toast| toast.contains("Branched the conversation")),
+                .any(|toast| toast.contains("Branched the session")),
             "{:?}",
             toast_lines(&shell),
         );
@@ -34205,14 +34338,14 @@ mod tests {
         let left_dir = TempDir::new().unwrap();
         let right_dir = TempDir::new().unwrap();
         let client_dir = TempDir::new().unwrap();
-        let persistence = ConversationPersistence::new(left_dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(left_dir.path().join("sessions"));
         let prompt = format!("{} distantneedle", "an old session prompt ".repeat(6));
         store_holding_a_prompt(&persistence, &prompt);
         let target = persistence.list_sessions().unwrap()[0].session_id.clone();
         for _ in 0..60 {
             seed_session(&persistence);
         }
-        let right_store = ConversationPersistence::new(right_dir.path().join("sessions"));
+        let right_store = ProjectSessions::new(right_dir.path().join("sessions"));
         store_holding_a_prompt(&right_store, "right-host-preview");
         let left = RemoteHost::named_at_directory(&left_dir, "preview-left").await;
         let right = RemoteHost::named_at_directory(&right_dir, "preview-right").await;
@@ -34691,7 +34824,7 @@ mod tests {
             &legacy,
         ]);
         let auth = AuthStorage::for_test(dir.path().join("auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let world = build_world(
             &args,
             layers_spilling_into(&dir),
@@ -34827,7 +34960,7 @@ mod tests {
             "BEADS_ACTOR=session-actor",
         ]);
         let auth = AuthStorage::for_test(dir.path().join("auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let world = build_world(
             &args,
             layers_spilling_into(&dir),

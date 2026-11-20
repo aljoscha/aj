@@ -9,7 +9,7 @@
 //!
 //! [`AgentMessageKind`] is the forward-compat seam: an agent-only entry
 //! becomes a new variant. [`AgentMessageKind::TaskNotification`] is one
-//! such entry: a background task's completion notice, stored as typed
+//! such entry: a background task's task notification, stored as typed
 //! data and framed into a wire user message only when it projects onto
 //! the provider (see [`AgentMessage::to_projected_wire`]). Every
 //! persistence and projection-to-LLM call site matches exhaustively on
@@ -49,7 +49,7 @@ pub struct AgentMessage {
     /// it. The log adopts this id as the entry id for message entries and
     /// backfills it from the entry id on resume.
     ///
-    /// NOTE: `MessageStart` and `MessageEnd` of one assistant turn are
+    /// NOTE: `MessageStart` and `MessageEnd` of one assistant message are
     /// separate `wire()` constructions, so they carry different ids. Only
     /// `MessageEnd` ids are consumed.
     #[serde(skip)]
@@ -188,7 +188,7 @@ enum ToolActivityTag {
     ToolActivity,
 }
 
-/// A background task's completion notice, stored as typed transcript
+/// A background task's task notification, stored as typed transcript
 /// data rather than a tagged user message.
 ///
 /// The structure is kept for rich local rendering. Only [`Self::body`]
@@ -299,7 +299,7 @@ pub enum AgentMessageKind {
     /// A wire-level message — user, assistant, or tool result.
     /// Projects directly onto the LLM context.
     Wire(Message),
-    /// A background task's completion notice. Stored as typed data,
+    /// A background task's task notification. Stored as typed data,
     /// projected onto the wire as a framed user message (see
     /// [`AgentMessage::to_projected_wire`]).
     TaskNotification(TaskNotification),

@@ -1,9 +1,7 @@
-//! Session tags: user-set display metadata kept beside the log.
+//! Session tags: user-set display metadata independent of the log.
 //!
-//! A tag is session-scoped, not branch-scoped, so it lives in a sidecar file
-//! rather than in the log: a head switch moves the session's history and must
-//! not move its label. Untagged sessions have no file, which is
-//! what keeps an untagged store free of tag reads.
+//! A tag is session-scoped, not branch-scoped. SQLite stores it as an annotation,
+//! while JSONL uses a sidecar. A head switch must not move the label.
 
 use std::fmt;
 

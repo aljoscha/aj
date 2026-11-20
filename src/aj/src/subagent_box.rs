@@ -22,7 +22,7 @@
 //! The box renders from box metadata alone: it never composites the
 //! child transcript or tail-windows it, so it needs no access to the
 //! sub's transcript. That is what lets a resumed sub-agent's transcript
-//! stay unmaterialized until observed. The full conversation is one
+//! stay unmaterialized until observed. The full run is one
 //! Observe away, which swaps the whole list over to that agent's
 //! transcript ([`set_active_view`](aj_app::chat::ChatState::set_active_view)).
 //!
@@ -491,6 +491,7 @@ mod tests {
                 child: sub,
                 task: "check the build setup".into(),
                 tool_name: tool_name.into(),
+                call_id: None,
                 background: false,
                 settings: AgentSettings {
                     context_window: 0,
@@ -1064,6 +1065,7 @@ mod tests {
                 child: AgentId::Sub(0),
                 task: long_task,
                 tool_name: "agent".into(),
+                call_id: None,
                 background: false,
                 settings: AgentSettings {
                     context_window: 0,

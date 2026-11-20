@@ -285,7 +285,7 @@ impl GoalUi {
         area.borrow_mut().set_text(current);
         area.borrow_mut().set_border_color(state.chrome.border.fg);
         // All submission is handled by the wrapper, before TextArea can clear
-        // its buffer. No conversation history or palette trigger is installed.
+        // its buffer. No prompt history or palette trigger is installed.
         area.borrow_mut().set_submit_enabled(false);
         let focus = to_widget_ref(Rc::clone(&area));
         let overlay = Rc::new(RefCell::new(ObjectiveEditor {

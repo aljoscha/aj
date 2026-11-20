@@ -23,11 +23,11 @@
     "assignment_pending": true
   },
   {
-    "type": "turn_start",
+    "type": "round_start",
     "agent_id": "main"
   },
   {
-    "type": "turn_end",
+    "type": "round_end",
     "agent_id": "main",
     "message": {
       "content": [],
@@ -123,6 +123,7 @@
     "parent": "main",
     "child": { "sub": 1 },
     "task": "inspect code",
+    "call_id": "call-1",
     "background": true,
     "context_window": 32000,
     "provider": "scripted",

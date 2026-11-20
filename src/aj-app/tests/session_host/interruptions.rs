@@ -8,14 +8,16 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-struct Inference {
-    context: Context,
+pub(super) struct Inference {
+    pub(super) context: Context,
+    /// The prompt-cache key the request carries.
+    pub(super) cache_key: Option<String>,
     stream: AssistantMessageEventStream,
     cancel: CancellationToken,
 }
 
 impl Inference {
-    fn answer(&self, message: AssistantMessage) {
+    pub(super) fn answer(&self, message: AssistantMessage) {
         assert!(
             !self.cancel.is_cancelled(),
             "answering a cancelled inference"
@@ -56,6 +58,7 @@ impl Provider for HeldProvider {
             self.requests
                 .send(Inference {
                     context: context.clone(),
+                    cache_key: options.base.session_id.clone(),
                     stream: stream.clone(),
                     cancel: options.base.cancel.clone().expect("turn cancellation"),
                 })
@@ -65,13 +68,26 @@ impl Provider for HeldProvider {
     }
 }
 
-fn held() -> (Harness, mpsc::UnboundedReceiver<Inference>) {
+pub(super) fn held() -> (Harness, mpsc::UnboundedReceiver<Inference>) {
     let (h, requests, _) = held_with_panic();
     (h, requests)
 }
 
 fn held_with_panic() -> (
     Harness,
+    mpsc::UnboundedReceiver<Inference>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (run, receiver, panic_next) = held_run_config();
+    (
+        Harness::with_run_config(run, Vec::new(), None, None),
+        receiver,
+        panic_next,
+    )
+}
+
+fn held_run_config() -> (
+    RunConfigSnapshot,
     mpsc::UnboundedReceiver<Inference>,
     Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -82,26 +98,31 @@ fn held_with_panic() -> (
         requests: sender,
         panic_next: Arc::clone(&panic_next),
     });
+    (run, receiver, panic_next)
+}
+
+/// A second host over `harness`'s store whose inferences the test answers.
+pub(super) fn held_over(harness: &Harness) -> (Harness, mpsc::UnboundedReceiver<Inference>) {
+    let (run, requests, _) = held_run_config();
     (
-        Harness::with_run_config(run, Vec::new(), None, None),
-        receiver,
-        panic_next,
+        harness.revive_with_run_config(run, None, LIST_WINDOW),
+        requests,
     )
 }
 
-async fn next(receiver: &mut mpsc::UnboundedReceiver<Inference>) -> Inference {
+pub(super) async fn next(receiver: &mut mpsc::UnboundedReceiver<Inference>) -> Inference {
     let inference = bounded("provider request", receiver.recv()).await.unwrap();
     assert!(!inference.cancel.is_cancelled());
     inference
 }
 
-async fn command(h: &Harness, session: &str, command: Command) {
+pub(super) async fn command(h: &Harness, session: &str, command: Command) {
     bounded("host command", h.host.command(session, command))
         .await
         .unwrap();
 }
 
-async fn resume(h: &Harness, session: &str, child: usize, text: &str) {
+pub(super) async fn resume(h: &Harness, session: &str, child: usize, text: &str) {
     command(
         h,
         session,
@@ -417,7 +438,7 @@ async fn background_task_notice_wakes_idle_assignment_and_fulfills_original_call
             .unwrap()
             .contains("background evidence report")
     );
-    parent.answer(finalized_text_message("completed after task notice"));
+    parent.answer(finalized_text_message("completed after task notification"));
     frames.extend(client.pump_until_idle().await);
     assert_eq!(result_count(&frames), 1);
     assert_no_dangling(&client.chat);
@@ -535,7 +556,7 @@ async fn repeated_interruptions_reattach_and_resume_fulfill_the_original_call_on
         "check the second clue",
         "finish with both clues",
     ] {
-        assert!(context.contains(text), "lost conversation context: {text}");
+        assert!(context.contains(text), "lost context: {text}");
     }
     final_child.answer(finalized_text_message("both clues verified"));
     let parent = next(&mut requests).await;

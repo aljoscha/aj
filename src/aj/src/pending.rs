@@ -1,8 +1,10 @@
 //! Pending-message box rendered directly above the editor.
 //!
-//! Shows the one message the user has queued for the viewed agent
-//! while it is busy, previewed as a user-message bubble so it reads
-//! the same as the message will once it is sent. A hint line at the
+//! Shows the one message that waits for the viewed agent: queued behind
+//! its running turn, or restored at an open. It is previewed as a
+//! user-message bubble so it reads the same as the message will once it
+//! is sent. A prompt to an idle agent never shows here, because the host
+//! does not announce it as queued. A hint line at the
 //! top of the bubble says when it will be delivered and how to edit
 //! or escalate it; steering and follow-up are distinguished by that
 //! hint.

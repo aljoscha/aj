@@ -209,6 +209,20 @@ fn holding_command(dir: &Path, shell_pid: &Path, descendant_pid: &Path) -> Strin
     )
 }
 
+/// A scratch directory under a root that lasts as long as the process.
+///
+/// A cancelled command is torn down by a spawned task and its wrapper
+/// records the exit status when the command ends, both of which can
+/// happen after the test has returned. A write that lands while the
+/// directory is being removed leaves it behind, and under this root that
+/// is not residue in the temp directory itself.
+fn scratch() -> TempDir {
+    static ROOT: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    let root =
+        ROOT.get_or_init(|| TempDir::with_prefix("aj-task-lifetime-").expect("scratch root"));
+    TempDir::new_in(root.path()).expect("create temp dir")
+}
+
 struct Fixture {
     dir: TempDir,
     shell_pid: PathBuf,
@@ -217,7 +231,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let dir = TempDir::new().expect("create temp dir");
+    let dir = scratch();
     let shell_pid = dir.path().join("shell-pid");
     let descendant_pid = dir.path().join("descendant-pid");
     let command = holding_command(dir.path(), &shell_pid, &descendant_pid);
@@ -295,7 +309,7 @@ async fn cancelling_a_turn_kills_the_commands_process_group() {
 /// heels.
 #[tokio::test]
 async fn a_cancelled_command_gets_its_sigterm_handler() {
-    let dir = TempDir::new().expect("create temp dir");
+    let dir = scratch();
     let shell_pid = dir.path().join("shell-pid");
     let termed = dir.path().join("was-termed");
     let command = format!(

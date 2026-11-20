@@ -1,11 +1,11 @@
 //! Cross-provider message transformation.
 //!
-//! When a conversation is replayed against a different provider/model than
+//! When a session is replayed against a different provider/model than
 //! the one that produced part of its history, content blocks must be
 //! rewritten so the target API accepts them: encrypted reasoning tied to
 //! the source model is dropped or demoted, tool-call IDs are coerced into
 //! the target's character class and length limits, orphaned tool calls
-//! get synthetic error results, incomplete (errored/aborted) turns are
+//! get synthetic error results, incomplete (errored/aborted) messages are
 //! skipped along with their dangling tool results, and a tool result that
 //! answers no tool call in the request is dropped.
 //!
@@ -57,7 +57,7 @@ pub const ORPHAN_TOOL_RESULT_TEXT: &str = "No result provided";
 /// Transform a message history so it can be replayed against `target`.
 ///
 /// Applies the cross-provider rewrites (thinking blocks, signatures,
-/// tool-call IDs, orphans, errored turns, unpaired tool results)
+/// tool-call IDs, orphans, errored messages, unpaired tool results)
 /// followed by the capability downgrade (images on non-vision targets).
 ///
 /// The function never mutates the input slice; the returned vector
@@ -232,7 +232,7 @@ fn transform_assistant(
 /// than the target. It only matters for the Responses-shaped targets
 /// (`openai-responses` and `openai-codex-responses`), where the
 /// `{call_id}|{item_id}` composite carries a Responses item id that the
-/// server pairs with a reasoning item from the same turn:
+/// server pairs with a reasoning item from the same response:
 ///
 /// - Foreign origin: rewrite the item id to a synthetic `fc_<hash>`. The
 ///   server never issued it, so it can't be paired with the (demoted,
@@ -331,12 +331,12 @@ fn short_hash(s: &str) -> String {
 ///   - rewrite `ToolResultMessage.tool_call_id` via the id map,
 ///   - skip errored/aborted assistants and drop their tool results,
 ///   - emit synthetic error results for orphaned tool calls when the
-///     assistant turn closes (next non-tool-result message or EOF),
+///     round closes (next non-tool-result message or EOF),
 ///   - drop a tool result that answers no kept tool call in the request.
 fn align_tool_results(messages: Vec<Message>, id_map: &HashMap<String, String>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     // Tool calls from the most recent kept assistant message that are
-    // still waiting for a result. Cleared when the turn closes.
+    // still waiting for a result. Cleared when the round closes.
     let mut pending: Vec<ToolCall> = Vec::new();
     // Result IDs we've already emitted for the current pending set.
     let mut seen_results: HashSet<String> = HashSet::new();
@@ -346,7 +346,7 @@ fn align_tool_results(messages: Vec<Message>, id_map: &HashMap<String, String>) 
             Message::Assistant(a) => {
                 close_pending(&mut out, &mut pending, &mut seen_results);
                 if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
-                    // Rule 5: drop the errored/aborted turn. We leave
+                    // Rule 5: drop the errored/aborted message. We leave
                     // `pending` empty and record none of its calls, so
                     // the tool results that referenced them fail the
                     // membership check below and are dropped with it.
@@ -368,10 +368,10 @@ fn align_tool_results(messages: Vec<Message>, id_map: &HashMap<String, String>) 
                     tr.tool_call_id = new_id.clone();
                 }
                 // Rule 6: keep a result only if it answers a tool call
-                // from the current assistant turn. A result that answers
+                // from the current assistant message. A result that answers
                 // no call in the request is dangling: its call was
                 // summarized away by compaction, or belonged to a dropped
-                // errored turn (rule 5). Both providers reject an
+                // errored message (rule 5). Both providers reject an
                 // unpaired tool_result, and a foreign composite id
                 // (`{call_id}|{item_id}`) that reaches the Anthropic wire
                 // this way also trips its `tool_use_id` character-class
@@ -394,7 +394,7 @@ fn align_tool_results(messages: Vec<Message>, id_map: &HashMap<String, String>) 
 }
 
 /// Emit synthetic error results for any pending tool calls that didn't
-/// see a real result, then clear the per-turn state.
+/// see a real result, then clear the per-round state.
 fn close_pending(
     out: &mut Vec<Message>,
     pending: &mut Vec<ToolCall>,

@@ -123,25 +123,18 @@ impl Fixture {
         auth.register_oauth_provider(Arc::new(Provider)).await;
         let host = scripted_host(host_dir, scripted(vec![], 0, Duration::ZERO), handles, None);
         let session = if stored {
-            use aj_session::{
-                ConversationEntryKind, ConversationLog, ConversationPersistence, ThreadKind,
-            };
-            let persistence = ConversationPersistence::new(host_dir.path().join("sessions"));
-            let mut log = ConversationLog::create(&persistence).unwrap();
-            log.append(
-                None,
-                ThreadKind::User,
-                None,
-                ConversationEntryKind::Message {
-                    message: aj_agent::message::AgentMessage::wire(
-                        aj_models::types::Message::User(aj_models::types::UserMessage::text(
-                            "stored",
-                        )),
-                    ),
-                },
-            )
-            .unwrap();
-            log.session_id().to_string()
+            use aj_session::{LogEntryKind, ProjectSessions, ThreadKind};
+            // A JSONL session that has not been imported, so a resume of it
+            // would show in the store.
+            let persistence = ProjectSessions::new(host_dir.path().join("sessions"));
+            let message = aj_agent::message::AgentMessage::wire(aj_models::types::Message::User(
+                aj_models::types::UserMessage::text("stored"),
+            ));
+            let (session, _) = aj_session::jsonl_session(&persistence, |log| {
+                let entry = LogEntryKind::Message { message };
+                log.append(None, ThreadKind::Main, None, entry).unwrap();
+            });
+            session
         } else {
             host.create().await.unwrap()
         };
@@ -495,11 +488,11 @@ async fn credentials_http_and_gateway_refuse_unknown_fields_and_unknown_sessions
 
 #[tokio::test]
 async fn credentials_cold_and_locked_anchors_never_resume_or_repair_logs() {
-    use aj_session::{ConversationPersistence, SessionLock};
+    use aj_session::{ProjectSessions, SessionLock};
     use std::io::Write;
     let fixture = Fixture::build(true).await;
     let session = &fixture.controls[0].1;
-    let persistence = ConversationPersistence::new(fixture._host_dir.path().join("sessions"));
+    let persistence = ProjectSessions::new(fixture._host_dir.path().join("sessions"));
     let path = persistence.sessions_dir().join(format!("{session}.jsonl"));
     // A recoverable partial tail makes an accidental resume/repair observable.
     std::fs::OpenOptions::new()

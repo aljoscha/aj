@@ -849,7 +849,7 @@ fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher)
         }
         // A usage row is rewritten in place when its source's usage is
         // re-applied, so the rendered line itself is hashed.
-        EntryKind::TurnUsage(u) => {
+        EntryKind::RoundUsage(u) => {
             6u8.hash(hasher);
             u.line().hash(hasher);
         }
@@ -1246,7 +1246,7 @@ pub(crate) fn build_entry_widget(
         // an empty (zero-height) rich text rather than being dropped from the
         // list, so the entry index stays aligned with selection and focus,
         // which key on it.
-        EntryKind::TurnUsage(_) if !display.show_token_usage => {
+        EntryKind::RoundUsage(_) if !display.show_token_usage => {
             EntryWidget::Rich(RichText::new(Vec::new()))
         }
         _ => EntryWidget::Rich(RichText::new(entry_spans(entry, styles))),
@@ -1445,7 +1445,7 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
             // yields a single span, so this is safe for every notice.
             strikethrough_spans(&n.text, style)
         }
-        EntryKind::TurnUsage(u) => vec![span(u.line(), styles.dim)],
+        EntryKind::RoundUsage(u) => vec![span(u.line(), styles.dim)],
     };
     // Normalize away trailing newlines so the spacer below yields
     // exactly one blank row regardless of how the content ends.
@@ -1817,6 +1817,21 @@ pub struct TranscriptView {
     last_globals: GlobalRenderInputs,
     /// The model incarnation the reading state belongs to.
     generation: u64,
+    /// The shown agent and where its history started when this view last
+    /// looked. A lower start for the same agent means a page of its earlier
+    /// history was prepended.
+    history_seen: (AgentId, u64),
+    /// The shown view and the entry at the top of its viewport as last
+    /// reconciled, so a prepend can put the viewport back on that entry.
+    anchor: Option<(AgentId, EntryId)>,
+    /// Set by Home while earlier history is unfetched: fetch all of it and
+    /// keep the viewport at the top as it arrives.
+    load_all_history: bool,
+    /// Home just started loading the rest, and nobody has told the reader.
+    history_announce: bool,
+    /// A fetch failed. Nothing more is asked for until the user scrolls
+    /// again, so a broken host is not asked in a loop.
+    history_paused: bool,
     /// While true, every draw pins the viewport to the bottom so a
     /// streaming turn stays in view. Wheel-up and thumb drags
     /// disengage, a scroll that lands back at the bottom re-engages.
@@ -2111,6 +2126,11 @@ impl TranscriptView {
             width_method: gwidth::Method::Unicode,
             last_globals,
             generation,
+            history_seen: (AgentId::Main, 1),
+            anchor: None,
+            load_all_history: false,
+            history_announce: false,
+            history_paused: false,
             follow_tail: true,
             focused,
             branch_armed,
@@ -2187,9 +2207,113 @@ impl TranscriptView {
             *self.activity.borrow_mut() = FocusedTranscript::default();
             self.focused.set(false);
             self.generation = generation;
+            self.history_seen = self.history_now();
+            self.anchor = None;
+            self.load_all_history = false;
             return true;
         }
+        self.reconcile_history();
+        self.note_anchor();
         false
+    }
+
+    /// Remember which entry tops the viewport. Taken after every reconcile
+    /// and every draw, the two places the scroll position settles.
+    fn note_anchor(&mut self) {
+        let view = self.chat.borrow().active_view();
+        let top = usize::try_from(self.list.borrow().scroll_top()).ok();
+        let top = top.and_then(|index| self.entry_id_at(index));
+        self.anchor = top.map(|id| (view, id));
+    }
+
+    /// The shown agent and where its history starts in the model now.
+    fn history_now(&self) -> (AgentId, u64) {
+        let chat = self.chat.borrow();
+        let view = chat.active_view();
+        (view, chat.history_start(view))
+    }
+
+    /// Keep the viewport and cursor on their entries when a page of earlier
+    /// history lands in front of them.
+    fn reconcile_history(&mut self) {
+        let now = self.history_now();
+        if now == self.history_seen {
+            return;
+        }
+        let same_view = now.0 == self.history_seen.0;
+        let prepended = same_view && now.1 < self.history_seen.1;
+        let home = self.load_all_history;
+        self.history_seen = now;
+        // Home loads the agent it was pressed on, not the next one shown.
+        if now.1 <= 1 || !same_view {
+            self.load_all_history = false;
+        }
+        if !prepended {
+            return;
+        }
+        let moved = self.anchor.and_then(|(agent, top)| {
+            let chat = self.chat.borrow();
+            let entries = chat.transcript(agent)?.entries();
+            let index = entries.binary_search_by_key(&top, |e| e.id).ok()?;
+            let index = u32::try_from(index).ok()?;
+            // A view the page added nothing to moves by zero.
+            let moved = index.checked_sub(self.list.borrow().scroll_top())?;
+            (agent == chat.active_view() && moved > 0).then_some(moved)
+        });
+        if let Some(moved) = moved {
+            self.list.borrow_mut().items_prepended(moved);
+            // Rows moved under any selection, which addresses them by position.
+            self.cancel_selection_gesture();
+            self.selection = None;
+        }
+        if home {
+            self.list.borrow_mut().jump_to_item(0);
+        }
+    }
+
+    /// How many entries of the shown agent's earlier history this view wants
+    /// fetched now, `None` when it wants none: there is none, the viewport
+    /// is not near the top of what is loaded, or a fetch failed and the
+    /// reader has not scrolled since.
+    pub(crate) fn history_wanted(&self) -> Option<u64> {
+        /// Entries per fetch while scrolling, and while Home loads the rest.
+        const PAGE: u64 = 400;
+        const HOME_PAGE: u64 = 4000;
+        /// Fetch when fewer entries than this remain above the viewport.
+        const NEAR_TOP: u32 = 40;
+        let now = self.history_now();
+        // A page that landed but is not reconciled yet has not moved the
+        // viewport, which would read as still near the top.
+        if self.history_paused || now.1 <= 1 || now != self.history_seen {
+            return None;
+        }
+        if self.load_all_history {
+            return Some(HOME_PAGE);
+        }
+        // Near the top of what is loaded, whether the reader scrolled there
+        // or the loaded part is shorter than that. A view not laid out yet
+        // has no position to judge by.
+        let list = self.list.borrow();
+        (list.viewport_height().is_some() && list.scroll_top() < NEAR_TOP).then_some(PAGE)
+    }
+
+    /// The reader scrolled by a gesture other than Home: a paused fetch may
+    /// resume, and a Home load stops pulling the viewport to the top.
+    fn reader_moved(&mut self) {
+        self.history_paused = false;
+        self.load_all_history = false;
+    }
+
+    /// Whether Home started loading the rest of the history since the last
+    /// call, so the caller can say so once.
+    pub(crate) fn take_history_announce(&mut self) -> bool {
+        std::mem::take(&mut self.history_announce)
+    }
+
+    /// A history fetch failed: ask for nothing more until the reader scrolls.
+    pub(crate) fn pause_history(&mut self) {
+        self.history_paused = true;
+        self.load_all_history = false;
     }
 
     /// Install the callback invoked when Esc leaves transcript-focus mode.
@@ -2626,7 +2750,7 @@ impl TranscriptView {
     /// `Some` only when in focus mode, the cursor sits on an `EntryKind::User`
     /// entry, and the active view is Main. A sub-agent user message is not a
     /// branch point: its parent chain lives on a sub thread, so anchoring the
-    /// user-thread head there would splice the main conversation onto a
+    /// main-thread head there would splice the main thread onto a
     /// sub-agent thread. We gate the Main-view check here (rather than in the
     /// caller) because `chat.active_view()` is already in hand.
     pub(crate) fn focused_branch(&self) -> Option<(crate::branch::BranchDraft, String)> {
@@ -2763,6 +2887,7 @@ impl TranscriptView {
     /// (Paging up on a transcript that fits the viewport can't move it, so
     /// the draw re-engages follow-tail right away, leaving it pinned.)
     pub(crate) fn page_up(&mut self, ctx: &mut EventContext) {
+        self.reader_moved();
         self.follow_tail = false;
         // Read the viewport under a short immutable borrow that drops at the
         // end of the statement, before `start_line_scroll` borrows again.
@@ -2777,6 +2902,7 @@ impl TranscriptView {
     /// [`draw`](Widget::draw)), so paging down to the end resumes following
     /// streamed content.
     pub(crate) fn page_down(&mut self, ctx: &mut EventContext) {
+        self.reader_moved();
         self.activity_reading = false;
         let lines = crate::scroll::half_page_scroll_lines(self.list.borrow().viewport_height());
         self.start_line_scroll(ctx, lines);
@@ -2798,10 +2924,17 @@ impl TranscriptView {
         self.cancel_scroll_anim();
         self.follow_tail = false;
         self.list.borrow_mut().jump_to_item(0);
+        // The top of what is loaded is not the top of the session while
+        // earlier history is unfetched. Fetch it all and stay at the top.
+        self.history_paused = false;
+        let earlier = self.history_now().1 > 1;
+        self.history_announce = earlier && !self.load_all_history;
+        self.load_all_history = earlier;
     }
 
     /// Scroll the transcript to the bottom (End), mode-aware.
     pub(crate) fn scroll_to_bottom(&mut self, ctx: &mut EventContext) {
+        self.reader_moved();
         if self.in_focus_mode() {
             // Focus mode: move the item cursor onto the last user message,
             // matching the `G` jump.
@@ -3738,6 +3871,23 @@ impl Widget for TranscriptView {
             .borrow_mut()
             .rebuild(&self.chat.borrow(), *self.display.borrow());
         let count = self.entry_count();
+        // Unfetched earlier history has no rows here. The scroll bar still
+        // accounts for it, estimated from how many lines the fetched log
+        // entries took, so the thumb says how far back the session goes.
+        {
+            let chat = self.chat.borrow();
+            let (shown, earlier) = chat.history_extent();
+            let mut list = self.list.borrow_mut();
+            let lines = vaxis::vxfw::ScrollableView::content_extent(&*list)
+                .unwrap_or(0)
+                .saturating_sub(list.lines_above);
+            let lines = u64::from(lines);
+            list.lines_above = if chat.active_view() == AgentId::Main && shown > 0 {
+                u32::try_from(earlier.saturating_mul(lines) / shown).unwrap_or(u32::MAX)
+            } else {
+                0
+            };
+        }
         // Focus mode hands the viewport to the item cursor, so follow-tail
         // must neither pin the bottom nor re-engage while it is active, or the
         // auto-scroll fights the cursor navigation.
@@ -3775,6 +3925,7 @@ impl Widget for TranscriptView {
         // Mouse events dispatch against this frame until another draw replaces
         // it, even if live entry geometry changes in the meantime.
         self.last_view = ctx.max.size();
+        self.note_anchor();
         self.record_agent_hit_map();
         // Paint the selection highlight over the composed frame. A zero-width
         // selection (a plain click) shows nothing.
@@ -3791,6 +3942,9 @@ impl Widget for TranscriptView {
         // Content-area mouse events target the inner list, so they
         // pass through here on the way down.
         if let Event::Mouse(m) = event {
+            if m.button.is_wheel() || m.kind == mouse::Type::Drag {
+                self.reader_moved();
+            }
             if m.kind == mouse::Type::Drag {
                 self.agent_click = None;
                 self.activity_click = None;
@@ -3801,6 +3955,10 @@ impl Widget for TranscriptView {
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
         self.reconcile_model();
+        // A key is the reader moving again.
+        if matches!(event, Event::KeyPress(_)) {
+            self.history_paused = false;
+        }
         match event {
             Event::Mouse(m) => {
                 if !matches!(m.button, mouse::Button::Left | mouse::Button::None)
@@ -4448,7 +4606,7 @@ mod tests {
         let rows = indented_rich_rows(&t.entries()[0], &s, 40);
         assert_eq!(rows[0], " note", "text at column one: {rows:?}");
 
-        let t = transcript_with(EntryKind::TurnUsage(aj_app::chat::TurnUsageEntry {
+        let t = transcript_with(EntryKind::RoundUsage(aj_app::chat::RoundUsageEntry {
             agent_id: aj_agent::events::AgentId::Main,
             source_entry: None,
             usage: aj_agent::types::TokenUsage {
@@ -4825,6 +4983,49 @@ mod tests {
 
     /// PageUp disengages follow-tail and scrolls the transcript up; paging
     /// back down to the bottom re-engages it.
+    /// Earlier history is asked for only once the reader nears the top of
+    /// what is loaded. A page landing in front leaves the viewport on the
+    /// rows it showed, and Home keeps asking until the session's start.
+    #[test]
+    fn earlier_history_is_fetched_near_the_top_and_lands_without_moving_the_view() {
+        let page = |n| {
+            Rc::try_unwrap(chat_with_notices(n))
+                .ok()
+                .unwrap()
+                .into_inner()
+        };
+        let chat = chat_with_notices(50);
+        chat.borrow_mut().set_history_start(101);
+        chat.borrow_mut().note_log_end(150);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.history_wanted(), None, "nothing while at the tail");
+        assert!(view.list.borrow().lines_above > 0, "the bar counts it");
+
+        view.page_up(&mut EventContext::new());
+        let _ = view.draw(&ctx);
+        assert_eq!(view.history_wanted(), None, "still far from the top");
+        for _ in 0..3 {
+            view.page_up(&mut EventContext::new());
+        }
+        let before = crate::test_support::rows(&view.draw(&ctx));
+        assert_eq!(view.history_wanted(), Some(400));
+        chat.borrow_mut()
+            .prepend_history(page(30), AgentId::Main, 41);
+        assert_eq!(crate::test_support::rows(&view.draw(&ctx)), before);
+        assert_eq!(view.list.borrow().item_count, Some(80));
+
+        view.scroll_to_top(&mut EventContext::new());
+        assert_eq!(view.history_wanted(), Some(4000), "Home wants the rest");
+        chat.borrow_mut().prepend_history(page(7), AgentId::Main, 1);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.list.borrow().scroll_top(), 0, "Home ends at the top");
+        assert_eq!(view.list.borrow().lines_above, 0);
+        assert_eq!(view.history_wanted(), None, "nothing is left");
+    }
+
     #[test]
     fn page_up_disengages_and_page_down_reengages_follow_tail() {
         // Fifty two-row entries over a 10-row viewport, so the transcript is
@@ -5096,8 +5297,8 @@ mod tests {
 
     /// `b` is inert in a sub-agent view: `focused_branch` returns `None`
     /// even with the cursor on a sub-agent user row, so no branch anchor can be
-    /// armed there. Anchoring the user-thread head at a sub-agent user message
-    /// would splice the main conversation onto a sub thread, the data-
+    /// armed there. Anchoring the main-thread head at a sub-agent user message
+    /// would splice the main thread onto a sub thread, the data-
     /// corruption path the Main-view gate guards. `focused_message_text` still
     /// resolves, proving the `None` comes from the view gate and not from an
     /// empty or non-user cursor.
@@ -7839,6 +8040,7 @@ mod tests {
                     format!("scout the code as agent {child}")
                 },
                 tool_name: "agent".into(),
+                call_id: None,
                 background: false,
                 settings: cache_settings(),
             },
@@ -7970,6 +8172,7 @@ mod tests {
                 child: AgentId::Sub(0),
                 task: "scout".into(),
                 tool_name: "agent".into(),
+                call_id: None,
                 background: false,
                 settings: cache_settings(),
             },

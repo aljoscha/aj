@@ -2,13 +2,15 @@
 //!
 //! Materializing a session in a host process takes this lock and holds it
 //! for the session's live lifetime, so a second process that tries the
-//! same session refuses rather than growing a sibling branch in a shared
-//! log.
+//! same session refuses rather than writing to the session beside the
+//! first. The store relies on this: it takes one writer per session for
+//! granted.
 //!
 //! The lock file doubles as the registry of minted session ids: creating
 //! a session claims its id by `create_new` on the same path (see
-//! [`claim_session_id`]), which is the only atomic way to reserve an id
-//! whose log file does not exist yet.
+//! [`claim_session_id`]). A new session is not stored before its first
+//! input, so until then the lock file is the only thing that holds its
+//! id.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -18,8 +20,8 @@ use std::path::{Path, PathBuf};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 
-use crate::log::ConversationError;
-use crate::persistence::ConversationPersistence;
+use crate::log::SessionError;
+use crate::persistence::ProjectSessions;
 
 /// The extension of a session's lock file.
 const LOCK_FILE: &str = "lock";
@@ -40,9 +42,9 @@ const LOCK_FILE: &str = "lock";
 /// session. Nothing in aj removes lock files, and we do not defend
 /// against a hand-run `rm`.
 ///
-/// The lock lives on a dedicated file rather than on the log because the
-/// log is created lazily: a session that has not punctuated yet has no
-/// file to lock.
+/// The lock is a file of its own because a session has none: its records
+/// are rows of a database shared with every other session, and a new
+/// session has no row before its first input.
 pub struct SessionLock {
     /// Dropping this releases the lock.
     flock: Flock<File>,
@@ -87,18 +89,18 @@ impl SessionLock {
     /// already held.
     ///
     /// Takes the persistence handle rather than a bare path so the lock
-    /// cannot be sited in a different store than the log it guards.
+    /// cannot be sited in a different store than the session it guards.
     ///
     /// `host_id` identifies the taker for [`Self::holder`]. Recording it is
     /// best-effort: a lock we won but could not annotate is still a lock, so a
     /// failed write is logged and ignored rather than dropping it.
     pub fn try_acquire(
-        persistence: &ConversationPersistence,
+        persistence: &ProjectSessions,
         session_id: &str,
         host_id: &str,
-    ) -> Result<Option<Self>, ConversationError> {
+    ) -> Result<Option<Self>, SessionError> {
         let path = lock_path(persistence.sessions_dir(), session_id)
-            .ok_or_else(|| ConversationError::InvalidSessionId(session_id.to_string()))?;
+            .ok_or_else(|| SessionError::InvalidSessionId(session_id.to_string()))?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -121,7 +123,7 @@ impl SessionLock {
             // The documented non-blocking refusal, i.e. somebody else
             // holds it. Anything else is a real failure to report.
             Err((_, Errno::EWOULDBLOCK)) => Ok(None),
-            Err((_, errno)) => Err(ConversationError::Io(errno.into())),
+            Err((_, errno)) => Err(SessionError::Io(errno.into())),
         }
     }
 
@@ -133,7 +135,7 @@ impl SessionLock {
     /// on release, so one that is present belongs to a live holder, but this
     /// does not check the lock itself and a holder that wrote none (an older
     /// build) leaves the answer empty rather than wrong.
-    pub fn holder(persistence: &ConversationPersistence, session_id: &str) -> Option<LockHolder> {
+    pub fn holder(persistence: &ProjectSessions, session_id: &str) -> Option<LockHolder> {
         let path = lock_path(persistence.sessions_dir(), session_id)?;
         let recorded = fs::read_to_string(&path).ok()?;
         let (pid, host_id) = recorded.trim().split_once(char::is_whitespace)?;
@@ -156,12 +158,9 @@ impl SessionLock {
     /// description rather than the process, so this reads a lock the calling
     /// process itself holds as held, exactly as a rival's: a caller that wants
     /// "held by somebody else" must exclude its own holdings before asking.
-    pub fn is_held(
-        persistence: &ConversationPersistence,
-        session_id: &str,
-    ) -> Result<bool, ConversationError> {
+    pub fn is_held(persistence: &ProjectSessions, session_id: &str) -> Result<bool, SessionError> {
         let path = lock_path(persistence.sessions_dir(), session_id)
-            .ok_or_else(|| ConversationError::InvalidSessionId(session_id.to_string()))?;
+            .ok_or_else(|| SessionError::InvalidSessionId(session_id.to_string()))?;
         let file = match OpenOptions::new().read(true).open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -172,7 +171,7 @@ impl SessionLock {
             // is what keeps the window this opens down to the probe itself.
             Ok(_) => Ok(false),
             Err((_, Errno::EWOULDBLOCK)) => Ok(true),
-            Err((_, errno)) => Err(ConversationError::Io(errno.into())),
+            Err((_, errno)) => Err(SessionError::Io(errno.into())),
         }
     }
 
@@ -186,8 +185,8 @@ impl SessionLock {
     /// the filter, because a holder that failed to write one leaves it empty
     /// while holding the lock.
     pub fn enumerate_locks(
-        persistence: &ConversationPersistence,
-    ) -> Result<Vec<LockMetadata>, ConversationError> {
+        persistence: &ProjectSessions,
+    ) -> Result<Vec<LockMetadata>, SessionError> {
         let files = persistence.session_files(&locks_dir(persistence.sessions_dir()), LOCK_FILE)?;
         Ok(files
             .into_iter()
@@ -225,7 +224,7 @@ fn record_holder(flock: &mut Flock<File>, host_id: &str) -> std::io::Result<()> 
 /// Claim `session_id` by creating its lock file, failing with
 /// [`std::io::ErrorKind::AlreadyExists`] when the id is taken.
 ///
-/// This is the atomic reservation `ConversationLog::create` mints ids
+/// This is the atomic reservation `SessionLog::create` mints ids
 /// with. The claim is deliberately not held open: it reserves the id, and
 /// [`SessionLock::try_acquire`] later locks the same file for as long as
 /// the session is live.
@@ -269,23 +268,23 @@ mod tests {
 
     /// Acquire for a fixed host id, since these tests do not care which.
     fn acquire(
-        persistence: &ConversationPersistence,
+        persistence: &ProjectSessions,
         session_id: &str,
-    ) -> Result<Option<SessionLock>, ConversationError> {
+    ) -> Result<Option<SessionLock>, SessionError> {
         SessionLock::try_acquire(persistence, session_id, "host-under-test")
     }
 
     #[test]
     fn an_id_the_grammar_rejects_creates_nothing() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         for id in ["../../escaped", "..", "", "with space"] {
             let err = acquire(&persistence, id)
                 .err()
                 .unwrap_or_else(|| panic!("{id:?} took a lock"));
             assert!(
-                matches!(&err, ConversationError::InvalidSessionId(named) if named == id),
+                matches!(&err, SessionError::InvalidSessionId(named) if named == id),
                 "{id:?}: {err}",
             );
             assert!(SessionLock::holder(&persistence, id).is_none());
@@ -305,7 +304,7 @@ mod tests {
     #[test]
     fn a_held_lock_refuses_a_second_acquire_until_it_is_dropped() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         let held = acquire(&persistence, "s-1")
             .expect("acquire")
@@ -347,7 +346,7 @@ mod tests {
     #[test]
     fn a_claimed_id_is_refused_once_and_still_lockable() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         claim_session_id(persistence.sessions_dir(), "s-1").expect("first claim wins");
         let err = claim_session_id(persistence.sessions_dir(), "s-1")
@@ -367,7 +366,7 @@ mod tests {
     #[test]
     fn a_taken_lock_records_a_holder_the_refused_side_can_read() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         assert_eq!(
             SessionLock::holder(&persistence, "s-1"),
@@ -411,7 +410,7 @@ mod tests {
     #[test]
     fn a_legacy_lock_file_names_nobody() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
         fs::create_dir_all(path.parent().expect("a locks dir")).expect("mkdir");
 
@@ -436,7 +435,7 @@ mod tests {
     #[test]
     fn releasing_a_lock_clears_its_holder_record() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         let held = SessionLock::try_acquire(&persistence, "s-1", "host-a")
             .expect("acquire")
@@ -467,7 +466,7 @@ mod tests {
     #[test]
     fn a_record_a_crash_left_behind_is_replaced_whole() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
         fs::create_dir_all(path.parent().expect("a locks dir")).expect("mkdir");
 
@@ -504,7 +503,7 @@ mod tests {
     #[test]
     fn a_probe_reads_a_hold_and_its_release() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         let held = acquire(&persistence, "s-1")
             .expect("acquire")
@@ -528,7 +527,7 @@ mod tests {
     #[test]
     fn a_probe_creates_no_lock_file() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         // The store any real host has: a `locks/` directory, because some
         // other session has been locked in it. Probing a store without one
@@ -562,7 +561,7 @@ mod tests {
     #[test]
     fn a_probe_of_a_store_with_no_locks_reads_free() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         assert!(!SessionLock::is_held(&persistence, "s-1").expect("probe"));
         assert!(
@@ -578,7 +577,7 @@ mod tests {
     #[test]
     fn a_probe_leaves_the_holder_record_alone() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
         fs::create_dir_all(path.parent().expect("a locks dir")).expect("mkdir");
         let stale = format!("{} a-crashed-host\n", std::process::id());
@@ -602,7 +601,7 @@ mod tests {
     #[test]
     fn a_probe_releases_what_it_took() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let claimed = acquire(&persistence, "s-1")
             .expect("acquire")
             .expect("nobody holds it yet");
@@ -624,7 +623,7 @@ mod tests {
     #[test]
     fn a_probe_does_not_collide_with_another_probe() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let claimed = acquire(&persistence, "s-1")
             .expect("acquire")
             .expect("nobody holds it yet");
@@ -649,14 +648,14 @@ mod tests {
     #[test]
     fn a_probe_refuses_an_id_the_grammar_rejects() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         for id in ["../../escaped", "..", "", "with space"] {
             let err = SessionLock::is_held(&persistence, id)
                 .err()
                 .unwrap_or_else(|| panic!("{id:?} was probed"));
             assert!(
-                matches!(&err, ConversationError::InvalidSessionId(named) if named == id),
+                matches!(&err, SessionError::InvalidSessionId(named) if named == id),
                 "{id:?}: {err}",
             );
         }
@@ -672,7 +671,7 @@ mod tests {
     #[test]
     fn a_sweep_flags_the_locks_whose_records_are_worth_probing() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
 
         assert_eq!(
             SessionLock::enumerate_locks(&persistence).expect("sweep a store with no locks"),
@@ -686,7 +685,7 @@ mod tests {
             .expect("acquire")
             .expect("nobody holds it yet");
 
-        let swept = |persistence: &ConversationPersistence| {
+        let swept = |persistence: &ProjectSessions| {
             let mut locks = SessionLock::enumerate_locks(persistence).expect("sweep");
             locks.sort_by(|a, b| a.session_id.cmp(&b.session_id));
             locks
@@ -721,7 +720,7 @@ mod tests {
     #[test]
     fn a_sweep_ignores_what_is_not_a_lock() {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let held = acquire(&persistence, "s-1")
             .expect("acquire")
             .expect("nobody holds it yet");

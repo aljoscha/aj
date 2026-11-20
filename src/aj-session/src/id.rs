@@ -1,37 +1,38 @@
 //! The session-id grammar the store guarantees and callers may rely on.
 //!
-//! A session id is a filename stem: it becomes
-//! `<sessions_dir>/<id>.jsonl` for the log and `<sessions_dir>/locks/<id>.lock`
-//! for the advisory lock. An id that arrives from outside this process must
-//! therefore be checked before it reaches either, or a peer could name a file
+//! A session id is a key in the database and a filename stem: it becomes
+//! `<sessions_dir>/locks/<id>.lock` for the advisory lock, and
+//! `<sessions_dir>/<id>.jsonl` when the store looks for a session file that
+//! was never imported. An id that arrives from outside this process must
+//! therefore be checked before it becomes a path, or a peer could name a file
 //! outside the store, and taking a lock would create the directories to go
 //! with it.
 //!
 //! Every store entry point that accepts an id from a caller enforces this:
-//! [`ConversationPersistence::session_metadata`],
-//! [`ConversationLog::resume`], and the lock path itself, which is the one
+//! [`ProjectSessions::session_metadata`],
+//! [`SessionLog::resume`], and the lock path itself, which is the one
 //! join whose callers do not already hold an enumerated id.
 //!
-//! [`ConversationPersistence::session_metadata`]: crate::persistence::ConversationPersistence::session_metadata
-//! [`ConversationLog::resume`]: crate::log::ConversationLog::resume
+//! [`ProjectSessions::session_metadata`]: crate::persistence::ProjectSessions::session_metadata
+//! [`SessionLog::resume`]: crate::log::SessionLog::resume
 
 /// Longest session id the store accepts.
 ///
 /// Minted ids are 23 characters (`%Y-%m-%d-%H-%M-%S-%3f`) plus at most a
 /// `_999` collision suffix. The bound is generous next to that and still
-/// leaves room for the `.jsonl` suffix under every filesystem's name limit.
+/// leaves room for a file extension under every filesystem's name limit.
 const MAX_LEN: usize = 128;
 
 /// Whether `id` is a well-formed session id.
 ///
 /// The grammar is non-empty, at most [`MAX_LEN`] bytes, ASCII alphanumerics
-/// plus `-` and `_`. That admits every id [`ConversationLog::create`] mints
+/// plus `-` and `_`. That admits every id [`SessionLog::create`] mints
 /// (a millisecond timestamp with an optional `_N` collision suffix) and rules
 /// out path traversal categorically rather than by enumerating the sequences
 /// that would be dangerous: with no `.`, no `/` and no `\` in the alphabet,
 /// there is no `..`, no separator, and no second extension to smuggle.
 ///
-/// [`ConversationLog::create`]: crate::log::ConversationLog::create
+/// [`SessionLog::create`]: crate::log::SessionLog::create
 pub fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_LEN
@@ -44,16 +45,16 @@ pub fn is_valid_session_id(id: &str) -> bool {
 mod tests {
     use super::*;
     use crate::lock::SessionLock;
-    use crate::log::{ConversationError, ConversationLog};
-    use crate::persistence::ConversationPersistence;
+    use crate::log::{SessionError, SessionLog};
+    use crate::persistence::ProjectSessions;
 
     /// Whatever the minting path produces is, by construction, a valid id.
     #[test]
     fn a_minted_id_is_valid() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         for _ in 0..4 {
-            let log = ConversationLog::create(&persistence).expect("create");
+            let log = SessionLog::create(&persistence).expect("create");
             assert!(
                 is_valid_session_id(log.session_id()),
                 "minted {:?} is not a valid id",
@@ -116,7 +117,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).expect("the store");
-        let persistence = ConversationPersistence::new(sessions.clone());
+        let persistence = ProjectSessions::new(sessions.clone());
 
         // An empty log is a session, resumable, and a `stat` target. Both
         // copies are empty, so the two ids below differ in nothing but whether
@@ -135,7 +136,7 @@ mod tests {
                 .expect("stat")
                 .is_some(),
         );
-        ConversationLog::resume(&persistence, CONTROL).expect("the control log resumes");
+        SessionLog::resume(&persistence, CONTROL).expect("the control log resumes");
         drop(
             SessionLock::try_acquire(&persistence, CONTROL, "host-under-test")
                 .expect("acquire")
@@ -153,15 +154,15 @@ mod tests {
             );
             assert!(
                 matches!(
-                    ConversationLog::resume(&persistence, id),
-                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                    SessionLog::resume(&persistence, id),
+                    Err(SessionError::InvalidSessionId(named)) if named == id,
                 ),
                 "resume opened the file {id:?} names",
             );
             assert!(
                 matches!(
                     SessionLock::try_acquire(&persistence, id, "host-under-test"),
-                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                    Err(SessionError::InvalidSessionId(named)) if named == id,
                 ),
                 "try_acquire built a lock path for {id:?}",
             );

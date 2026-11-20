@@ -54,6 +54,9 @@ pub struct BuiltinToolOptions {
     /// `None` uses the ambient temp directory; set via `spill_dir` in
     /// `~/.aj/config.toml`.
     pub spill_dir: Option<PathBuf>,
+    /// Where bash writes the output and exit files of background tasks.
+    /// `None` uses the spill directory.
+    pub task_dir: Option<PathBuf>,
 }
 
 impl Default for BuiltinToolOptions {
@@ -62,6 +65,7 @@ impl Default for BuiltinToolOptions {
             image_auto_resize: true,
             bash_rtk: false,
             spill_dir: None,
+            task_dir: None,
         }
     }
 }
@@ -76,7 +80,9 @@ pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefiniti
         AgentTool.into(),
         OracleTool::default().into(),
         ApplyPatchTool.into(),
-        BashTool::new(options.bash_rtk, options.spill_dir.clone()).into(),
+        BashTool::new(options.bash_rtk, options.spill_dir.clone())
+            .with_task_dir(options.task_dir.clone())
+            .into(),
         ReadFileTool::with_auto_resize(options.image_auto_resize).into(),
         WriteFileTool.into(),
         EditFileTool.into(),

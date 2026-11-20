@@ -11,7 +11,7 @@
 //! The reducer preserves the domain rules of `aj`'s imperative event
 //! pump, but it mutates data instead of a live component tree, so it is
 //! unit-testable with no terminal. Replay emits the same events as a
-//! live run (`MessageStart` + `MessageEnd` with no updates for
+//! live agent (`MessageStart` + `MessageEnd` with no updates for
 //! finalized messages, `ToolExecutionEnd` with no `Start`), and the
 //! reducer handles both paths, so a resumed session feeds history
 //! through the same `reduce` call as live events.
@@ -24,7 +24,7 @@ mod reducer;
 
 pub use model::{
     AgentEntry, AssistantEntry, ChatState, CompactionEntry, Entry, EntryId, EntryKind, NoticeEntry,
-    NoticeLevel, NoticeRow, SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry,
-    ToolEntry, ToolStatus, Transcript, TurnUsageEntry, UserEntry,
+    NoticeLevel, NoticeRow, RoundUsageEntry, SubAgentEntry, SubAgentStatus, TaskInfo,
+    TaskNotificationEntry, ToolEntry, ToolStatus, Transcript, UserEntry,
 };
 pub use reducer::{Redraw, reduce};

@@ -11,7 +11,7 @@ use aj_models::types::{
     AssistantContent, AssistantError, AssistantMessage, Context, ErrorCategory, Message,
     SimpleStreamOptions, StopReason, StreamOptions, ToolCall,
 };
-use aj_session::{AppendHandoff, ConversationEntryKind, ConversationPersistence, ThreadFilter};
+use aj_session::{LogEntryKind, ProjectSessions, ThreadFilter};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -19,7 +19,7 @@ use super::{TurnPolicy, TurnStart, drive_turn, turn_policy};
 use crate::session::{SessionCore, SessionEntry, SessionSpec};
 use crate::session_setup::RunConfigSnapshot;
 use crate::test_support::{
-    build_test_agent, finalized_text_message, scripted_run_config_with_window,
+    build_test_agent, finalized_text_message, queue_prompt, scripted_run_config_with_window,
 };
 
 const OLD_WORK: &str = "OLD_WORK_TO_SUMMARIZE ";
@@ -146,18 +146,18 @@ fn assert_batch(context: &Context) {
 
 async fn assert_replay(
     agent: &aj_agent::Agent,
-    log: &Arc<tokio::sync::Mutex<aj_session::ConversationLog>>,
-    store: &ConversationPersistence,
+    log: &Arc<tokio::sync::Mutex<aj_session::SessionLog>>,
+    store: &ProjectSessions,
     config: &Arc<Mutex<RunConfigSnapshot>>,
     checkpoints: usize,
 ) {
     let guard = log.lock().await;
-    let conversation = guard.linearize(guard.head().unwrap(), ThreadFilter::USER);
+    let branch = guard.linearize(guard.head().unwrap(), ThreadFilter::MAIN);
     assert_eq!(
-        conversation
+        branch
             .entries()
             .iter()
-            .filter(|entry| matches!(entry.entry, ConversationEntryKind::Compaction { .. }))
+            .filter(|entry| matches!(entry.entry, LogEntryKind::Compaction { .. }))
             .count(),
         checkpoints
     );
@@ -169,7 +169,7 @@ async fn assert_replay(
     {
         persisted.push(Message::Assistant(last.clone()).into());
     }
-    assert_eq!(json(&conversation.agent_messages()), json(&persisted));
+    assert_eq!(json(&branch.agent_messages()), json(&persisted));
     let session_id = guard.session_id().to_string();
     drop(guard);
     let (core, _) = SessionCore::build(
@@ -196,8 +196,8 @@ async fn batch_compacts_before_continuing_with_steering_and_replays_exactly() {
         finalized_text_message(SUMMARY),
         finalized_text_message("finished"),
     ]);
-    let store = ConversationPersistence::new(dir.path().join("sessions"));
-    let (mut agent, log, _persistence) = build_test_agent(&store, &config);
+    let store = ProjectSessions::new(dir.path().join("sessions"));
+    let (mut agent, log, journal) = build_test_agent(&store, &config);
     agent
         .prompt("old request".into(), CancellationToken::new())
         .await
@@ -228,12 +228,12 @@ async fn batch_compacts_before_continuing_with_steering_and_replays_exactly() {
             events.lock().unwrap().push(event.clone());
         }
     }));
+    queue_prompt(&agent, "read both files");
     drive_turn(
         &mut agent,
-        &log,
-        &AppendHandoff::default(),
+        &journal,
         policy,
-        TurnStart::Prompt("read both files".into()),
+        TurnStart::Wake,
         |_| {},
         CancellationToken::new(),
     )
@@ -252,7 +252,14 @@ async fn batch_compacts_before_continuing_with_steering_and_replays_exactly() {
         assert!(text.contains("STEERING_DURING_SUMMARY"));
         assert!(!text.contains("FOLLOW_UP_LATER"));
         assert!(!json(&requests[2]).contains("STEERING_DURING_SUMMARY"));
-        assert_eq!(queues.drain_follow_up(AgentId::Main), ["FOLLOW_UP_LATER"]);
+        assert_eq!(
+            queues
+                .drain_follow_up(AgentId::Main)
+                .into_iter()
+                .map(|input| input.text())
+                .collect::<Vec<_>>(),
+            ["FOLLOW_UP_LATER"]
+        );
     }
 
     {
@@ -310,8 +317,8 @@ async fn opt_out_and_low_reported_usage_skip_even_with_large_tool_results() {
             read_batch(&dir, input, &"large evidence line\n".repeat(1800)),
             finalized_text_message("finished"),
         ]);
-        let store = ConversationPersistence::new(dir.path().join("sessions"));
-        let (mut agent, log, _persistence) = build_test_agent(&store, &config);
+        let store = ProjectSessions::new(dir.path().join("sessions"));
+        let (mut agent, log, journal) = build_test_agent(&store, &config);
         agent
             .prompt("old request".into(), CancellationToken::new())
             .await
@@ -320,12 +327,12 @@ async fn opt_out_and_low_reported_usage_skip_even_with_large_tool_results() {
             during_turn_threshold: threshold,
             ..policy()
         };
+        queue_prompt(&agent, "read");
         drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             move || policy,
-            TurnStart::Prompt("read".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -366,7 +373,7 @@ async fn failed_summary_stops_mid_turn_and_overflow_recovery_without_changing_hi
         } else if silent_overflow {
             // Tool calls drive continuation even when a provider reports Stop.
             // Retained high usage must not misclassify a compaction failure as
-            // a conversational overflow and retry it.
+            // an overflow of a turn and retry it.
             let mut message = read_batch(&dir, 11_000, "evidence");
             message.stop_reason = StopReason::Stop;
             message
@@ -378,18 +385,18 @@ async fn failed_summary_stops_mid_turn_and_overflow_recovery_without_changing_hi
             next,
             finalized_text_message("   "),
         ]);
-        let store = ConversationPersistence::new(dir.path().join("sessions"));
-        let (mut agent, log, _persistence) = build_test_agent(&store, &config);
+        let store = ProjectSessions::new(dir.path().join("sessions"));
+        let (mut agent, log, journal) = build_test_agent(&store, &config);
         agent
             .prompt("old request".into(), CancellationToken::new())
             .await
             .unwrap();
+        queue_prompt(&agent, "read");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             policy,
-            TurnStart::Prompt("read".into()),
+            TurnStart::Wake,
             |_| {},
             CancellationToken::new(),
         )
@@ -418,8 +425,8 @@ async fn cancellation_before_commit_stops_without_checkpoint_or_continuation() {
             read_batch(&dir, 9000, "evidence"),
             finalized_text_message("summary must be canceled"),
         ]);
-        let store = ConversationPersistence::new(dir.path().join("sessions"));
-        let (mut agent, log, _persistence) = build_test_agent(&store, &config);
+        let store = ProjectSessions::new(dir.path().join("sessions"));
+        let (mut agent, log, journal) = build_test_agent(&store, &config);
         agent
             .prompt("old request".into(), CancellationToken::new())
             .await
@@ -442,12 +449,12 @@ async fn cancellation_before_commit_stops_without_checkpoint_or_continuation() {
                 }
             }
         }));
+        queue_prompt(&agent, "read");
         let result = drive_turn(
             &mut agent,
-            &log,
-            &AppendHandoff::default(),
+            &journal,
             policy,
-            TurnStart::Prompt("read".into()),
+            TurnStart::Wake,
             |_| {},
             cancel,
         )
@@ -477,19 +484,19 @@ async fn nothing_to_compact_continues_once_instead_of_looping() {
         read_batch(&dir, 9000, "evidence"),
         finalized_text_message("finished"),
     ]);
-    let store = ConversationPersistence::new(dir.path().join("sessions"));
-    let (mut agent, log, _persistence) = build_test_agent(&store, &config);
+    let store = ProjectSessions::new(dir.path().join("sessions"));
+    let (mut agent, log, journal) = build_test_agent(&store, &config);
     let events = Arc::new(Mutex::new(Vec::new()));
     let _listener = agent.subscribe(listener_from_sync({
         let events = Arc::clone(&events);
         move |event| events.lock().unwrap().push(event.clone())
     }));
+    queue_prompt(&agent, "read");
     drive_turn(
         &mut agent,
-        &log,
-        &AppendHandoff::default(),
+        &journal,
         policy,
-        TurnStart::Prompt("read".into()),
+        TurnStart::Wake,
         |_| {},
         CancellationToken::new(),
     )

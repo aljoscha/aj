@@ -88,20 +88,20 @@ const entries = [
         body_ref: { source: 'future_content', append_newline: false } },
       is_error: false, timestamp: 0 } },
   // The spawn event can be persisted after sibling tool results from the same
-  // assistant turn, so its parent is the current main-thread head rather than
+  // assistant message, so its parent is the current main-thread head rather than
   // necessarily the assistant entry that contains the `agent` call.
   { id: 'sp', parent_id: 'r3f', thread: 'subagent', agent_id: 1, type: 'sub_agent_spawn', task: 'investigate the bug',
     settings: { provider: 'anthropic', model_id: 'claude-test', thinking: 'off', speed: 'standard', verbosity: '' }, timestamp: '2024-01-01T00:00:06Z' },
   { id: 'sm', parent_id: 'sp', thread: 'subagent', agent_id: 1, type: 'message', timestamp: '2024-01-01T00:00:07Z',
     message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'sub-agent finding' }],
       usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
-  // the agent tool_result (successful report) on the user thread
+  // the agent tool_result (successful report) on the main thread
   { id: 'r4', parent_id: 'r3f', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:08Z',
     message: { role: 'tool_result', tool_call_id: 'c4', tool_name: 'agent',
       content: [{ type: 'text', text: 'sub-agent finding' }],
       details: { kind: 'sub_agent_report', agent_id: 1, task: 'investigate the bug', report: 'sub-agent finding' },
       is_error: false, timestamp: 0 } },
-  // A background-task completion notice on the user thread: the typed
+  // A background-task notification on the main thread: the typed
   // `role:"task_notification"` shape the exporter emits.
   { id: 'n1', parent_id: 'r4', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:08Z',
     message: { role: 'task_notification', label: 'cargo build', kind: 'bash',
@@ -569,9 +569,9 @@ console.log('filters');
 }
 
 // Spine layout: a sub-agent run hangs one level in off the message that
-// spawned it and renders before the conversation continues, while the
+// spawned it and renders before the main thread continues, while the
 // main thread stays on its spine (not indented by the run). sp2 is
-// spawned by a2; a3 is a2's conversation continuation.
+// spawned by a2; a3 is a2's continuation on the main thread.
 console.log('layout');
 {
   const rows = treeRows();
@@ -582,7 +582,7 @@ console.log('layout');
   check('sub-agent run hangs one level in off its spawning message', !!(a2 && sp2) && sp2.indent === a2.indent + 1);
   check('delayed spawn root hangs off its spawning message', !!(a1 && sp1) && sp1.indent === a1.indent + 1);
   check('main thread is not indented by a sub-agent run', !!(a2 && a3) && a3.indent === a2.indent);
-  check('sub-agent run renders before the conversation continues', !!(sp2 && a3) && rows.indexOf(sp2) < rows.indexOf(a3));
+  check('sub-agent run renders before the main thread continues', !!(sp2 && a3) && rows.indexOf(sp2) < rows.indexOf(a3));
   // A run followed by a spine continuation keeps the connector open (├)
   // so the spine threads down to the continuation.
   check('run before a spine continuation keeps the connector open', !!sp2 && sp2.prefix.includes('\u251c') && !sp2.prefix.includes('\u2514'));
@@ -598,17 +598,17 @@ check('sub-agent message in tree', visibleSubs.includes('sub-agent finding'));
 fire(subToggle, 'click');
 const hiddenSubs = elements['tree-container'].children.map(nodeText).join('\n');
 check('sub-agent hidden after toggle', !hiddenSubs.includes('sub-agent #1'));
-check('conversation remains after hiding sub-agents', hiddenSubs.includes('user:'));
+check('main thread remains after hiding sub-agents', hiddenSubs.includes('user:'));
 fire(subToggle, 'click');
 
 // Clicking a sub-agent row opens its inline box and keeps the full
-// conversation visible (it routes to the host assistant's branch).
+// main thread visible (it routes to the host assistant's branch).
 const spawnNode = elements['tree-container'].children.find((n) => n.dataset.id === 'sp');
 check('sub-agent spawn node present', !!spawnNode);
 if (spawnNode) {
   fire(spawnNode, 'click');
   check('clicking sub-agent renders its inline box', elements['messages'].innerHTML.includes('id="subagent-1"'));
-  check('clicking sub-agent keeps full conversation', elements['messages'].innerHTML.includes('Done.'));
+  check('clicking sub-agent keeps full main thread', elements['messages'].innerHTML.includes('Done.'));
   check('sidebar navigation aligns the target at the top',
     scrollCalls.some((call) => call.id === 'subagent-1' && call.options && call.options.block === 'start'));
 }

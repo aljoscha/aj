@@ -340,6 +340,7 @@ mod tests {
                 child,
                 task: "work".into(),
                 tool_name: "agent".into(),
+                call_id: None,
                 background: false,
                 settings: AgentSettings {
                     context_window: 0,

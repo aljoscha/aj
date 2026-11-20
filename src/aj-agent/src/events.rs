@@ -1,7 +1,7 @@
 //! Agent event protocol.
 //!
 //! The agent emits a typed event for every state transition: lifecycle
-//! markers (turn start/end, agent start/end), message lifecycle (start,
+//! markers (agent start/end, round start/end), message lifecycle (start,
 //! streaming update, end), tool execution lifecycle (start, update,
 //! end), sub-agent correlation, queue snapshots, and transient
 //! notices. Listeners subscribed via the agent's bus see every event
@@ -81,10 +81,9 @@ pub struct AgentSettings {
 }
 
 /// How a sub-agent run concluded, delivered to the parent alongside its
-/// report and used to set the parent box's status. Not persisted on its
-/// own. On resume it is reconstructed from the sub's final message stop
-/// reason (see `aj-session`'s replay), so no on-disk format change is
-/// needed to tell a failed or truncated run from a clean one.
+/// report and used to set the parent box's status. The session records
+/// it with the run's end. For a run without that record, replay
+/// reconstructs it from the sub's final message stop reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubAgentConclusion {
@@ -148,7 +147,7 @@ pub enum CompactionReason {
 #[serde(rename_all = "snake_case")]
 pub enum CompactionPhase {
     /// Summarizing the history before the cut point — the main
-    /// summarizer inference and the longest part of a run.
+    /// summarizer inference and the longest part of a compaction.
     Summarizing,
     /// Summarizing the prefix of a turn the cut split, so the retained
     /// suffix keeps its setup. Only emitted for a split-turn cut.
@@ -179,14 +178,14 @@ pub enum AgentEvent {
         writes: std::collections::BTreeMap<String, Value>,
     },
     // --- Lifecycle ---------------------------------------------------------
-    /// Emitted once when [`Agent::prompt`](crate::Agent) starts a run.
+    /// Emitted once when [`Agent::prompt`](crate::Agent) starts a turn.
     AgentStart {
         agent_id: AgentId,
         /// Whether a foreground caller owns this agent's assignment.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         assignment_pending: bool,
     },
-    /// Emitted once when a run completes. Carries the full transcript
+    /// Emitted once when a turn completes. Carries the full transcript
     /// for listeners that want a final snapshot without replaying.
     AgentEnd {
         agent_id: AgentId,
@@ -200,15 +199,15 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         assignment_pending: bool,
     },
-    /// Beginning of an assistant-message turn (one inference + any
-    /// tool calls it triggers). Paired with a closing [`TurnEnd`], but
-    /// only on a clean completion: a turn that aborts or errors emits
-    /// its `TurnStart` and then returns without a `TurnEnd`, so a
+    /// Beginning of a round (one inference + any
+    /// tool calls it triggers). Paired with a closing [`RoundEnd`], but
+    /// only on a clean completion: a round that aborts or errors emits
+    /// its `RoundStart` and then returns without a `RoundEnd`, so a
     /// consumer pairing the two must tolerate an unclosed bracket.
-    TurnStart { agent_id: AgentId },
-    /// End of an assistant-message turn, after tools have finalized.
-    /// Emitted only when the turn completes cleanly (see [`TurnStart`]).
-    TurnEnd {
+    RoundStart { agent_id: AgentId },
+    /// End of a round, after tools have finalized.
+    /// Emitted only when the round completes cleanly (see [`RoundStart`]).
+    RoundEnd {
         agent_id: AgentId,
         message: AssistantMessage,
         tool_results: Vec<ToolResultMessage>,
@@ -223,7 +222,7 @@ pub enum AgentEvent {
     ///
     /// This event is also the persistence trigger: the persistence
     /// listener subscribed on the bus writes one
-    /// [`aj_session::ConversationEntry`] per finalized message off
+    /// [`aj_session::LogEntry`] per finalized message off
     /// [`AgentEvent::MessageEnd`].
     MessageStart {
         agent_id: AgentId,
@@ -240,16 +239,16 @@ pub enum AgentEvent {
         event: AssistantMessageEvent,
     },
     /// A message has been finalized. The `message` field is the
-    /// authoritative final form; renderers / persistence listeners
+    /// authoritative final form; renderers and the journal
     /// should treat any in-flight state from `MessageUpdate` as
     /// stale once this fires.
     ///
     /// Persistence subscribes to this event directly: every
     /// [`AgentEvent::MessageEnd`] becomes one
-    /// [`aj_session::ConversationEntry`] appended to the log. The
+    /// [`aj_session::LogEntry`] appended to the log. The
     /// agent emits one [`AgentEvent::MessageEnd`] per finalized
-    /// message — assistant turns, the user prompt at the top of
-    /// every run, and one event per tool-result message in a tool
+    /// message — assistant messages, the user prompt at the top of
+    /// every turn, and one event per tool-result message in a tool
     /// batch.
     MessageEnd {
         agent_id: AgentId,
@@ -320,9 +319,14 @@ pub enum AgentEvent {
         /// unspecified and renders as an ordinary agent.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         tool_name: String,
+        /// The id of `parent`'s tool call that spawned the child, which is
+        /// what ties that call to this sub-agent. `None` from a peer or a
+        /// record that predates the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
         /// Whether the sub was spawned to run in the background,
         /// concurrent with the parent's turn, rather than blocking it.
-        /// The persistence listener writes it to the log's `SubAgentSpawn`
+        /// The journal writes it to the log's `SubAgentSpawn`
         /// entry so a picker can still show the run mode after a resume,
         /// when the transient task registry that reveals it live is empty.
         background: bool,
@@ -377,7 +381,7 @@ pub enum AgentEvent {
         partial: ToolDetails,
     },
     /// A background task reached a terminal status. Transient — not
-    /// persisted; the completion notice drained into the owner's
+    /// persisted; the task notification drained into the owner's
     /// transcript is the persisted record.
     TaskEnd {
         agent_id: AgentId,
@@ -405,12 +409,12 @@ pub enum AgentEvent {
     },
 
     /// Cumulative token-usage snapshot emitted for each accounted assistant
-    /// turn. The [`TokenUsage`] payload carries both this turn's delta (`turn_*`) and the running totals
+    /// message. The [`TokenUsage`] payload carries both this response's delta (`turn_*`) and the running totals
     /// (`accumulated_*`, which the agent maintains across operations), so a
     /// renderer can show a usage indicator without re-aggregating from
     /// [`AgentEvent::MessageEnd`] payloads. Distinct from
-    /// [`AgentEvent::TurnEnd`]: that closes a turn's lifecycle and
-    /// carries the turn's message + tool results, whereas this carries
+    /// [`AgentEvent::RoundEnd`]: that closes a round's lifecycle and
+    /// carries the round's message + tool results, whereas this carries
     /// the running usage figures.
     UsageUpdate {
         agent_id: AgentId,
@@ -444,11 +448,11 @@ pub enum AgentEvent {
     /// - `summary: Some` (and `error: None`) — success; the text is the
     ///   generated summary so a live renderer can show a
     ///   compaction-summary row.
-    /// - both `None` — the run ended without writing (cancelled before
+    /// - both `None` — the compaction ended without writing (cancelled before
     ///   the persist step).
     ///
     /// `usage` carries the accounted summarizer spend on success. It is absent
-    /// for unsuccessful runs and checkpoints whose spend is unknown.
+    /// for unsuccessful compactions and checkpoints whose spend is unknown.
     ///
     /// The event is not stored verbatim. Successful ends carry the checkpoint's
     /// durable tag during forwarding and replay. Failures carry their error
@@ -488,8 +492,8 @@ impl AgentEvent {
             Self::AgentStart { agent_id, .. }
             | Self::CodeModeStore { agent_id, .. }
             | Self::AgentEnd { agent_id, .. }
-            | Self::TurnStart { agent_id }
-            | Self::TurnEnd { agent_id, .. }
+            | Self::RoundStart { agent_id }
+            | Self::RoundEnd { agent_id, .. }
             | Self::MessageStart { agent_id, .. }
             | Self::MessageUpdate { agent_id, .. }
             | Self::MessageEnd { agent_id, .. }
@@ -523,7 +527,7 @@ mod tests {
         // Every regular event reports its own agent_id; sub-agent
         // correlation events report the parent so listeners that
         // group by source see the spawn alongside its own activity.
-        let main_evt = AgentEvent::TurnStart {
+        let main_evt = AgentEvent::RoundStart {
             agent_id: AgentId::Main,
         };
         assert_eq!(main_evt.agent_id(), AgentId::Main);
@@ -533,6 +537,7 @@ mod tests {
             child: AgentId::Sub(0),
             task: "test".into(),
             tool_name: "agent".into(),
+            call_id: None,
             background: false,
             settings: AgentSettings {
                 context_window: 0,
@@ -628,6 +633,7 @@ mod tests {
             child: AgentId::Sub(2),
             task: "explore".into(),
             tool_name: "oracle".into(),
+            call_id: Some("call-7".into()),
             background: true,
             settings: AgentSettings {
                 context_window: 0,
@@ -643,6 +649,7 @@ mod tests {
         assert_eq!(json["type"], "sub_agent_start");
         assert_eq!(json["task"], "explore");
         assert_eq!(json["tool_name"], "oracle");
+        assert_eq!(json["call_id"], "call-7");
         assert_eq!(json["background"], true);
         assert_eq!(json["provider"], "anthropic");
         assert_eq!(json["model_id"], "claude-x");
@@ -653,9 +660,10 @@ mod tests {
         let decoded: AgentEvent = serde_json::from_value(json.clone()).expect("spawn decodes");
         assert_eq!(serde_json::to_value(decoded).unwrap(), json);
         json.as_object_mut().unwrap().remove("tool_name");
+        json.as_object_mut().unwrap().remove("call_id");
         let legacy: AgentEvent = serde_json::from_value(json).expect("legacy spawn decodes");
         assert!(
-            matches!(legacy, AgentEvent::SubAgentStart { tool_name, .. } if tool_name.is_empty())
+            matches!(legacy, AgentEvent::SubAgentStart { tool_name, call_id: None, .. } if tool_name.is_empty())
         );
     }
 

@@ -211,6 +211,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/tree", get(tree))
         .route("/v1/sessions/{id}/info", get(session_info))
         .route("/v1/sessions/{id}/export", get(export_html))
+        .route("/v1/sessions/{id}/history", get(history))
         .route("/v1/sessions/{id}/usage", get(provider_usage))
         .route("/v1/sessions/{id}/usage/reset", post(reset_provider_usage))
         .route("/v1/sessions/{id}/env", get(environment).post(env_command))
@@ -229,6 +230,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/sessions/{id}/kill-agent", post(kill_agent))
         .route("/v1/sessions/{id}/compact", post(compact))
+        .route("/v1/sessions/{id}/continue", post(continue_turn))
         .route("/v1/sessions/{id}/settings", post(settings))
         .route("/v1/sessions/{id}/models", get(models))
         .route("/v1/sessions/{id}/config", get(config).post(edit_config))
@@ -429,6 +431,32 @@ fn history_stream(state: Arc<ServerState>, session: Option<String>) -> Response 
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    before: u64,
+    limit: u64,
+    /// A sub-agent's index. Absent for the main agent.
+    agent: Option<usize>,
+}
+
+async fn history(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid("invalid history query"))?;
+    let page = state
+        .host
+        .history(
+            &session,
+            query.agent.map_or(AgentId::Main, AgentId::Sub),
+            query.before,
+            query.limit,
+        )
+        .await?;
+    Ok(Json(page).into_response())
+}
+
 async fn export_html(
     State(state): State<Arc<ServerState>>,
     Path(session): Path<String>,
@@ -627,6 +655,14 @@ async fn kill_agent(
             )
             .await?,
     )
+}
+
+async fn continue_turn(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(_request): Body<EmptyRequest>,
+) -> Result<Response, ApiError> {
+    accepted(state.host.command(&session, Command::Continue).await?)
 }
 
 async fn compact(

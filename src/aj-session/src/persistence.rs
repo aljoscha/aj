@@ -1,232 +1,450 @@
-//! Project-level discovery of conversation session files.
+//! Project-level session discovery.
 //!
-//! [`ConversationPersistence`] is the owner of a project's sessions
-//! directory. It lists existing sessions (for `aj list-sessions` and
-//! `aj continue`) and resolves a session id to its on-disk path so
-//! [`crate::log::ConversationLog`] can open / create the right file.
+//! [`ProjectSessions`] is the owner of a project's sessions. It
+//! lists them (for `aj list-sessions` and `aj continue`), answers for one
+//! session without opening it, and hands [`crate::log::SessionLog`]
+//! its connection to the database.
+//!
+//! The sessions are the ones in the database, plus the session files that
+//! were never imported. Every method asks the database first, and
+//! [`crate::legacy`] for a session it does not hold. No file of a session
+//! is read here.
 
 use aj_models::types::{Message, UserContent};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError, ThreadKind};
+use crate::legacy;
+use crate::log::{LogEntry, LogEntryKind, SessionError, ThreadKind};
 
-/// The extension of the sidecar holding a session's label.
-const TAG_SIDECAR: &str = "tag";
+pub use crate::legacy::MigrationResult;
 
-/// The extension of the sidecar whose existence archives a session.
-const ARCHIVED_SIDECAR: &str = "archived";
-
-/// Handles persistence operations for conversations, including listing
-/// existing session files and resolving their paths.
+/// One project's sessions: where its database is, the project it is scoped
+/// to, and the directory that holds its writer locks and any session file
+/// that was never imported.
 #[derive(Clone)]
-pub struct ConversationPersistence {
+pub struct ProjectSessions {
     sessions_dir: PathBuf,
+    database_path: PathBuf,
+    project_id: String,
 }
 
-impl ConversationPersistence {
-    /// Create a new [ConversationPersistence] instance with the given
-    /// sessions directory.
+impl ProjectSessions {
+    /// Open an isolated store rooted at `sessions_dir`, with project `default`.
+    /// Hosts sharing the global database use [`Self::for_project`] instead.
     pub fn new(sessions_dir: PathBuf) -> Self {
-        Self { sessions_dir }
+        Self::for_project(
+            sessions_dir.join("sessions.sqlite3"),
+            sessions_dir,
+            "default".into(),
+        )
+    }
+
+    /// Scope a shared database to one project. `sessions_dir` retains that
+    /// project's legacy JSONL files and writer locks. Construction performs no
+    /// I/O and never imports an intermediate SQLite database from that directory.
+    pub fn for_project(database_path: PathBuf, sessions_dir: PathBuf, project_id: String) -> Self {
+        Self {
+            sessions_dir,
+            database_path,
+            project_id,
+        }
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// Explicitly discover sibling projects in this database and legacy root.
+    /// Missing legacy directories do not hide database-only projects. This
+    /// never opens SQLite files found inside individual project directories.
+    pub fn projects(&self) -> Result<Vec<Self>, SessionError> {
+        let root = self.sessions_dir.parent().unwrap_or(&self.sessions_dir);
+        let mut projects = BTreeMap::from([(self.project_id.clone(), self.clone())]);
+        let directories = match fs::read_dir(root) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in directories.into_iter().flatten() {
+            let entry = entry?;
+            if !entry.path().is_dir() || entry.path() == self.sessions_dir {
+                continue;
+            }
+            let name = entry.file_name().into_string().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "project directory name is not UTF-8",
+                )
+            })?;
+            projects.insert(
+                name.clone(),
+                Self::for_project(self.database_path.clone(), entry.path(), name),
+            );
+        }
+        if let Some(store) = self.sqlite_reader()? {
+            for project in store.project_ids()? {
+                // Catalog identities become legacy paths here, not at SQL query
+                // sites. Refuse names that could escape the legacy store root.
+                if Path::new(&project)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(project.as_str())
+                {
+                    return Err(SessionError::Corrupt(
+                        "project identity is not a directory name".into(),
+                    ));
+                }
+                projects.entry(project.clone()).or_insert_with(|| {
+                    Self::for_project(self.database_path.clone(), root.join(&project), project)
+                });
+            }
+        }
+        Ok(projects.into_values().collect())
+    }
+
+    pub fn sqlite_path(&self) -> PathBuf {
+        self.database_path.clone()
+    }
+
+    pub(crate) fn sqlite_writer(&self) -> Result<crate::sqlite::SqliteStore, SessionError> {
+        Ok(crate::sqlite::SqliteStore::open_project(
+            &self.database_path,
+            &self.project_id,
+        )?)
+    }
+
+    /// A connection to an existing database for queries, `None` when there
+    /// is no database. An unreadable database is an error, never permission
+    /// to fall back to a stale JSONL source.
+    pub(crate) fn sqlite_reader(&self) -> Result<Option<Reader>, SessionError> {
+        Reader::checkout(&self.database_path, &self.project_id)
+    }
+
+    /// Every entry of a session in append order, from the database or,
+    /// for a session not imported yet, its JSONL file. Takes no writer lock,
+    /// so a live session reads one committed snapshot.
+    pub fn read_entries(&self, session_id: &str) -> Result<Vec<crate::LogEntry>, SessionError> {
+        if self.in_database(session_id)?
+            && let Some(store) = self.sqlite_reader()?
+        {
+            return Ok(store.full_entries(session_id)?);
+        }
+        legacy::entries(self, session_id)
+    }
+
+    /// Make `snapshot` hold `agent`'s page of history before `before`, of
+    /// at least `limit` entries, and return where the page starts (see
+    /// [`crate::LogSnapshot::page_start`]). Takes no writer lock. A
+    /// snapshot that holds its whole session is left as it is.
+    pub fn load_page(
+        &self,
+        snapshot: &mut crate::LogSnapshot,
+        agent: aj_agent::events::AgentId,
+        before: u64,
+        limit: u64,
+    ) -> Result<u64, SessionError> {
+        if !snapshot.is_complete()
+            && let Some(store) = self.sqlite_reader()?
+        {
+            return Ok(snapshot.load_page(&store, agent, before, limit)?);
+        }
+        Ok(snapshot.page_start(agent, before, limit))
+    }
+
+    /// Make every later label and archive write to this database fail, as a
+    /// full disk would, while reads keep working.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_sqlite_annotation_writes(&self) {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .refuse_annotation_writes();
+    }
+
+    /// Lift [`Self::refuse_sqlite_annotation_writes`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn allow_sqlite_annotation_writes(&self) {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .allow_annotation_writes();
+    }
+
+    /// Make every later save of pending work to this database fail, as a
+    /// full disk would, while reads keep working.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_sqlite_pending_writes(&self) {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .refuse_pending_writes();
+    }
+
+    /// Lift [`Self::refuse_sqlite_pending_writes`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn allow_sqlite_pending_writes(&self) {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .allow_pending_writes();
+    }
+
+    /// Make every later append of an entry to this database fail, or
+    /// none, while reads and other writes keep working.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_sqlite_entry_writes(&self, refuse: bool) {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .refuse_every_entry_write(refuse);
+    }
+
+    /// Make every later insert or delete of a task record in this database
+    /// fail, or neither, while reads keep working.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_sqlite_task_writes(&self, insert: bool, delete: bool) {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .refuse_task_writes(insert, delete);
+    }
+
+    /// The id and pid of every task the database records for the session,
+    /// whichever thread it belongs to, in id order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn recorded_tasks(&self, session_id: &str) -> Vec<(usize, u32)> {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .all_tasks(session_id)
+            .expect("read the task records")
+    }
+
+    /// Everything the database stores for the session beside its entries:
+    /// its threads with their turns, its pending inputs and its
+    /// recorded tasks, one line each.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stored_rows(&self, session_id: &str) -> Vec<String> {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .rows(session_id)
+            .expect("read the session's rows")
+    }
+
+    /// How many committed transactions the database's write-ahead log
+    /// holds. Every write of a session commits one, so the difference
+    /// between two readings is how many writes were made in between,
+    /// provided no checkpoint restarted the log: one runs when the last
+    /// connection closes or the log has grown by a thousand pages.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn committed_writes(&self) -> u64 {
+        let mut path = self.sqlite_path().into_os_string();
+        path.push("-wal");
+        let Ok(wal) = std::fs::read(path) else {
+            return 0;
+        };
+        let word = |at: usize| wal.get(at..at + 4).map(|bytes| bytes.try_into().unwrap());
+        let Some(page) = word(8).map(u32::from_be_bytes) else {
+            return 0;
+        };
+        let salts = (word(16), word(20));
+        let frame = 24 + usize::try_from(page).unwrap();
+        let mut commits = 0;
+        // A frame of the current log carries the header's salts. A commit
+        // frame records the database's size, which is not zero.
+        for at in (32..wal.len()).step_by(frame) {
+            if (word(at + 8), word(at + 12)) != salts || at + frame > wal.len() {
+                break;
+            }
+            commits += u64::from(word(at + 4) != Some([0; 4]));
+        }
+        commits
+    }
+
+    /// Damage sub-agent `agent`'s stored runs in the session: no entry of
+    /// them can be read any more, and their turns are stored as working.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn damage_sub_agent(&self, session_id: &str, agent: usize) {
+        self.sqlite_writer()
+            .expect("open the session database")
+            .damage_sub_agent(session_id, agent)
+            .expect("damage the sub-agent's runs");
+    }
+
+    /// The pid of every command the database records for this project, so a
+    /// test can stop what it started. Empty when there is no database.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn recorded_task_pids(&self) -> Vec<u32> {
+        if !self.database_path.exists() {
+            return Vec::new();
+        }
+        self.sqlite_writer()
+            .and_then(|store| Ok(store.all_task_pids()?))
+            .unwrap_or_default()
+    }
+
+    /// Whether the database holds the session. One that it does not hold
+    /// may still exist as a JSONL file that has not been imported.
+    pub fn in_database(&self, session_id: &str) -> Result<bool, SessionError> {
+        if !crate::is_valid_session_id(session_id) {
+            return Err(SessionError::InvalidSessionId(session_id.into()));
+        }
+        match self.sqlite_reader()? {
+            Some(store) => Ok(store.contains_session(session_id)?),
+            None => Ok(false),
+        }
+    }
+
+    /// Storage problems in this store's database, one line each. `None` when
+    /// no database exists yet. Read-only, and repairs nothing.
+    pub fn check_database(&self) -> Result<Option<Vec<String>>, SessionError> {
+        if !self.sqlite_path().exists() {
+            return Ok(None);
+        }
+        Ok(Some(crate::sqlite::check_database(&self.sqlite_path())?))
+    }
+
+    /// Every command the database records as running, in every project and
+    /// session, each with its project and session id. Empty when no
+    /// database exists yet. Read-only: whether a command's process is
+    /// still alive is the caller's to find out.
+    pub fn task_records(&self) -> Result<Vec<(String, String, crate::TaskRecord)>, SessionError> {
+        if !self.sqlite_path().exists() {
+            return Ok(Vec::new());
+        }
+        Ok(crate::sqlite::task_records(&self.sqlite_path())?)
     }
 
     pub fn sessions_dir(&self) -> &std::path::Path {
         &self.sessions_dir
     }
 
-    pub(crate) fn session_path(&self, session_id: &str) -> PathBuf {
-        self.sessions_dir.join(format!("{session_id}.jsonl"))
-    }
-
-    /// The directory holding session sidecars, `meta/` under the store.
-    ///
-    /// The location is a wire-level convention shared with every reader of the
-    /// store. Its payoff is that one directory read
-    /// finds every sidecar without walking the logs, which is what makes an
-    /// untagged store cost nothing and a tagged one cost one read per label
-    /// rather than a `stat` per session.
-    fn meta_dir(&self) -> PathBuf {
-        self.sessions_dir.join("meta")
-    }
-
-    /// A session's sidecar path under `extension`, or `None` for an id the
-    /// grammar rejects.
-    ///
-    /// An invalid id must not become a path (see [`crate::id`]), and these are
-    /// write paths, so the check is not optional.
-    fn sidecar_path(&self, session_id: &str, extension: &str) -> Option<PathBuf> {
-        crate::id::is_valid_session_id(session_id)
-            .then(|| self.meta_dir().join(format!("{session_id}.{extension}")))
-    }
-
     /// The session's tag, `Ok(None)` when it has none.
     ///
-    /// One open and one read of a small file. Callers that list a whole store
-    /// go through [`Self::enumerate_tags`] instead, which finds the sidecars
-    /// that exist in a single directory read.
-    pub fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
-        let Some(path) = self.sidecar_path(session_id, TAG_SIDECAR) else {
+    /// Callers listing a whole store use [`Self::enumerate_tags`] to load
+    /// database labels in bulk.
+    pub fn read_tag(&self, session_id: &str) -> Result<Option<String>, SessionError> {
+        if !crate::is_valid_session_id(session_id) {
             return Ok(None);
-        };
-        match fs::read_to_string(&path) {
-            Ok(contents) => Ok(crate::tag::tag_from_sidecar(&contents)),
-            // No sidecar is the untagged case, not a failure.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err.into()),
         }
+        if self.in_database(session_id)? {
+            return Ok(self
+                .sqlite_reader()?
+                .map(|store| store.annotations(session_id))
+                .transpose()?
+                .unwrap_or_default()
+                .tag);
+        }
+        legacy::label(self, session_id)
     }
 
-    /// Set or clear the session's tag. `None` removes the sidecar.
+    /// Set or clear the tag of a session the store holds, where it lives.
+    /// Callers hold the session's lock, which is what orders two writers.
     ///
-    /// The write is atomic: the body lands in a temporary file in the same
-    /// directory and is renamed over the target, so a reader sees either the
-    /// old tag or the new one and never a torn line. Callers hold the session's
-    /// lock, which is what orders two writers.
+    /// A session the store does not hold is refused: one that is not stored
+    /// yet keeps its label with its log (see
+    /// [`crate::SessionLog::set_tag`]).
     ///
     /// `tag` is expected to have been through [`crate::tag::normalize_tag`]
     /// already, so this writes what it is given.
     ///
-    /// An id the grammar rejects is an error rather than a quiet no-op. It
-    /// cannot name a sidecar in this store, and a caller that took the `Ok`
-    /// for a write would go on to publish a label the store does not hold:
-    /// the tag command sets the session's row on the strength of this
-    /// returning.
-    pub fn write_tag(&self, session_id: &str, tag: Option<&str>) -> Result<(), ConversationError> {
-        let Some(path) = self.sidecar_path(session_id, TAG_SIDECAR) else {
-            return Err(ConversationError::InvalidSessionId(session_id.to_string()));
-        };
-        let Some(tag) = tag else {
-            match fs::remove_file(&path) {
-                Ok(()) => return Ok(()),
-                // Already untagged, which is what the caller asked for.
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(err) => return Err(err.into()),
-            }
-        };
-        fs::create_dir_all(self.meta_dir())?;
-        let mut temp = tempfile::Builder::new()
-            .prefix(".tag-")
-            .tempfile_in(self.meta_dir())?;
-        std::io::Write::write_all(&mut temp, tag.as_bytes())?;
-        std::io::Write::write_all(&mut temp, b"\n")?;
-        temp.persist(&path).map_err(|err| err.error)?;
-        Ok(())
+    /// An id the grammar rejects is an error rather than a quiet no-op. A
+    /// caller that took the `Ok` for a write would go on to publish a label
+    /// the store does not hold: the tag command sets the session's row on
+    /// the strength of this returning.
+    pub fn write_tag(&self, session_id: &str, tag: Option<&str>) -> Result<(), SessionError> {
+        if self.in_database(session_id)? {
+            self.sqlite_writer()?.set_tag(session_id, tag)?;
+            return Ok(());
+        }
+        legacy::set_label(self, session_id, tag)
     }
 
     /// Whether the session is archived.
     ///
-    /// One `stat` and no read at all: the sidecar's existence is the whole
-    /// answer. Callers that list a whole store go through
-    /// [`Self::enumerate_archived`] instead, which finds the sidecars that
-    /// exist in a single directory read.
-    pub fn read_archived(&self, session_id: &str) -> Result<bool, ConversationError> {
-        let Some(path) = self.sidecar_path(session_id, ARCHIVED_SIDECAR) else {
+    /// Callers listing a whole store use [`Self::enumerate_archived`]
+    /// instead.
+    pub fn read_archived(&self, session_id: &str) -> Result<bool, SessionError> {
+        if !crate::is_valid_session_id(session_id) {
             return Ok(false);
-        };
-        match fs::metadata(&path) {
-            // A directory under the name is not a sidecar, which is the answer
-            // an enumeration gives for it too.
-            Ok(metadata) => Ok(metadata.is_file()),
-            // No sidecar is the unarchived case, not a failure.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(err.into()),
         }
+        if self.in_database(session_id)? {
+            return Ok(self
+                .sqlite_reader()?
+                .map(|store| store.annotations(session_id))
+                .transpose()?
+                .unwrap_or_default()
+                .archived);
+        }
+        legacy::archived(self, session_id)
     }
 
-    /// Set or clear the session's archived bit by creating or removing its
-    /// sidecar.
-    ///
-    /// The existence of the file is the bit, so there is no content to tear:
-    /// the create and the remove each publish the whole answer in one
-    /// operation, and a reader sees one state or the other. Callers hold the
-    /// session's lock, which is what orders two writers.
+    /// Set or clear the archived bit of a session the store holds, where it
+    /// lives. A session the store does not hold is refused, as
+    /// [`Self::write_tag`] refuses it. Callers hold the session's lock.
     ///
     /// An id the grammar rejects is an error rather than a quiet no-op, for
     /// the reason [`Self::write_tag`] gives: the archive command sets the
     /// session's row on the strength of this returning.
-    pub fn write_archived(
-        &self,
-        session_id: &str,
-        archived: bool,
-    ) -> Result<(), ConversationError> {
-        let Some(path) = self.sidecar_path(session_id, ARCHIVED_SIDECAR) else {
-            return Err(ConversationError::InvalidSessionId(session_id.to_string()));
-        };
-        if !archived {
-            return match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                // Already unarchived, which is what the caller asked for.
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                // A directory under the sidecar's name is not the bit either
-                // (see [`Self::read_archived`]), so the session already reads
-                // as unarchived and the remove had nothing to do. Raising here
-                // would refuse the state the store is in, and go on refusing
-                // it.
-                Err(_) if fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) => Ok(()),
-                Err(err) => Err(err.into()),
-            };
+    pub fn write_archived(&self, session_id: &str, archived: bool) -> Result<(), SessionError> {
+        if self.in_database(session_id)? {
+            self.sqlite_writer()?.set_archived(session_id, archived)?;
+            return Ok(());
         }
-        fs::create_dir_all(self.meta_dir())?;
-        match fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(()),
-            // Already archived, and the file holds nothing to bring up to
-            // date, so this leaves it exactly as it is.
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(err) => Err(err.into()),
-        }
+        legacy::set_archived(self, session_id, archived)
     }
 
-    /// Every tag sidecar in the store, with its file metadata.
-    ///
-    /// One directory read of `meta/` plus one `stat` per sidecar, and no
-    /// sidecar contents at all: callers read the labels with [`Self::read_tag`].
-    /// An untagged store has no `meta/` directory and costs a single failed
-    /// `read_dir`, which is what makes the untagged case free: a caller cannot
-    /// ask per session without paying a `stat` per session.
-    pub fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
-        self.enumerate_sidecars(TAG_SIDECAR)
-    }
-
-    /// Every archived sidecar in the store, with the fingerprint of the file
-    /// it was found at.
-    ///
-    /// The same shape as [`Self::enumerate_tags`], for the axis whose answer is
-    /// the file's existence: one directory read for the whole listing and no
-    /// sidecar opened at all. A store with no `meta/` directory pays a single
-    /// failed `read_dir`, and one that has the directory pays a read of it per
-    /// axis, never a `stat` per session.
-    pub fn enumerate_archived(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
-        self.enumerate_sidecars(ARCHIVED_SIDECAR)
-    }
-
-    /// The sidecars under `extension` the store holds.
-    ///
-    /// One directory read per axis, which is what keeps a listing off the
-    /// per-session `stat` a caller asking session by session would pay.
-    fn enumerate_sidecars(
-        &self,
-        extension: &str,
-    ) -> Result<Vec<SidecarMetadata>, ConversationError> {
-        let files = self.session_files(&self.meta_dir(), extension)?;
-        Ok(files
+    /// Tags in this project, without reading transcript entries. Database
+    /// labels are already loaded. The label of a session file that was not
+    /// imported is left for the caller to read, so live labels and
+    /// unreadable individual files retain their own semantics.
+    pub fn enumerate_tags(&self) -> Result<Vec<TagListing>, SessionError> {
+        let files = legacy::labelled(self)?;
+        let sql = self.annotation_catalog(files.ids())?;
+        let mut tags: Vec<TagListing> = files
+            .unimported(|id| sql.contains_key(id))?
             .into_iter()
-            .filter_map(|(session_id, metadata)| {
-                let modified = metadata.modified().ok()?;
-                Some(SidecarMetadata {
-                    session_id,
-                    modified_at: modified.into(),
-                    size_bytes: metadata.len(),
-                })
+            .map(|session_id| TagListing {
+                session_id,
+                tag: None,
             })
-            .collect())
+            .collect();
+        tags.extend(sql.into_iter().filter_map(|(session_id, annotations)| {
+            annotations.tag.map(|tag| TagListing {
+                session_id,
+                tag: Some(tag),
+            })
+        }));
+        Ok(tags)
+    }
+
+    /// Archived IDs for display. An archive marker of a session file that
+    /// cannot be read is skipped. Control flow uses the strict archive sweep
+    /// instead.
+    pub fn enumerate_archived(&self) -> Result<Vec<String>, SessionError> {
+        self.archived_with(legacy::archive_marked(self)?)
+    }
+
+    /// The archived sessions: the ones the database marks, and the session
+    /// files among `files` that it does not hold.
+    fn archived_with(&self, files: legacy::Marked<'_>) -> Result<Vec<String>, SessionError> {
+        let sql = self.annotation_catalog(files.ids())?;
+        let mut archived = files.unimported(|id| sql.contains_key(id))?;
+        archived.extend(
+            sql.into_iter()
+                .filter_map(|(id, annotations)| annotations.archived.then_some(id)),
+        );
+        Ok(archived)
+    }
+
+    /// Every labelled or archived session of the database, plus the sessions
+    /// among `file_ids` that it holds, at one snapshot. A session the
+    /// database holds takes nothing from a sidecar kept beside it, so a
+    /// label or marker cleared in the database stays cleared.
+    fn annotation_catalog<'a>(
+        &self,
+        file_ids: impl Iterator<Item = &'a str>,
+    ) -> Result<BTreeMap<String, crate::sqlite::SessionAnnotations>, SessionError> {
+        let Some(store) = self.sqlite_reader()? else {
+            return Ok(BTreeMap::new());
+        };
+        Ok(store.annotation_snapshot(file_ids)?.into_iter().collect())
     }
 
     /// Every per-session file under `dir` carrying `extension`, with the stat
@@ -239,13 +457,13 @@ impl ConversationPersistence {
     ///
     /// Display semantics: a file whose stat fails for any reason is dropped,
     /// because a listing that loses one row is still worth rendering. A caller
-    /// whose control flow turns on the answer wants the strict
-    /// `archived_ids` sweep instead, which cannot afford that.
+    /// whose control flow turns on the answer starts from
+    /// [`Self::sidecar_candidates`] and judges each `stat` itself.
     pub(crate) fn session_files(
         &self,
         dir: &Path,
         extension: &str,
-    ) -> Result<Vec<(String, fs::Metadata)>, ConversationError> {
+    ) -> Result<Vec<(String, fs::Metadata)>, SessionError> {
         let mut found = Vec::new();
         for (session_id, path) in self.sidecar_candidates(dir, extension)? {
             let Ok(metadata) = fs::metadata(&path) else {
@@ -272,11 +490,11 @@ impl ConversationPersistence {
     /// name claims to be, which is the half both the display sweep and the
     /// strict sweep agree on. What a caller does about a file that will not
     /// stat is the half they differ on, so it is left to them.
-    fn sidecar_candidates(
+    pub(crate) fn sidecar_candidates(
         &self,
         dir: &Path,
         extension: &str,
-    ) -> Result<Vec<(String, PathBuf)>, ConversationError> {
+    ) -> Result<Vec<(String, PathBuf)>, SessionError> {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -302,106 +520,45 @@ impl ConversationPersistence {
     /// The id of every archived session, for a caller whose control flow turns
     /// on the answer.
     ///
-    /// The strict counterpart to the display sweep. Archiving is recorded by a
-    /// sidecar's existence, so this needs no timestamp and opens nothing: one
-    /// directory read plus one `stat` per sidecar found.
-    ///
-    /// What it will not do is report a session unarchived because the store
-    /// could not be read. A sidecar that is gone by the time it is stat-ed was
-    /// unarchived as of this read, which is an answer. Any other stat failure,
-    /// a permission denial, an I/O error, a symlink loop, is not an answer,
-    /// and reporting it as one would hand back the session the store was told
-    /// to put away.
-    fn archived_ids(&self) -> Result<HashSet<String>, ConversationError> {
-        let mut archived = HashSet::new();
-        for (session_id, path) in self.sidecar_candidates(&self.meta_dir(), ARCHIVED_SIDECAR)? {
-            match fs::metadata(&path) {
-                // A directory named like a sidecar is not one, exactly as the
-                // display sweep treats it.
-                Ok(metadata) => {
-                    if metadata.is_file() {
-                        archived.insert(session_id);
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-        Ok(archived)
+    /// The strict counterpart to [`Self::enumerate_archived`]. What it will
+    /// not do is report a session unarchived because the store could not be
+    /// read (see [`legacy::archive_marked_strict`]).
+    fn archived_ids(&self) -> Result<HashSet<String>, SessionError> {
+        let archived = self.archived_with(legacy::archive_marked_strict(self)?)?;
+        Ok(archived.into_iter().collect())
     }
 
-    /// Every `.jsonl` file in the sessions directory whose stem is a session
-    /// id, latest first, with the facts a `stat` yields. Session contents are
-    /// not opened or parsed.
-    ///
-    /// A stem the grammar rejects (see [`crate::id`]) is skipped: this store
-    /// refuses that id at every later lookup, so listing it would put a row in
-    /// every directory that nothing can resolve.
-    ///
-    /// A file that vanishes or turns unreadable between the directory read and
-    /// its `stat` is skipped rather than failing the enumeration: a listing
-    /// must not break over one file, least of all one that is no longer there.
-    pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
-        if !self.sessions_dir.exists() {
-            return Ok(Vec::new());
-        }
+    /// Every session of the project, latest first, with the facts that
+    /// fingerprint it. No entry of a session is read.
+    pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionError> {
+        let mut sessions = legacy::sessions(self)?;
 
-        let mut sessions = Vec::new();
-        for entry in fs::read_dir(&self.sessions_dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            // A stem the grammar rejects is not a session this store can be
-            // asked about later, so listing it would put a row in every
-            // directory that no attach could ever resolve.
-            if !crate::id::is_valid_session_id(session_id) {
-                continue;
-            }
-            let metadata = match fs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    // Vanished or turned unreadable since the directory read.
-                    tracing::debug!("skipping session file {}: {err}", path.display());
-                    continue;
-                }
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let Ok(modified) = metadata.modified() else {
-                tracing::debug!(
-                    "skipping session file {}: no modification time",
-                    path.display()
-                );
-                continue;
-            };
-            sessions.push(SessionMetadata::new(
-                session_id.to_string(),
-                modified.into(),
-                metadata.len(),
-            ));
+        if let Some(store) = self.sqlite_reader()? {
+            let stored = store.list_sessions()?;
+            let imported: HashSet<_> = stored.iter().map(|m| m.id.as_str()).collect();
+            sessions.retain(|m| !imported.contains(m.session_id.as_str()));
+            sessions.extend(
+                stored
+                    .into_iter()
+                    .map(|m| SessionMetadata::new(m.id, m.updated_at, m.last_seq)),
+            );
         }
-
-        // Filenames are timestamps, so reverse-lexicographic is latest first.
+        // Ids are timestamps, so reverse-lexicographic is latest first.
         sessions.sort_by(|left, right| right.session_id.cmp(&left.session_id));
         Ok(sessions)
     }
 
-    /// The `stat` facts for one session's log, `Ok(None)` when the store
-    /// holds no log under that id.
+    /// The fingerprint of one session, `Ok(None)` when the store holds no
+    /// session under that id.
     ///
     /// The single-id form of [`Self::list_sessions`], for the membership
-    /// question a lookup asks. It costs one `stat` rather than a directory
-    /// read, which is what keeps "is this id one of mine" off the size of the
-    /// store.
+    /// question a lookup asks. It costs one query, and one `stat` when the
+    /// database does not hold the session, which is what keeps "is this id
+    /// one of mine" off the size of the store.
     ///
     /// An id the grammar rejects answers `Ok(None)` without touching the
-    /// filesystem: it cannot name a log in this store, and turning it into a
-    /// path is exactly what must not happen (see [`crate::id`]).
+    /// filesystem: it cannot name a session in this store, and turning it
+    /// into a path is exactly what must not happen (see [`crate::id`]).
     ///
     /// Absence and failure are separate answers. A store this process cannot
     /// read is not a store without the session in it, and a caller that
@@ -410,28 +567,38 @@ impl ConversationPersistence {
     pub fn session_metadata(
         &self,
         session_id: &str,
-    ) -> Result<Option<SessionMetadata>, ConversationError> {
+    ) -> Result<Option<SessionMetadata>, SessionError> {
         if !crate::id::is_valid_session_id(session_id) {
             return Ok(None);
         }
-        let path = self.session_path(session_id);
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(ConversationError::Io(err)),
-        };
-        if !metadata.is_file() {
-            return Ok(None);
+        if let Some(store) = self.sqlite_reader()?
+            && let Some(m) = store.session_metadata(session_id)?
+        {
+            return Ok(Some(SessionMetadata::new(m.id, m.updated_at, m.last_seq)));
         }
-        let modified = metadata.modified().map_err(ConversationError::Io)?;
-        Ok(Some(SessionMetadata::new(
-            session_id.to_string(),
-            modified.into(),
-            metadata.len(),
-        )))
+        legacy::metadata(self, session_id)
     }
 
-    /// Get the latest conversation session ID, if any exist.
+    /// How large a session's history is, in bytes: the summed length of a
+    /// stored session's entries, the length of a session file. `Ok(None)` when
+    /// the store holds no session under that id.
+    ///
+    /// Computed when asked, by reading the session's row headers, so it is
+    /// for a caller that shows the size and not for one that polls.
+    pub fn session_size(&self, session_id: &str) -> Result<Option<u64>, SessionError> {
+        if !crate::id::is_valid_session_id(session_id) {
+            return Ok(None);
+        }
+        if let Some(store) = self.sqlite_reader()?
+            && store.contains_session(session_id)?
+        {
+            return Ok(Some(store.entry_bytes(session_id)?));
+        }
+        // The revision of a session file is its length.
+        Ok(legacy::metadata(self, session_id)?.map(|file| file.revision))
+    }
+
+    /// Get the latest session ID, if any exist.
     ///
     /// Archived sessions are passed over. Archiving puts a session away
     /// without closing it, so an explicit id still resumes one; this is the
@@ -439,17 +606,16 @@ impl ConversationPersistence {
     /// has to mean something. Same rule as bare `aj connect`, which filters
     /// the peer's rows for the same reason. The filter belongs here rather
     /// than in [`Self::list_sessions`], because every listing depends on the
-    /// unfiltered read, and it costs one directory read for the whole store
-    /// rather than a `stat` per session.
+    /// unfiltered read.
     ///
     /// The archive set is read through the strict `archived_ids` sweep rather
-    /// than the display one. That is the difference between
-    /// control flow and rendering. A listing may lose the archived bit and
-    /// still be worth showing, so the display path drops a sidecar it cannot
-    /// stat. Here the bit decides which session the user gets, so the same
-    /// silence would hand back a session the store was told to put away.
-    /// Absence of archiving is an answer; absence of knowledge is raised.
-    pub fn get_latest_session_id(&self) -> Result<Option<String>, ConversationError> {
+    /// than the display one. That is the difference between control flow and
+    /// rendering. A listing may lose the archived bit and still be worth
+    /// showing. Here the bit decides which session the user gets, so the
+    /// same silence would hand back a session the store was told to put
+    /// away. Absence of archiving is an answer. Absence of knowledge is
+    /// raised.
+    pub fn get_latest_session_id(&self) -> Result<Option<String>, SessionError> {
         let sessions = self.list_sessions()?;
         let archived = self.archived_ids()?;
         Ok(sessions
@@ -464,55 +630,158 @@ impl ConversationPersistence {
         &self,
         session_id: &str,
         cancel: &dyn Fn() -> bool,
-    ) -> Result<Option<SessionPreview>, ConversationError> {
+    ) -> Result<Option<SessionPreview>, SessionError> {
         if !crate::is_valid_session_id(session_id) {
-            return Err(ConversationError::InvalidSessionId(session_id.to_string()));
+            return Err(SessionError::InvalidSessionId(session_id.to_string()));
         }
         if cancel() {
             return Ok(None);
         }
-        let mut preview =
-            read_session_preview_file(session_id, &self.session_path(session_id), cancel)?;
+        let mut preview = if let Some(store) = self.sqlite_reader()?
+            && let Some(metadata) = store.session_metadata(session_id)?
+        {
+            // Counts and times come from the index. Only the entries that
+            // can supply the preview text are read, and only until one does.
+            let summary = store.message_summary(session_id)?;
+            let mut accumulator = PreviewAccumulator {
+                message_count: summary.count,
+                last_message_at: summary.last_at,
+                ..Default::default()
+            };
+            store.scan(session_id, "user", true, |entry| {
+                accumulator.push_text(&entry);
+                accumulator.first_user_message.is_none() && !cancel()
+            })?;
+            if accumulator.first_user_message.is_none() {
+                store.scan(session_id, "goal_change", false, |entry| {
+                    accumulator.push_text(&entry);
+                    accumulator.first_goal_objective.is_none() && !cancel()
+                })?;
+            }
+            accumulator.finish(session_id, metadata.updated_at)
+        } else {
+            legacy::preview(self, session_id, cancel)?
+        };
         if cancel() {
             return Ok(None);
         }
-        // Sidecars are display metadata here: one that cannot be read leaves
-        // the preview unlabelled or unarchived rather than failing it.
+        // The label and the archived bit are display metadata here: one that
+        // cannot be read leaves the preview unlabelled or unarchived rather
+        // than failing it.
         preview.tag = self.read_tag(session_id).ok().flatten();
         preview.archived = self.read_archived(session_id).unwrap_or(false);
         Ok(Some(preview))
     }
 }
 
-/// A session sidecar the store holds, with the file state it was found at.
-///
-/// The fingerprint is what lets a caller cache what it derived from the file: a
-/// sidecar whose modification time and size have not moved holds the same
-/// answer.
+/// A label found without reading the transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SidecarMetadata {
+pub struct TagListing {
     pub session_id: String,
-    pub modified_at: DateTime<Utc>,
-    pub size_bytes: u64,
+    /// The label when the database holds it. `None` for a session file that
+    /// was never imported: its label is in a sidecar this listing did not
+    /// read, and [`ProjectSessions::read_tag`] reads it.
+    pub tag: Option<String>,
 }
 
-/// Metadata about a conversation session.
+/// Read connections no reader is using, kept for the next one.
+static IDLE_READERS: std::sync::Mutex<Vec<IdleReader>> = std::sync::Mutex::new(Vec::new());
+
+/// How many idle read connections the process keeps. Readers beyond that
+/// open a connection and close it.
+const MAX_IDLE_READERS: usize = 4;
+
+struct IdleReader {
+    store: crate::sqlite::SqliteStore,
+    database: PathBuf,
+    project: String,
+    /// Device and inode of the file the connection was opened on.
+    file: (u64, u64),
+}
+
+/// A read-only connection to one project's sessions, borrowed from the
+/// process's idle connections and returned to them when dropped.
+///
+/// A connection is reused only for the database file it was opened on. One
+/// whose file was replaced or removed is closed, so a reader never answers
+/// from a database that is no longer at its path.
+pub(crate) struct Reader(Option<IdleReader>);
+
+impl Reader {
+    pub(crate) fn checkout(
+        database: &std::path::Path,
+        project: &str,
+    ) -> Result<Option<Self>, SessionError> {
+        use std::os::unix::fs::MetadataExt;
+        let file = match fs::metadata(database) {
+            Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let idle = {
+            let mut idle = IDLE_READERS.lock().expect("idle readers mutex poisoned");
+            // Connections to a file that is no longer at the path are
+            // closed here.
+            idle.retain(|reader| reader.database != database || Some(reader.file) == file);
+            let found = idle
+                .iter()
+                .position(|reader| reader.database == database && reader.project == project);
+            found.map(|index| idle.swap_remove(index))
+        };
+        let Some(file) = file else {
+            return Ok(None);
+        };
+        if idle.is_some() {
+            return Ok(Some(Self(idle)));
+        }
+        let store = crate::sqlite::SqliteStore::open_project_read_only(database, project)?;
+        Ok(Some(Self(Some(IdleReader {
+            store,
+            database: database.to_owned(),
+            project: project.to_owned(),
+            file,
+        }))))
+    }
+}
+
+impl std::ops::Deref for Reader {
+    type Target = crate::sqlite::SqliteStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.as_ref().expect("held until drop").store
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let Some(reader) = self.0.take() else {
+            return;
+        };
+        let mut idle = IDLE_READERS.lock().expect("idle readers mutex poisoned");
+        if idle.len() < MAX_IDLE_READERS {
+            idle.push(reader);
+        }
+    }
+}
+
+/// Metadata about a session.
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
     pub session_id: String,
     pub modified_at: DateTime<Utc>,
-    /// File size in bytes. Paired with `modified_at` it fingerprints the file
-    /// for callers caching values derived from it.
-    pub size_bytes: u64,
+    /// A number that moves when the session's entries do: the append
+    /// position of a stored session's last entry, the length of a session
+    /// file that was never imported. Paired with `modified_at` this fingerprints the session for
+    /// callers caching values derived from it.
+    pub revision: u64,
 }
 
 impl SessionMetadata {
-    /// Assemble a row from what a `stat` of the session's log yields.
-    pub fn new(session_id: String, modified_at: DateTime<Utc>, size_bytes: u64) -> Self {
+    pub fn new(session_id: String, modified_at: DateTime<Utc>, revision: u64) -> Self {
         Self {
             session_id,
             modified_at,
-            size_bytes,
+            revision,
         }
     }
 
@@ -524,67 +793,47 @@ impl SessionMetadata {
     pub fn modified_display(&self) -> String {
         self.modified_at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
     }
-
-    /// The file size, formatted for the `list-sessions` output. Size stands in
-    /// for conversation length.
-    pub fn size_display(&self) -> String {
-        if self.size_bytes < 1024 {
-            format!("{}B", self.size_bytes)
-        } else if self.size_bytes < 1024 * 1024 {
-            format!("{}KB", self.size_bytes / 1024)
-        } else {
-            format!("{}MB", self.size_bytes / (1024 * 1024))
-        }
-    }
 }
 
 /// Richer per-session snapshot used by the interactive session
 /// selector overlay.
 ///
-/// Unlike [`SessionMetadata`] (which is purely a filesystem-stat
-/// payload), [`SessionPreview`] opens the JSONL and walks far enough
-/// to count `Message` entries and capture the first nonempty user-role text
-/// block, falling back to the first nonempty goal objective. Producing one
-/// through [`ConversationPersistence::session_preview`] is therefore
-/// O(file size).
+/// Unlike [`SessionMetadata`], a [`SessionPreview`] counts the session's
+/// `Message` entries and carries the first nonempty user-role text block,
+/// falling back to the first nonempty goal objective. For a stored session
+/// the counts come from the index and only the entries that can supply the
+/// text are read. For a session file that was never imported the whole file
+/// is read.
 #[derive(Debug, Clone)]
 pub struct SessionPreview {
-    /// Filename stem of the session file (e.g.
-    /// `2025-05-11-14-22-03-512`).
+    /// The session id (e.g. `2025-05-11-14-22-03-512`).
     pub session_id: String,
-    /// Modification time read from the file system. Held as a
-    /// real [`DateTime`] (not a pre-formatted string) so the
-    /// renderer can choose whatever date/age formatting it likes.
+    /// When the session last changed. Held as a real [`DateTime`] (not a
+    /// pre-formatted string) so the renderer can choose whatever date/age
+    /// formatting it likes.
     pub modified: DateTime<Utc>,
     /// Session creation time. Parsed from `session_id` (which is
     /// minted as a millisecond-precision UTC timestamp on
-    /// [`crate::log::ConversationLog::create`]). Falls back to
-    /// `modified` when the id doesn't parse, so hand-renamed files or a
-    /// future filename format this build doesn't recognise still
-    /// produce a structurally complete row.
+    /// [`crate::log::SessionLog::create`]). Falls back to
+    /// `modified` when the id doesn't parse, so an id this build doesn't
+    /// recognise still produces a structurally complete row.
     pub created_at: DateTime<Utc>,
-    /// Time of the most recently appended message-kind entry.
-    /// Captured during the JSONL walk in
-    /// [`read_session_preview_file`] as the largest
-    /// [`ConversationEntry::timestamp`] seen on a
-    /// [`ConversationEntryKind::Message`] entry, so out-of-order
-    /// writes (e.g. a tool result that completes after a streaming
-    /// assistant message finalised) still resolve to the true
-    /// most-recent message rather than the last line of the file.
-    /// Falls back to `modified` when no entry carries a timestamp
-    /// (logs predating the timestamping work) or no message-kind
-    /// entry has been appended yet.
+    /// Time of the most recent message-kind entry: the largest
+    /// [`LogEntry::timestamp`] on a
+    /// [`LogEntryKind::Message`] entry, so out-of-order writes
+    /// (e.g. a tool result that completes after a streaming assistant
+    /// message finalised) still resolve to the true most-recent message
+    /// rather than the last one appended. Falls back to `modified` when no
+    /// entry carries a timestamp or no message-kind entry has been
+    /// appended yet.
     pub last_message_at: DateTime<Utc>,
-    /// On-disk size in bytes. Cheap to surface from the
-    /// `fs::metadata` we already had to call.
-    pub size_bytes: u64,
-    /// Number of [`ConversationEntryKind::Message`] entries in the
+    /// Number of [`LogEntryKind::Message`] entries in the
     /// log. User, assistant, and tool_result messages all
     /// contribute; non-message entries (`SystemPrompt`) are
     /// skipped.
     pub message_count: usize,
-    /// Display text from the first nonempty user-thread, user-role textual block,
-    /// falling back to the first nonempty `GoalChange` objective in the file.
+    /// Display text from the first nonempty main-thread, user-role textual block,
+    /// falling back to the first nonempty `GoalChange` objective.
     /// Internal context and delegated task prompts are not user input. Later goal
     /// edits or clears do not replace the fallback. `None` when neither source
     /// has nonempty text.
@@ -593,124 +842,70 @@ pub struct SessionPreview {
     pub first_user_message: Option<String>,
     /// The label the session carries, `None` when it has none.
     ///
-    /// It lives in a tag sidecar rather than in the log, so
-    /// [`ConversationPersistence::session_preview`] fills it from the sidecar
-    /// and the per-file walk leaves it unset.
+    /// It is not an entry of the session, so
+    /// [`ProjectSessions::session_preview`] fills it in after the
+    /// entries are read.
     pub tag: Option<String>,
     /// Whether the session is archived.
     ///
-    /// Its sidecar's existence is the bit, so
-    /// [`ConversationPersistence::session_preview`] fills it from a `stat` of
-    /// the sidecar and the per-file walk leaves it false.
+    /// Filled in like `tag`.
     pub archived: bool,
 }
 
-/// Open `path`, walk every JSONL line, and assemble a
-/// [`SessionPreview`].
-///
-/// JSON lines that fail to parse are skipped. Invalid UTF-8 ends the walk at
-/// the readable prefix. Either way the entries already read produce a preview,
-/// matching the resume-time tolerance for a truncated tail. The walk is
-/// one-pass. User text takes precedence over a goal objective regardless of
-/// their order in the file.
-fn read_session_preview_file(
-    session_id: &str,
-    path: &std::path::Path,
-    cancel: &dyn Fn() -> bool,
-) -> Result<SessionPreview, ConversationError> {
-    let metadata = fs::metadata(path)?;
-    let modified = metadata
-        .modified()
-        .map(DateTime::<Utc>::from)
-        .unwrap_or_else(|_| Utc::now());
-    let size_bytes = metadata.len();
+#[derive(Default)]
+pub(crate) struct PreviewAccumulator {
+    message_count: usize,
+    first_user_message: Option<String>,
+    first_goal_objective: Option<String>,
+    last_message_at: Option<DateTime<Utc>>,
+}
 
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+impl PreviewAccumulator {
+    pub(crate) fn push(&mut self, entry: &LogEntry) {
+        if matches!(entry.entry, LogEntryKind::Message { .. }) {
+            self.message_count += 1;
+            if let Some(timestamp) = entry.timestamp {
+                self.last_message_at = Some(
+                    self.last_message_at
+                        .map_or(timestamp, |previous| previous.max(timestamp)),
+                );
+            }
+        }
+        self.push_text(entry);
+    }
 
-    let mut message_count = 0usize;
-    let mut first_user_message: Option<String> = None;
-    let mut first_goal_objective: Option<String> = None;
-    // Track the largest message-kind timestamp seen so far. Tracking
-    // the max (not the last) lets the field tolerate out-of-order
-    // writes: a tool result that lands after a streaming assistant
-    // message finalised, for example.
-    let mut last_message_at: Option<DateTime<Utc>> = None;
-    for (lineno, line_res) in reader.lines().enumerate() {
-        // Cooperative cancellation: this runs on the blocking pool, so we
-        // poll `cancel` and stop reading once the consumer is gone. We may
-        // break with a partial count. `session_preview` re-checks `cancel`
-        // after the walk and drops it, so no truncated row shows.
-        if lineno % crate::SCAN_CANCEL_CHECK_LINES == 0 && cancel() {
-            break;
-        }
-        // A best-effort `Ok(_)`-only path: an IO error mid-file
-        // shouldn't mask the entries we already accumulated. Same
-        // policy as the resume tolerance for truncated lines.
-        let line = match line_res {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line) else {
-            continue;
-        };
-        if let ConversationEntryKind::Message { message: msg } = &entry.entry {
-            message_count += 1;
-            if first_user_message.is_none() && entry.thread == ThreadKind::User {
-                if let Some(Message::User(u)) = msg.as_stored_wire() {
-                    if let Some(text) = first_user_text(&u.content) {
-                        first_user_message = Some(text);
-                    }
-                }
+    /// Take the preview text this entry offers, if none is held yet.
+    fn push_text(&mut self, entry: &LogEntry) {
+        if let LogEntryKind::Message { message } = &entry.entry {
+            if self.first_user_message.is_none()
+                && entry.thread == ThreadKind::Main
+                && let Some(Message::User(user)) = message.as_stored_wire()
+            {
+                self.first_user_message = first_user_text(&user.content);
             }
-            if let Some(ts) = entry.timestamp {
-                last_message_at = Some(match last_message_at {
-                    Some(prev) if prev >= ts => prev,
-                    _ => ts,
-                });
-            }
-        } else if first_goal_objective.is_none()
-            && let ConversationEntryKind::GoalChange { goal: Some(goal) } = &entry.entry
+        } else if self.first_goal_objective.is_none()
+            && let LogEntryKind::GoalChange { goal: Some(goal) } = &entry.entry
+            && !goal.objective.trim().is_empty()
         {
-            let objective = goal.objective.trim();
-            if !objective.is_empty() {
-                first_goal_objective = Some(objective.to_string());
-            }
+            self.first_goal_objective = Some(goal.objective.trim().to_owned());
         }
     }
 
-    // Creation time: derived from the filename stem rather than
-    // a per-entry timestamp so a session with no appended messages
-    // (a freshly-minted log) still has a meaningful "created"
-    // marker for the selector. Fall back to the file mtime if the
-    // stem doesn't parse.
-    let created_at = parse_session_id_created_at(session_id).unwrap_or(modified);
-    // `last_message_at` falls back to the file mtime for two cases:
-    // logs predating the per-entry timestamping work (every entry
-    // has `timestamp: None`) and freshly-minted sessions with no
-    // message-kind entries yet. The fallback matches the value the
-    // selector would have rendered as `modified` under the older
-    // single-field design.
-    let last_message_at = last_message_at.unwrap_or(modified);
-
-    Ok(SessionPreview {
-        session_id: session_id.to_string(),
-        modified,
-        created_at,
-        last_message_at,
-        size_bytes,
-        message_count,
-        first_user_message: first_user_message.or(first_goal_objective),
-        // Not in the log: `session_preview` fills these from the sidecars.
-        tag: None,
-        archived: false,
-    })
+    pub(crate) fn finish(self, session_id: &str, modified: DateTime<Utc>) -> SessionPreview {
+        SessionPreview {
+            session_id: session_id.to_owned(),
+            modified,
+            created_at: parse_session_id_created_at(session_id).unwrap_or(modified),
+            last_message_at: self.last_message_at.unwrap_or(modified),
+            message_count: self.message_count,
+            first_user_message: self.first_user_message.or(self.first_goal_objective),
+            tag: None,
+            archived: false,
+        }
+    }
 }
 
-/// Parse a session id minted by [`crate::log::ConversationLog::create`]
+/// Parse a session id minted by [`crate::log::SessionLog::create`]
 /// back into the UTC instant it represents.
 ///
 /// The mint format is `%Y-%m-%d-%H-%M-%S-%3f` with an optional
@@ -742,8 +937,7 @@ pub(crate) fn parse_session_id_created_at(session_id: &str) -> Option<DateTime<U
 }
 
 /// Return the text from the first [`UserContent::Text`] block in
-/// `content`, if any. Used by [`read_session_preview_file`] to
-/// capture the user-input preview.
+/// `content`, if any: the user-input text of a preview.
 fn first_user_text(content: &[UserContent]) -> Option<String> {
     content.iter().find_map(|b| match b {
         UserContent::Text(t) => {
@@ -760,6 +954,9 @@ fn first_user_text(content: &[UserContent]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use crate::jsonl::ARCHIVED_SIDECAR;
     use aj_agent::goal::{Goal, GoalStatus};
     use aj_agent::message::AgentMessage;
     use aj_models::types::{
@@ -769,14 +966,40 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::log::{ConversationLog, ConversationView};
+    use crate::log::{AgentLog, SessionLog};
 
-    /// A tag round-trips through the sidecar, and clearing removes it.
+    /// Store a session under `id`: one message.
+    fn stored_session(persistence: &ProjectSessions, id: &str) {
+        let record = LogEntry {
+            id: "root".into(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::Main,
+            agent_id: None,
+            entry: LogEntryKind::Message {
+                message: AgentMessage::wire(Message::User(UserMessage::text("hello"))),
+            },
+        };
+        let mut store = persistence.sqlite_writer().expect("open the database");
+        let (now, none) = (Utc::now(), Default::default());
+        crate::jsonl::import_entries(&mut store, id, &[record], now, &none)
+            .expect("store the session");
+    }
+
+    /// A stored session's tag round-trips, and clearing removes it. A
+    /// session the store does not hold has nowhere to keep one.
     #[test]
     fn a_tag_round_trips_and_clears() {
-        let (_dir, persistence) = fixture();
+        let (dir, persistence) = fixture();
         let id = "2024-01-01-00-00-00";
 
+        assert!(
+            persistence.write_tag(id, Some("fix-auth")).is_err(),
+            "a label was accepted for a session that is not stored",
+        );
+        assert!(persistence.write_archived(id, true).is_err());
+        assert!(!persistence.sqlite_path().exists() && !dir.path().join("meta").exists());
+        stored_session(&persistence, id);
         assert_eq!(persistence.read_tag(id).expect("read"), None, "untagged");
 
         persistence.write_tag(id, Some("fix-auth")).expect("write");
@@ -806,25 +1029,31 @@ mod tests {
     fn a_sidecar_lives_under_meta() {
         let (dir, persistence) = fixture();
         let id = "2024-01-01-00-00-00";
+        legacy_file(&persistence, id);
         persistence.write_tag(id, Some("fix-auth")).expect("write");
 
         assert!(
             dir.path().join("meta").join(format!("{id}.tag")).is_file(),
             "the sidecar is at the path the spec names",
         );
-        let top: Vec<std::ffi::OsString> = std::fs::read_dir(dir.path())
+        let mut top: Vec<std::ffi::OsString> = std::fs::read_dir(dir.path())
             .expect("store directory")
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name())
             .collect();
+        top.sort();
         assert_eq!(
             top,
-            vec![std::ffi::OsString::from("meta")],
+            vec![
+                std::ffi::OsString::from(format!("{id}.jsonl")),
+                std::ffi::OsString::from("meta"),
+            ],
             "nothing landed beside the logs",
         );
-        assert!(
-            persistence.list_sessions().expect("enumerate").is_empty(),
-            "a store with only a tag holds no sessions",
+        assert_eq!(
+            persistence.list_sessions().expect("enumerate").len(),
+            1,
+            "the tag is not a session of its own",
         );
     }
 
@@ -839,7 +1068,7 @@ mod tests {
             assert!(
                 matches!(
                     persistence.write_tag(id, Some("nope")),
-                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                    Err(SessionError::InvalidSessionId(named)) if named == id,
                 ),
                 "{id:?} is refused rather than silently dropped",
             );
@@ -849,7 +1078,7 @@ mod tests {
             assert!(
                 matches!(
                     persistence.write_archived(id, true),
-                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                    Err(SessionError::InvalidSessionId(named)) if named == id,
                 ),
                 "{id:?} is refused by the archived write as well",
             );
@@ -869,6 +1098,7 @@ mod tests {
     fn a_tag_is_never_read_half_written() {
         let (dir, persistence) = fixture();
         let id = "2024-01-01-00-00-00";
+        legacy_file(&persistence, id);
         persistence.write_tag(id, Some("before")).expect("write");
 
         let target = dir.path().join("meta").join(format!("{id}.tag"));
@@ -917,27 +1147,28 @@ mod tests {
             "an untagged store has no meta directory and no tags",
         );
 
-        persistence
-            .write_tag("2024-01-01-00-00-00", Some("first"))
-            .expect("write");
-        persistence
-            .write_tag("2024-01-02-00-00-00", Some("second"))
-            .expect("write");
+        for (id, tag) in [
+            ("2024-01-01-00-00-00", "first"),
+            ("2024-01-02-00-00-00", "second"),
+        ] {
+            legacy_file(&persistence, id);
+            persistence.write_tag(id, Some(tag)).expect("write");
+        }
 
-        let mut found: Vec<(String, u64)> = persistence
+        let mut found: Vec<(String, Option<String>)> = persistence
             .enumerate_tags()
             .expect("enumerate")
             .into_iter()
-            .map(|tag| (tag.session_id, tag.size_bytes))
+            .map(|tag| (tag.session_id, tag.tag))
             .collect();
         found.sort();
         assert_eq!(
             found,
             vec![
-                ("2024-01-01-00-00-00".to_string(), 6),
-                ("2024-01-02-00-00-00".to_string(), 7),
+                ("2024-01-01-00-00-00".to_string(), None),
+                ("2024-01-02-00-00-00".to_string(), None),
             ],
-            "each sidecar reports its own file state",
+            "legacy labels are left unread for their caller",
         );
     }
 
@@ -949,6 +1180,7 @@ mod tests {
     #[test]
     fn enumerating_tags_ignores_what_is_not_a_sidecar() {
         let (dir, persistence) = fixture();
+        legacy_file(&persistence, "2024-01-01-00-00-00");
         let meta = dir.path().join("meta");
         std::fs::create_dir_all(&meta).expect("meta");
         std::fs::write(meta.join("notes.txt"), "not a tag").expect("write");
@@ -970,6 +1202,7 @@ mod tests {
     fn an_archived_bit_round_trips_and_clears() {
         let (dir, persistence) = fixture();
         let id = "2024-01-01-00-00-00";
+        legacy_file(&persistence, id);
 
         assert!(
             !persistence.read_archived(id).expect("read"),
@@ -1033,6 +1266,8 @@ mod tests {
         let (_dir, persistence) = fixture();
         let tagged = "2024-01-01-00-00-00";
         let archived = "2024-01-02-00-00-00";
+        stored_session(&persistence, tagged);
+        stored_session(&persistence, archived);
         persistence
             .write_tag(tagged, Some("fix-auth"))
             .expect("tag");
@@ -1051,16 +1286,17 @@ mod tests {
             "and a session nobody archived is not archived",
         );
 
-        let ids = |sidecars: Vec<SidecarMetadata>| -> Vec<String> {
-            let mut ids: Vec<String> = sidecars
-                .into_iter()
-                .map(|sidecar| sidecar.session_id)
-                .collect();
+        let ids = |mut ids: Vec<String>| -> Vec<String> {
             ids.sort();
             ids
         };
         assert_eq!(
-            ids(persistence.enumerate_tags().expect("enumerate")),
+            ids(persistence
+                .enumerate_tags()
+                .expect("enumerate")
+                .into_iter()
+                .map(|tag| tag.session_id)
+                .collect()),
             vec![tagged.to_string()],
             "the label listing reports the tag sidecars and nothing else",
         );
@@ -1087,6 +1323,9 @@ mod tests {
             "an unarchived store has no meta directory and nothing archived",
         );
 
+        for id in ["2024-01-01-00-00-00", "2024-01-02-00-00-00"] {
+            legacy_file(&persistence, id);
+        }
         let meta = dir.path().join("meta");
         std::fs::create_dir_all(&meta).expect("meta");
         std::fs::write(meta.join("notes.txt"), "not a sidecar").expect("write");
@@ -1115,27 +1354,41 @@ mod tests {
             .expect("archive");
         let found = persistence.enumerate_archived().expect("enumerate");
         assert_eq!(
-            found
-                .iter()
-                .map(|sidecar| sidecar.session_id.as_str())
-                .collect::<Vec<_>>(),
+            found.iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["2024-01-02-00-00-00"],
         );
         assert_eq!(
-            found[0].size_bytes, 0,
-            "the sidecar carries no content: its existence is the answer",
+            std::fs::metadata(meta.join("2024-01-02-00-00-00.archived"))
+                .unwrap()
+                .len(),
+            0,
+            "the legacy archive marker needs no content"
         );
     }
 
-    /// Build a `ConversationPersistence` against a fresh temp dir.
-    fn fixture() -> (TempDir, ConversationPersistence) {
+    /// Make `id` a JSONL session that has not been imported, so its label
+    /// and archive marker live in sidecars.
+    fn legacy_file(persistence: &ProjectSessions, id: &str) {
+        std::fs::write(crate::legacy::session_path(persistence, id), "")
+            .expect("write the session file");
+    }
+
+    /// A JSONL session holding one exchange. Returns its id and path.
+    fn legacy_session(persistence: &ProjectSessions, u: &str, a: &str) -> (String, PathBuf) {
+        crate::log::test_support::jsonl_session(persistence, |log| {
+            append_user_then_assistant(log, u, a)
+        })
+    }
+
+    /// Build a `ProjectSessions` against a fresh temp dir.
+    fn fixture() -> (TempDir, ProjectSessions) {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         (dir, persistence)
     }
 
     /// The uncancelled preview of `session_id`, which the test expects to exist.
-    fn preview_of(persistence: &ConversationPersistence, session_id: &str) -> SessionPreview {
+    fn preview_of(persistence: &ProjectSessions, session_id: &str) -> SessionPreview {
         persistence
             .session_preview(session_id, &|| false)
             .expect("read the preview")
@@ -1168,9 +1421,9 @@ mod tests {
     }
 
     /// Append one user-text message and one assistant-text message
-    /// via the high-level [`ConversationView::add_message`] path.
-    fn append_user_then_assistant(log: &mut ConversationLog, u: &str, a: &str) {
-        let mut view = ConversationView::user(log);
+    /// via the high-level [`AgentLog::add_message`] path.
+    fn append_user_then_assistant(log: &mut SessionLog, u: &str, a: &str) {
+        let mut view = AgentLog::main(log);
         view.add_message(user_msg(u)).expect("append user");
         view.add_message(assistant_text(a))
             .expect("append assistant");
@@ -1182,10 +1435,10 @@ mod tests {
         for id in ["../outside", "a/b", ""] {
             assert!(matches!(
                 persistence.session_preview(id, &|| false),
-                Err(ConversationError::InvalidSessionId(_))
+                Err(SessionError::InvalidSessionId(_))
             ));
         }
-        let mut log = ConversationLog::create(&persistence).expect("log");
+        let mut log = SessionLog::create(&persistence).expect("log");
         append_user_then_assistant(&mut log, "hello", "reply");
         let polls = std::cell::Cell::new(0);
         let preview = persistence
@@ -1202,11 +1455,11 @@ mod tests {
     fn session_preview_captures_first_user_message_and_count() {
         let (_dir, persistence) = fixture();
 
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello world", "hi there");
 
-        // A second message on the user thread so the count crosses 2.
-        let mut view = ConversationView::user(&mut log);
+        // A second message on the main thread so the count crosses 2.
+        let mut view = AgentLog::main(&mut log);
         view.add_message(user_msg("follow-up"))
             .expect("append second user");
 
@@ -1214,13 +1467,12 @@ mod tests {
         assert_eq!(p.session_id, log.session_id());
         assert_eq!(p.message_count, 3);
         assert_eq!(p.first_user_message.as_deref(), Some("hello world"));
-        assert!(p.size_bytes > 0);
     }
 
     #[test]
     fn previews_fall_back_to_first_nonempty_goal_objective() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         for objective in [None, Some(""), Some(" \n ")] {
             log.append_goal_change(objective.map(goal)).expect("goal");
         }
@@ -1243,11 +1495,11 @@ mod tests {
             assert_eq!(p.last_message_at, p.modified);
         }
 
-        ConversationView::user(&mut log)
+        AgentLog::main(&mut log)
             .add_message(AgentMessage::internal_context("Pursue the goal".into()))
             .expect("internal context");
         let head = log.head().unwrap().clone();
-        ConversationView::subagent(&mut log, head, 1)
+        AgentLog::sub(&mut log, head, 1)
             .add_message(user_msg("Inspect one file for the parent agent"))
             .expect("delegated task prompt");
         let before = persistence
@@ -1276,8 +1528,8 @@ mod tests {
     fn previews_prefer_genuine_user_text_over_goal_objectives_in_either_order() {
         for goal_first in [true, false] {
             let (_dir, persistence) = fixture();
-            let mut log = ConversationLog::create(&persistence).expect("create");
-            ConversationView::user(&mut log)
+            let mut log = SessionLog::create(&persistence).expect("create");
+            AgentLog::main(&mut log)
                 .add_message(AgentMessage::internal_context("Pursue the goal".into()))
                 .expect("internal context");
             if goal_first {
@@ -1289,7 +1541,7 @@ mod tests {
                 log.append_goal_change(Some(goal("Repair login")))
                     .expect("goal");
             }
-            ConversationView::user(&mut log)
+            AgentLog::main(&mut log)
                 .add_message(user_msg("Second user prompt"))
                 .expect("follow-up");
             {
@@ -1309,7 +1561,7 @@ mod tests {
     #[test]
     fn enumeration_skips_a_stem_that_is_not_a_session_id() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "hi");
         let real = log.session_id().to_string();
         drop(log);
@@ -1341,19 +1593,20 @@ mod tests {
         // A store one level down, so the traversal target below still lives
         // inside the temp dir.
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "hello", "hi");
-        let session_id = log.session_id().to_string();
-        let size = std::fs::metadata(log.path()).expect("stat").len();
-        drop(log);
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
+        let (session_id, path) = legacy_session(&persistence, "hello", "hi");
+        let size = std::fs::metadata(path).expect("stat").len();
 
         let metadata = persistence
             .session_metadata(&session_id)
             .expect("the stat succeeded")
             .expect("the log is there");
         assert_eq!(metadata.session_id, session_id);
-        assert_eq!(metadata.size_bytes, size);
+        assert_eq!(metadata.revision, size);
+        assert_eq!(
+            persistence.session_size(&session_id).expect("the size"),
+            Some(size)
+        );
 
         assert!(
             persistence
@@ -1426,10 +1679,7 @@ mod tests {
     #[test]
     fn the_default_pick_passes_over_an_archived_session() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "older", "hi");
-        let older = log.session_id().to_string();
-        drop(log);
+        let (older, _) = legacy_session(&persistence, "older", "hi");
 
         // The younger log is written by hand rather than minted: ids come from
         // the clock, so two creates inside one test can collide, and the
@@ -1487,10 +1737,7 @@ mod tests {
     #[test]
     fn the_default_pick_raises_when_the_archive_set_cannot_be_read() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "older", "hi");
-        let older = log.session_id().to_string();
-        drop(log);
+        let (older, _) = legacy_session(&persistence, "older", "hi");
         let newer = "2999-01-01-00-00-00-000";
         std::fs::copy(
             persistence.sessions_dir().join(format!("{older}.jsonl")),
@@ -1499,7 +1746,7 @@ mod tests {
         .expect("write a younger log");
         persistence.write_archived(newer, true).expect("archive");
 
-        let meta = persistence.meta_dir();
+        let meta = crate::jsonl::Directory(persistence.sessions_dir()).meta_dir();
         let pick = {
             let _sealed = PermissionGuard::seal(&meta);
             if fs::read_dir(&meta).is_ok() {
@@ -1534,10 +1781,7 @@ mod tests {
     #[test]
     fn the_default_pick_raises_when_one_sidecar_cannot_be_stat_ed() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "older", "hi");
-        let older = log.session_id().to_string();
-        drop(log);
+        let (older, _) = legacy_session(&persistence, "older", "hi");
         let newer = "2999-01-01-00-00-00-000";
         std::fs::copy(
             persistence.sessions_dir().join(format!("{older}.jsonl")),
@@ -1550,7 +1794,7 @@ mod tests {
         // searched, so `meta/` still reads and only this entry's stat fails.
         // A dangling symlink would be NotFound, which is the case that
         // legitimately means "gone".
-        let sidecar = persistence
+        let sidecar = crate::jsonl::Directory(persistence.sessions_dir())
             .meta_dir()
             .join(format!("{newer}.{ARCHIVED_SIDECAR}"));
         let vault = persistence.sessions_dir().join("vault");
@@ -1580,7 +1824,7 @@ mod tests {
     #[test]
     fn listing_does_not_parse_session_contents() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "hi");
         let session_id = log.session_id().to_string();
         drop(log);
@@ -1613,11 +1857,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "hello", "hi");
-        let session_id = log.session_id().to_string();
-        let path = log.path().to_path_buf();
-        drop(log);
+        let (session_id, path) = legacy_session(&persistence, "hello", "hi");
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
             .expect("drop the read bit");
@@ -1649,7 +1889,7 @@ mod tests {
         let (_dir, persistence) = fixture();
         let mut ids = Vec::new();
         for i in 0..3 {
-            let mut log = ConversationLog::create(&persistence).expect("create");
+            let mut log = SessionLog::create(&persistence).expect("create");
             append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
             ids.push(log.session_id().to_string());
         }
@@ -1672,7 +1912,7 @@ mod tests {
         let (_dir, persistence) = fixture();
         let mut ids = Vec::new();
         for i in 0..2 {
-            let mut log = ConversationLog::create(&persistence).expect("create");
+            let mut log = SessionLog::create(&persistence).expect("create");
             append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
             ids.push(log.session_id().to_string());
         }
@@ -1691,7 +1931,7 @@ mod tests {
     #[test]
     fn an_unusable_sidecar_leaves_the_session_unlabelled() {
         let (dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "prompt", "reply");
         let id = log.session_id().to_string();
         let meta = dir.path().join("meta");
@@ -1728,7 +1968,7 @@ mod tests {
         }
 
         let full =
-            read_session_preview_file("2024-01-01-00-00-00", &path, &|| false).expect("read");
+            crate::legacy::preview_file("2024-01-01-00-00-00", &path, &|| false).expect("read");
         assert_eq!(full.message_count, n);
 
         // Sticky predicate: false at the line-0 poll, true from line-1024 on.
@@ -1739,7 +1979,7 @@ mod tests {
             c > 0
         };
         let partial =
-            read_session_preview_file("2024-01-01-00-00-00", &path, &cancel).expect("read");
+            crate::legacy::preview_file("2024-01-01-00-00-00", &path, &cancel).expect("read");
         assert_eq!(
             partial.message_count,
             crate::SCAN_CANCEL_CHECK_LINES,
@@ -1750,10 +1990,10 @@ mod tests {
     #[test]
     fn session_preview_ignores_non_user_first_messages() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         // First message is a tool_result (not a user prompt). The
         // preview should leave `first_user_message` at `None`.
-        let mut view = ConversationView::user(&mut log);
+        let mut view = AgentLog::main(&mut log);
         view.add_message(AgentMessage::wire(Message::ToolResult(
             ToolResultMessage::text("x", "ping", "ok", false),
         )))
@@ -1782,11 +2022,7 @@ mod tests {
     #[test]
     fn read_session_preview_file_tolerates_a_malformed_line() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "hello", "hi");
-        let path = log.path().to_path_buf();
-        let session_id = log.session_id().to_string();
-        drop(log);
+        let (session_id, path) = legacy_session(&persistence, "hello", "hi");
 
         let mut lines: Vec<String> = std::fs::read_to_string(&path)
             .expect("read log")
@@ -1798,7 +2034,7 @@ mod tests {
         lines.insert(0, "}{ this is not json".to_string());
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("rewrite");
 
-        let preview = read_session_preview_file(&session_id, &path, &|| false).expect("read");
+        let preview = crate::legacy::preview_file(&session_id, &path, &|| false).expect("read");
         // The two messages survive. Only the torn line is skipped.
         assert_eq!(preview.message_count, 2);
         assert_eq!(preview.first_user_message.as_deref(), Some("hello"));
@@ -1835,7 +2071,7 @@ mod tests {
     #[test]
     fn session_preview_populates_created_at_from_session_id() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hi", "ok");
         let session_id = log.session_id().to_string();
 
@@ -1848,9 +2084,9 @@ mod tests {
     #[test]
     fn session_preview_counts_tool_result_entries() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
+        let mut log = SessionLog::create(&persistence).expect("create");
         {
-            let mut view = ConversationView::user(&mut log);
+            let mut view = AgentLog::main(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall(ToolCall {
@@ -1905,16 +2141,14 @@ mod tests {
     #[test]
     fn session_preview_uses_largest_message_timestamp() {
         let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "hello", "world");
-        let mut view = ConversationView::user(&mut log);
-        view.add_message(user_msg("follow-up"))
-            .expect("append user2");
-
-        let session_id = log.session_id().to_string();
-        let path = log.path().to_path_buf();
-        let mut entries: Vec<_> = log.entries_in_order().into_iter().cloned().collect();
-        drop(log);
+        let mut entries = Vec::new();
+        let (session_id, path) = crate::log::test_support::jsonl_session(&persistence, |log| {
+            append_user_then_assistant(log, "hello", "world");
+            let mut view = AgentLog::main(log);
+            view.add_message(user_msg("follow-up"))
+                .expect("append user2");
+            entries = log.entries_in_order().into_iter().cloned().collect();
+        });
 
         // Persist out-of-order message times so neither file order nor mtime
         // can stand in for the largest message timestamp.
@@ -1922,10 +2156,7 @@ mod tests {
         let mut offsets = [1, 3, 2].into_iter();
         let mut lines = String::new();
         for entry in &mut entries {
-            let offset = if matches!(
-                entry.entry,
-                crate::log::ConversationEntryKind::Message { .. }
-            ) {
+            let offset = if matches!(entry.entry, crate::log::LogEntryKind::Message { .. }) {
                 offsets.next().expect("three message entries")
             } else {
                 4

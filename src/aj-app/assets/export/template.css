@@ -47,7 +47,7 @@ body {
 a { color: var(--link); }
 
 /* Layout: a fixed-width navigation sidebar beside a scrolling content
- * pane. The sidebar lists the filterable conversation tree, including
+ * pane. The sidebar lists the filterable session tree, including
  * sub-agent runs hanging off the message that spawned them when enabled.
  * A sub-agent run also renders inline as a collapsible box in the content. */
 #app { display: flex; min-height: 100vh; }
@@ -88,7 +88,7 @@ a { color: var(--link); }
 .tree-node:not(.in-path) { opacity: .5; }
 .tree-node:not(.in-path):hover { opacity: 1; }
 /* The selected node stays legible even on an off-path (dimmed) branch,
- * such as a sub-agent run viewed from the conversation. */
+ * such as a sub-agent run viewed from the main thread. */
 .tree-node.active { opacity: 1; }
 .tree-prefix { color: var(--muted); flex-shrink: 0; font-family: ui-monospace, monospace; white-space: pre; }
 .tree-marker { color: var(--link); flex-shrink: 0; white-space: pre; }

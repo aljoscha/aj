@@ -652,7 +652,7 @@ pub struct Config {
     /// single italic "Thinking…" placeholder line. Toggled at
     /// runtime with the thinking-toggle chord.
     pub show_thinking_block: bool,
-    /// Show the inline per-turn "Token Usage - ..." rows in the
+    /// Show the inline per-response "Token Usage - ..." rows in the
     /// interactive TUI. Defaults to `true`. Usage is always
     /// recorded, this toggles only its visibility, so it takes
     /// effect at runtime.
@@ -727,12 +727,10 @@ pub struct Config {
     /// Use Codex-compatible JavaScript tool orchestration for models included
     /// in the bundled Codex Code Mode catalog. Other models use ordinary tools.
     pub code_mode: bool,
-    /// Directory for the spill files that carry a bash command's full
-    /// output: every background task's canonical output, and any
-    /// foreground run whose output was truncated for the model. Unset
-    /// uses the ambient temp directory (`TMPDIR`). Point it somewhere
-    /// with room when a small `/tmp` cannot hold what long-running
-    /// commands produce.
+    /// Directory for the files that carry a bash command's output. Unset,
+    /// they go to `~/.aj/tasks`: a command can outlive the process, and
+    /// the system cleans the temp directory. Point it somewhere with room
+    /// when that cannot hold what long-running commands produce.
     pub spill_dir: Option<String>,
     /// User keybinding overrides, `aj.*` action id to chord string (e.g.
     /// `"aj.palette.open" = "ctrl+p"`), parsed from the `[keybindings]`
@@ -1072,7 +1070,7 @@ impl Config {
         },
         ConfigOption {
             name: "show_token_usage",
-            description: "Show the inline per-turn token-usage rows in the TUI.",
+            description: "Show the inline per-response token-usage rows in the TUI.",
             kind: ValueKind::Bool,
             apply_toml_fn: |v, c| {
                 c.show_token_usage = v.try_into()?;

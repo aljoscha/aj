@@ -34,7 +34,7 @@ use crate::session::AgentLifecycle;
 /// Opaque, per-transcript entry id, stable for the session.
 ///
 /// Minted from a monotonically increasing counter, so ids within one
-/// transcript are ordered by append position. Cheap and future-proof
+/// transcript are ordered by position. Cheap and future-proof
 /// against any later reordering, and it reads clearly in the
 /// bookkeeping maps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,8 +56,8 @@ pub enum EntryKind {
     SubAgent(SubAgentEntry),
     Compaction(CompactionEntry),
     Notice(NoticeEntry),
-    TurnUsage(TurnUsageEntry),
-    /// A background task's completion notice (see
+    RoundUsage(RoundUsageEntry),
+    /// A background task's task notification (see
     /// [`TaskNotificationEntry`]). Distinct from [`EntryKind::Notice`],
     /// which is an unrelated transient UI notice (level + text).
     TaskNotification(TaskNotificationEntry),
@@ -85,7 +85,7 @@ impl UserEntry {
     }
 }
 
-/// A background task's completion notice, appended from
+/// A background task's task notification, appended from
 /// `MessageEnd { TaskNotification }`.
 ///
 /// Carries the structured fields for rich rendering (an outcome-tinted
@@ -205,17 +205,18 @@ pub struct SubAgentEntry {
     /// Originating tool name for display identity. Empty is unspecified.
     pub tool_name: String,
     pub status: SubAgentStatus,
+    /// Whether the run's `SubAgentEnd` has arrived. The box then stands
+    /// for a finished delegation and nothing changes it: a later prompt to
+    /// the sub-agent is a side exchange the parent never hears of.
+    pub concluded: bool,
     /// A foreground caller still owns this assignment, even between turns.
     pub assignment_pending: bool,
     /// Final report, set on `SubAgentEnd`.
     pub report: Option<String>,
-    /// Start of the current run: set on `SubAgentStart` and reset on a
-    /// continuation re-run, so the runtime measures the active run rather than
-    /// the wall-clock since first spawn.
+    /// Start of the run, set on `SubAgentStart`.
     pub started_at: Instant,
-    /// When the assignment or independent continuation finished, freezing the
-    /// displayed runtime. `None` while it is outstanding. A continuation
-    /// re-run clears it (and resets `started_at`) so timing starts fresh.
+    /// When the run finished, freezing the displayed runtime. `None` while
+    /// it is outstanding.
     pub finished_at: Option<Instant>,
     /// Whether the sub was spawned to run in the background, concurrent with
     /// the parent's turn, rather than blocking it. Set from `SubAgentStart`,
@@ -279,10 +280,10 @@ pub struct NoticeRow {
 }
 
 /// One accounted usage delta, stored structured so views format it without
-/// reparsing. Most rows follow assistant turns; compaction rows follow their
+/// reparsing. Most rows follow assistant messages; compaction rows follow their
 /// checkpoint.
 #[derive(Debug)]
-pub struct TurnUsageEntry {
+pub struct RoundUsageEntry {
     /// The emitting agent, for the sub-agent line prefix.
     pub agent_id: AgentId,
     pub usage: TokenUsage,
@@ -294,17 +295,17 @@ pub struct TurnUsageEntry {
     pub source_entry: Option<String>,
 }
 
-impl TurnUsageEntry {
+impl RoundUsageEntry {
     /// Render the `Token Usage - ...` line for this delta. Sub-agents
-    /// get a leading `(sub agent N)` tag so their per-turn counts stay
+    /// get a leading `(sub agent N)` tag so their per-response counts stay
     /// distinguishable in a shared scrollback.
     pub fn line(&self) -> String {
-        format_turn_usage_line(self.agent_id, &self.usage)
+        format_round_usage_line(self.agent_id, &self.usage)
     }
 }
 
 /// Render the `Token Usage - ...` line for one usage event.
-fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
+fn format_round_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
     // `format_tokens` renders the accumulated total bare when the operation
     // contributed nothing (e.g. a cached read of an existing tool
     // result), or `acc+turn` so the operation's delta is visible at a
@@ -335,11 +336,25 @@ fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
 /// one operation that drops entries, and it only ever drops the
 /// unfinalized streaming assistant entry, whose message is re-rendered
 /// from its `MessageEnd`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Transcript {
     pub(crate) entries: Vec<Entry>,
     /// Mints the next [`EntryId`].
     next_id: u64,
+}
+
+/// The first id a transcript mints. Earlier history is prepended under
+/// lower ids (see [`ChatState::prepend_history`]), so ids stay ordered by
+/// position and this leaves room for it.
+const FIRST_ENTRY_ID: u64 = 1 << 40;
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_id: FIRST_ENTRY_ID,
+        }
+    }
 }
 
 impl Transcript {
@@ -358,8 +373,9 @@ impl Transcript {
 
     /// Entry by id, if present.
     pub fn get(&self, id: EntryId) -> Option<&Entry> {
-        // Ids are minted monotonically and entries only append, so the
-        // vector is sorted by id and a binary search suffices.
+        // Ids are minted monotonically and earlier history is prepended
+        // under lower ids, so the vector is sorted by id and a binary
+        // search suffices.
         self.entries
             .binary_search_by_key(&id, |e| e.id)
             .ok()
@@ -421,7 +437,7 @@ impl UsageOrigin {
 #[derive(Debug, Default)]
 pub struct AgentRender {
     /// The in-flight assistant entry for this agent, or `None` between
-    /// turns.
+    /// rounds.
     ///
     /// The lazy materialization this drives (the first painting
     /// `MessageUpdate` opens the entry) rests on a stream contract: no
@@ -527,6 +543,15 @@ pub struct ChatState {
     /// Which incarnation of the model this is, unique for the life of the
     /// process (see [`Self::generation`]).
     generation: u64,
+    /// Log position the attach block started at: every agent's transcript
+    /// covers the log from here on. Above `1`, earlier history exists on the
+    /// host.
+    history_start: u64,
+    /// Where an agent's transcript starts once pages of its earlier history
+    /// were fetched: below `history_start`, and `1` when it is whole.
+    history_starts: HashMap<AgentId, u64>,
+    /// Log position of the latest entry the transcripts cover.
+    log_end: u64,
 }
 
 /// Source of [`ChatState::generation`] values.
@@ -553,7 +578,122 @@ impl ChatState {
             sub_boxes: HashMap::new(),
             compaction_phase: HashMap::new(),
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            history_start: 1,
+            history_starts: HashMap::new(),
+            log_end: 0,
         }
+    }
+
+    /// How many log entries the main transcript covers and how many precede
+    /// them unfetched, for a view that estimates the extent of the latter.
+    pub fn history_extent(&self) -> (u64, u64) {
+        let start = self.history_start(AgentId::Main);
+        (
+            (self.log_end + 1).saturating_sub(start),
+            start.saturating_sub(1),
+        )
+    }
+
+    /// Record that the transcripts cover the log up to position `seq`.
+    pub fn note_log_end(&mut self, seq: u64) {
+        self.log_end = self.log_end.max(seq);
+    }
+
+    /// Log position `agent`'s transcript covers the log from. `1` when it
+    /// holds the agent's whole history.
+    pub fn history_start(&self, agent: AgentId) -> u64 {
+        let fetched = self.history_starts.get(&agent);
+        fetched.copied().unwrap_or(self.history_start)
+    }
+
+    /// Record that every transcript begins at log position `start`, as a
+    /// fresh attach block reports.
+    pub fn set_history_start(&mut self, start: u64) {
+        self.history_start = start;
+        self.history_starts.clear();
+    }
+
+    /// Put a page of `agent`'s earlier history in front of its transcript.
+    ///
+    /// `page` is a fresh model that the page's events were reduced into, and
+    /// `start` the log position the page begins at. Its entries get ids
+    /// below the ones already minted, in order, so ids held outside stay
+    /// valid and ids stay ordered by position. Only positions shift.
+    ///
+    /// A sub-agent whose run crosses the page boundary has a box on both
+    /// sides. The one already shown carries the run's state, and the page's
+    /// marks where the run began, so the shown box moves there and takes
+    /// the page entry's id. A tool call issued in the page and answered
+    /// after it is likewise one cell: the shown one, at the page's place.
+    pub fn prepend_history(&mut self, mut page: ChatState, agent: AgentId, start: u64) {
+        if let Some(older) = page.transcripts.remove(&agent) {
+            let mut entries = older.entries;
+            let shown = self.transcripts.entry(agent).or_default();
+            let first = shown.entries.first().map_or(shown.next_id, |e| e.id.0);
+            let count = u64::try_from(entries.len()).expect("entry count fits u64");
+            let base = first - count;
+            let renumber = |id: EntryId| EntryId(base + (id.0 - FIRST_ENTRY_ID));
+            for entry in &mut entries {
+                entry.id = renumber(entry.id);
+            }
+            let mut answered = Vec::new();
+            for entry in &mut entries {
+                let EntryKind::Tool(cell) = &entry.kind else {
+                    continue;
+                };
+                let index = self.render.get(&agent).map(|render| &render.tool_index);
+                let Some(id) = index.and_then(|index| index.get(&cell.call_id)) else {
+                    continue;
+                };
+                let shown = self.transcripts.entry(agent).or_default();
+                if let Ok(at) = shown.entries.binary_search_by_key(id, |e| e.id) {
+                    answered.push((cell.call_id.clone(), entry.id));
+                    entry.kind = shown.entries.remove(at).kind;
+                }
+            }
+            if let Some(render) = self.render.get_mut(&agent) {
+                render.tool_index.extend(answered);
+            }
+            for entry in &mut entries {
+                let EntryKind::SubAgent(sub) = &entry.kind else {
+                    continue;
+                };
+                let child = sub.child;
+                let moved = self.sub_boxes.get(&child).and_then(|(parent, id)| {
+                    let shown = self.transcripts.get_mut(parent)?;
+                    let at = shown.entries.binary_search_by_key(id, |e| e.id).ok()?;
+                    Some(shown.entries.remove(at).kind)
+                });
+                if let Some(kind) = moved {
+                    entry.kind = kind;
+                }
+                self.sub_boxes.insert(child, (agent, entry.id));
+                self.transcripts.entry(AgentId::Sub(child)).or_default();
+            }
+            self.transcripts
+                .entry(agent)
+                .or_default()
+                .entries
+                .splice(0..0, entries);
+            if let Some(older) = page.render.get(&agent) {
+                let render = self.render.entry(agent).or_default();
+                for (key, id) in &older.tool_index {
+                    render
+                        .tool_index
+                        .entry(key.clone())
+                        .or_insert_with(|| renumber(*id));
+                }
+                for (key, id) in &older.message_index {
+                    render
+                        .message_index
+                        .entry(key.clone())
+                        .or_insert_with(|| renumber(*id));
+                }
+            }
+        }
+        // A sub-agent seen only in the page still needs its own footer.
+        self.footers.adopt_missing(page.footers);
+        self.history_starts.insert(agent, start);
     }
 
     pub(crate) fn note_goal(&mut self, goal: Option<Goal>) {
@@ -641,14 +781,14 @@ impl ChatState {
         self.active_view
     }
 
-    /// Whether the active view holds any real conversation, meaning at least
+    /// Whether the active view holds any message, meaning at least
     /// one user or assistant entry.
     ///
     /// Leading `Notice` rows (the startup config, restore, and auth
-    /// diagnostics) are chrome, not conversation, so a transcript that holds
+    /// diagnostics) are chrome, not messages, so a transcript that holds
     /// only notices still reads as empty. The empty-state splash gate reads
     /// this to choose between the splash and the transcript view.
-    pub fn has_conversation(&self) -> bool {
+    pub fn has_messages(&self) -> bool {
         self.transcripts.get(&self.active_view).is_some_and(|t| {
             t.entries()
                 .iter()
@@ -832,16 +972,11 @@ impl ChatState {
         matches!(agent_id, AgentId::Sub(_)) && self.active_view != agent_id
     }
 
-    /// Conclude the `Sub(n)` box after its run ended without a final
-    /// conclusion event: a still-running box flips to `Done` and
+    /// Conclude the `Sub(n)` box after a turn of its run ended without a
+    /// final conclusion event: a still-running box flips to `Done` and
     /// freezes its runtime clock. A box already carrying a
     /// `SubAgentEnd` conclusion (`Done`/`Truncated`/`Failed`) and a
     /// missing box are left untouched.
-    ///
-    /// A conclusion is therefore stable under a re-delivered lifecycle
-    /// bracket with one exception, which is the point of that exception:
-    /// `AgentStart(Sub n)` re-opens a `Done` box for a continuation
-    /// re-run, and this concludes that re-run as `Done` again.
     pub fn conclude_sub_box(&mut self, n: usize) {
         if let Some(b) = self.sub_box_mut(n)
             && b.status == SubAgentStatus::Running
@@ -851,23 +986,17 @@ impl ChatState {
         }
     }
 
-    /// Re-open the `Sub(n)` box for a new run of a sub we already have a
-    /// box for: a `Done` box flips to `Running` and its runtime clock
-    /// starts over. A missing box and one that is already running are left
-    /// untouched.
-    ///
-    /// A `Done` box re-opens for continuation.
-    /// A `Truncated` or `Failed` conclusion is terminal,
-    /// and re-opening it would let the new run's plain `AgentEnd` conclude
-    /// the box `Done` and quietly rewrite a failure into a success.
+    /// Re-open the `Sub(n)` box for another turn of a run that has not
+    /// ended: a box an `AgentEnd` marked `Done` flips back to `Running`.
+    /// That is a background sub-agent woken by a task it owns, or a run
+    /// whose start a backfill re-synthesized. A box whose `SubAgentEnd`
+    /// arrived, a missing box and a running one are left untouched.
     pub(crate) fn reopen_sub_box(&mut self, n: usize) {
         if let Some(b) = self.sub_box_mut(n)
             && b.status == SubAgentStatus::Done
+            && !b.concluded
         {
             b.status = SubAgentStatus::Running;
-            // The clock restarts so the runtime times the new run, not the
-            // wall-clock since first spawn.
-            b.started_at = Instant::now();
             b.finished_at = None;
         }
     }
@@ -1004,7 +1133,7 @@ impl ChatState {
     /// Main's footer keeps its settings seed, which the stream never wrote:
     /// a client reads the host's active settings off the `state` frame.
     /// Every other agent's footer goes with its transcript, and Main's
-    /// occupancy numerator goes with the turns it measured.
+    /// occupancy numerator goes with the responses it measured.
     pub fn reset(&mut self, lifecycle: &mut AgentLifecycle) {
         // Entry ids restart here, so this is a new incarnation and nothing
         // keyed on an id of the old one may survive it.
@@ -1020,6 +1149,9 @@ impl ChatState {
         self.goal_clock = None;
         self.sub_boxes.clear();
         self.compaction_phase.clear();
+        self.history_start = 1;
+        self.history_starts.clear();
+        self.log_end = 0;
         self.footers.retain_main();
         for agent in lifecycle.running_agents() {
             lifecycle.mark_idle(agent);
@@ -1034,7 +1166,7 @@ impl ChatState {
 mod tests {
     use super::*;
 
-    /// Build a TokenUsage carrying the supplied per-turn deltas and
+    /// Build a TokenUsage carrying the supplied per-response deltas and
     /// the running accumulator state observed before this turn was
     /// folded in (`already`), matching the wire semantic on
     /// `AgentEvent::UsageUpdate`.
@@ -1052,11 +1184,11 @@ mod tests {
     }
 
     #[test]
-    fn format_turn_usage_line_emits_acc_plus_turn_for_main_agent() {
+    fn format_round_usage_line_emits_acc_plus_turn_for_main_agent() {
         // First turn: the accumulator is still zero, so each field
         // prints `0+turn`.
         let usage = token_usage([100, 50, 30, 5], [0, 0, 0, 0]);
-        let line = format_turn_usage_line(AgentId::Main, &usage);
+        let line = format_round_usage_line(AgentId::Main, &usage);
         assert_eq!(
             line,
             "Token Usage - Input: 0+100 | Output: 0+50 | Cache Creation: 0+30 | Cache Read: 0+5",
@@ -1064,11 +1196,11 @@ mod tests {
     }
 
     #[test]
-    fn format_turn_usage_line_drops_turn_part_when_turn_is_zero() {
+    fn format_round_usage_line_drops_turn_part_when_turn_is_zero() {
         // The `+turn` suffix is hidden when the turn contributed
         // nothing, so routine cache hits don't show `+0` rows.
         let usage = token_usage([0, 0, 0, 0], [200, 80, 0, 14]);
-        let line = format_turn_usage_line(AgentId::Main, &usage);
+        let line = format_round_usage_line(AgentId::Main, &usage);
         assert_eq!(
             line,
             "Token Usage - Input: 200 | Output: 80 | Cache Creation: 0 | Cache Read: 14",
@@ -1076,9 +1208,9 @@ mod tests {
     }
 
     #[test]
-    fn format_turn_usage_line_prefixes_sub_agent_id() {
+    fn format_round_usage_line_prefixes_sub_agent_id() {
         let usage = token_usage([10, 5, 1, 0], [0, 0, 0, 0]);
-        let line = format_turn_usage_line(AgentId::Sub(2), &usage);
+        let line = format_round_usage_line(AgentId::Sub(2), &usage);
         assert_eq!(
             line,
             "(sub agent 2) Token Usage - Input: 0+10 | Output: 0+5 | Cache Creation: 0+1 | Cache Read: 0",
@@ -1195,9 +1327,9 @@ mod tests {
     }
 
     #[test]
-    fn has_conversation_ignores_leading_notices() {
+    fn has_messages_ignores_leading_notices() {
         let mut chat = chat_state();
-        assert!(!chat.has_conversation(), "a fresh model is empty");
+        assert!(!chat.has_messages(), "a fresh model is empty");
 
         chat.transcripts
             .get_mut(&AgentId::Main)
@@ -1208,8 +1340,8 @@ mod tests {
                 entry: None,
             }));
         assert!(
-            !chat.has_conversation(),
-            "leading notices are chrome, not conversation"
+            !chat.has_messages(),
+            "leading notices are chrome, not messages"
         );
 
         chat.transcripts
@@ -1221,8 +1353,8 @@ mod tests {
                 branch_settings: None,
             }));
         assert!(
-            chat.has_conversation(),
-            "a user entry after the notices counts as conversation"
+            chat.has_messages(),
+            "a user entry after the notices counts as a message"
         );
     }
 }

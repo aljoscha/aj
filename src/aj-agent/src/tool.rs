@@ -30,6 +30,7 @@ use crate::TaskRegistry;
 use crate::bus::EventBus;
 use crate::error::BoxError;
 use crate::events::{AgentEvent, AgentId, SubAgentConclusion};
+use crate::message::AgentMessage;
 
 // ---------------------------------------------------------------------------
 // Execution mode
@@ -37,8 +38,8 @@ use crate::events::{AgentEvent, AgentId, SubAgentConclusion};
 
 /// Per-tool execution mode.
 ///
-/// The agent partitions a single assistant turn's tool calls into
-/// contiguous groups: a maximal run of [`ExecutionMode::Parallel`]
+/// The agent partitions a single round's tool calls into
+/// contiguous groups: a maximal sequence of [`ExecutionMode::Parallel`]
 /// tools forms one group that runs concurrently, while each
 /// [`ExecutionMode::Sequential`] tool is its own singleton group and
 /// acts as an ordering barrier. Groups run one at a time in source
@@ -52,7 +53,7 @@ pub enum ExecutionMode {
     /// Runs alone, as a barrier: it never overlaps the calls before or
     /// after it in the batch.
     Sequential,
-    /// Runs concurrently with the adjacent run of `Parallel` calls.
+    /// Runs concurrently with the adjacent sequence of `Parallel` calls.
     Parallel,
     /// Operates on runtime control state rather than shared tool resources.
     /// May overlap a sequential call, so cancellation and observation cannot
@@ -109,27 +110,28 @@ pub enum ToolDetails {
     Diff(DiffDetails),
     /// Command-output rendering for `bash`.
     ///
-    /// Cross-field invariant: `stdout`/`stderr` carry a bounded rolling
-    /// tail. If either stream exceeded the cap the implementation
-    /// spills the full output to a temp file and surfaces its path
-    /// through `full_output_path`. Absent truncation fields on older
+    /// A command's stdout and stderr are one stream, carried in `stdout`
+    /// as a bounded rolling tail. `stderr` is empty, and holds text only
+    /// in sessions recorded when the streams were separate. When the tail
+    /// was cut, `full_output_path` names the file with the whole output.
+    /// Absent truncation fields on older
     /// persisted sessions fall back to the legacy `[Output truncated]`
     /// marker. The per-field docs carry each payload's contract.
     Bash {
         /// The exact command line executed.
         command: String,
-        /// Captured (and possibly truncated) standard output.
+        /// Captured (and possibly truncated) output.
         stdout: String,
-        /// Captured (and possibly truncated) standard error.
+        /// Empty, except in sessions recorded with separate streams.
         stderr: String,
         /// Process exit code, when the process exited normally.
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
-        /// True when at least one of `stdout` / `stderr` was truncated.
+        /// True when the output was truncated.
         #[serde(default)]
         truncated: bool,
-        /// Path to a temp file containing the full uncaptured output,
-        /// when truncation occurred.
+        /// Path of the file containing the full output, when truncation
+        /// occurred.
         #[serde(skip_serializing_if = "Option::is_none")]
         full_output_path: Option<PathBuf>,
         /// Structured truncation summary for `stdout` when that stream
@@ -449,8 +451,8 @@ pub fn wire_diff(path: &str, old: &str, new: &str) -> WireDiff {
 
 /// Length of a backtick fence, at least three and longer than the longest
 /// backtick run in `body`, so a body with an embedded code fence stays
-/// enclosed. A single pass finds the longest run, avoiding a quadratic
-/// rescan on adversarial input with long backtick runs.
+/// enclosed. A single pass finds the longest sequence, avoiding a quadratic
+/// rescan on adversarial input with long backtick sequences.
 fn fence_len(body: &str) -> usize {
     let mut longest = 0;
     let mut run = 0;
@@ -854,7 +856,7 @@ pub enum SpawnResult {
     Completed(SpawnedAgent),
     /// A background spawn started the child's run on a detached
     /// driver; the report arrives later through the task's completion
-    /// notice (and `task_output` once terminal).
+    /// notification (and `task_output` once terminal).
     Started {
         /// The `n` from this sub-agent's [`AgentId::Sub`] id.
         agent_id: usize,
@@ -878,13 +880,16 @@ pub type TaskId = usize;
 pub enum TaskStatus {
     /// The task's driver is still running.
     Running,
-    /// Process exited (code is `None` when signal-killed), or the
-    /// agent-backed run completed/failed.
+    /// The process exited, or the agent-backed run completed or failed. A
+    /// process killed by a signal has code `128 + signal`. The code is
+    /// `None` when the process is gone and left no exit status.
     Exited(Option<i32>),
-    /// The process exited, but its complete stdout/stderr could not be
+    /// The process exited, but its complete output could not be
     /// captured. The code retains the process's independent exit status.
     CaptureFailed(Option<i32>),
-    /// Killed via `task_stop`, the TUI, or shutdown.
+    /// Killed via `task_stop` or the TUI, or at the shutdown of a session
+    /// that does not record its commands. An agent run a session ends
+    /// under reads so too, in the registry only.
     Killed,
 }
 
@@ -958,8 +963,10 @@ pub struct StartedTask {
     /// The freshly minted task id.
     pub id: TaskId,
     /// Cancellation token for the driver — a child of the registry's
-    /// session-scoped root, NOT of the per-turn token, so the task
-    /// outlives the originating turn but dies on shutdown.
+    /// session-scoped root, NOT of the per-turn token, so the driver
+    /// outlives the originating turn and ends at shutdown. The driver of
+    /// a recorded task then leaves the work running unless
+    /// [`TaskEventSink::kill_requested`] says it was a kill.
     pub cancel: CancellationToken,
     /// Event sink the driver reports through.
     pub events: TaskEventSink,
@@ -970,12 +977,12 @@ pub struct StartedTask {
     pub driver: crate::TaskDriverRegistration,
 }
 
-/// Opening tag wrapping a harness-injected task-completion notice when
+/// Opening tag wrapping a harness-injected task-task notification when
 /// it is projected onto the wire. [`AgentMessage::to_projected_wire`]
-/// frames the notice body between this tag and
+/// frames the notification body between this tag and
 /// [`TASK_NOTIFICATION_CLOSE_TAG`] as a user message, marking it to the
 /// model as harness-injected rather than a user reply. The framing is
-/// projection-only: locally a notice is a typed
+/// projection-only: locally a notification is a typed
 /// [`AgentMessageKind::TaskNotification`], so the format lives here as
 /// the single source of truth for what the model sees.
 ///
@@ -986,14 +993,14 @@ pub(crate) const TASK_NOTIFICATION_OPEN_TAG: &str = "<task-notification>";
 /// Closing tag paired with [`TASK_NOTIFICATION_OPEN_TAG`].
 pub(crate) const TASK_NOTIFICATION_CLOSE_TAG: &str = "</task-notification>";
 
-/// Completion notice queued when a background task reaches a terminal
+/// Task notification queued when a background task reaches a terminal
 /// status, drained into the owner's transcript at the next drain point
 /// as a typed [`AgentMessageKind::TaskNotification`].
 ///
 /// [`AgentMessageKind::TaskNotification`]: crate::message::AgentMessageKind::TaskNotification
 #[derive(Clone, Debug)]
 pub struct TaskNotice {
-    /// The agent that started the task and receives the notice.
+    /// The agent that started the task and receives the notification.
     pub owner: AgentId,
     /// Id of the finished task.
     pub task_id: TaskId,
@@ -1003,12 +1010,12 @@ pub struct TaskNotice {
     pub label: String,
     /// Terminal status the task ended with.
     pub status: TaskStatus,
-    /// Pre-rendered notice body. For bash: exit status, final output
+    /// Pre-rendered notification body. For bash: exit status, final output
     /// tail, and the spill path; for agents: the report verbatim.
     pub body: String,
 }
 
-/// How a detached task driver reaches the bus and the notice queue
+/// How a detached task driver reaches the bus and the notification queue
 /// without holding the whole agent.
 ///
 /// Drivers are plain tokio tasks, so emits are properly awaited. Bus
@@ -1046,7 +1053,7 @@ impl TaskEventSink {
         }
     }
 
-    /// The agent that owns the task (the notice recipient).
+    /// The agent that owns the task (the notification recipient).
     pub fn owner(&self) -> AgentId {
         self.owner
     }
@@ -1101,16 +1108,48 @@ impl TaskEventSink {
         }
     }
 
-    /// Queue `notice`, record the terminal `status`, and emit
-    /// [`AgentEvent::TaskEnd`].
+    /// Commit the task's end (see [`TaskRegistry::save_end`]), trying
+    /// again for as long as [`crate::TASK_END_SAVE_RETRIES`] says. `None`
+    /// means the end is not saved and the driver lets go of the task:
+    /// nothing is delivered from memory, and what the store holds, the
+    /// task's record or its announced loss, is the account a later host
+    /// settles. A session that ends meanwhile is not waited out.
+    pub async fn save_end(&self, notice: &TaskNotice) -> Option<AgentMessage> {
+        let mut retries = crate::TASK_END_SAVE_RETRIES.iter();
+        let session_over = self.registry.root_cancel.clone();
+        loop {
+            let error = match self.registry.save_end(self.task_id, notice) {
+                Ok(message) => return Some(message),
+                Err(error) => error,
+            };
+            let task_id = self.task_id;
+            let wait = match retries.next() {
+                Some(wait) if !session_over.is_cancelled() => *wait,
+                _ => {
+                    tracing::error!(task_id, "could not save a task's end, letting go: {error}");
+                    return None;
+                }
+            };
+            tracing::warn!(task_id, "could not save a task's end: {error}");
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = session_over.cancelled() => return None,
+            }
+        }
+    }
+
+    /// Queue the saved end for the owner, record the terminal `status`
+    /// and emit [`AgentEvent::TaskEnd`]. `message` is what
+    /// [`Self::save_end`] returned for `notice`.
     ///
-    /// The notice and the status land in the registry together, so
-    /// every observer that learns of the termination finds the notice
+    /// The notification and the status land in the registry together, so
+    /// every observer that learns of the termination finds the notification
     /// already present.
-    pub async fn finished(&self, status: TaskStatus, notice: TaskNotice) {
-        self.registry.finish(self.task_id, status, notice);
+    pub async fn publish_end(&self, status: TaskStatus, notice: TaskNotice, message: AgentMessage) {
+        self.registry
+            .publish_end(self.task_id, status, notice, message);
         // TaskEnd comes last: the binary's wake trigger fires off it,
-        // and the woken agent must find the notice already queued.
+        // and the woken agent must find the notification already queued.
         let result = self
             .bus
             .emit(AgentEvent::TaskEnd {
@@ -1124,6 +1163,23 @@ impl TaskEventSink {
         if let Err(err) = result {
             tracing::warn!(task_id = self.task_id, "task end listener failed: {err:#}");
         }
+    }
+
+    /// End the task: [`Self::save_end`], then [`Self::publish_end`].
+    /// `false` means the end could not be saved. Nothing was queued or
+    /// emitted then, and the task still runs as far as anyone can tell.
+    pub async fn finished(&self, status: TaskStatus, notice: TaskNotice) -> bool {
+        let Some(message) = self.save_end(&notice).await else {
+            return false;
+        };
+        self.publish_end(status, notice, message).await;
+        true
+    }
+
+    /// Whether the task was asked to stop (see
+    /// [`TaskRegistry::kill_requested`]).
+    pub fn kill_requested(&self) -> bool {
+        self.registry.kill_requested(self.task_id)
     }
 }
 
@@ -1400,7 +1456,7 @@ pub trait ToolContext: Send {
     ///
     /// The task is recorded as owned by [`ToolContext::agent_id`],
     /// which is also the identity the `task_*` tools authorize
-    /// against and the recipient of the completion notice.
+    /// against and the recipient of the task notification.
     ///
     /// NOTE: ids are allocated by the registry, not by session state,
     /// so detached drivers never need the `&mut SessionState` borrow
@@ -1531,7 +1587,7 @@ mod tests {
 
     #[test]
     fn tool_details_round_trips_each_variant() {
-        // The persistence listener writes ToolDetails alongside each
+        // The journal writes ToolDetails alongside each
         // tool_result message. This locks the {"kind": "..."} framing
         // that the session log and the TUI renderer both depend on.
         let cases = [

@@ -7,23 +7,27 @@
 //!   references into it, as [`aj_session::compact_tool_details`] stores them.
 //! - Edit details that hold the file before and after become the display
 //!   diff that is stored today.
-//! - A goal record whose only successor is a record of the same goal, with
+//! - A goal entry whose only successor is an entry of the same goal, with
 //!   nothing but usage changed, is dropped. An active goal used to append one
-//!   every second. The last of each run stays, so every remaining entry sees
-//!   the goal it saw before, with usage at most one run older.
+//!   every second. The last of each sequence stays, so every remaining entry sees
+//!   the goal it saw before, with usage at most one sequence older.
 //!
 //! A session is rewritten only when all of this holds, and is otherwise left
 //! byte for byte as it was:
 //!
 //! - its lock is free, so no running `aj` has it open;
-//! - every line is a record that ends in a newline;
-//! - loaded through [`ConversationLog::resume`], the rewritten file has the
-//!   same entries, head and goal as the original, apart from the dropped
-//!   goal records;
+//! - every line is an entry that ends in a newline;
+//! - read through [`ProjectSessions::read_entries`], the rewritten
+//!   file has the same entries, last entry and goal as the original, apart
+//!   from the dropped goal entries;
 //! - the original did not change while it was being rewritten.
 //!
 //! The file is replaced by a rename and keeps its modification time, so the
 //! session list keeps its order.
+//!
+//! Only JSONL files are rewritten. A session already imported into the
+//! database keeps the entries it was imported with, so compact before
+//! migrating.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -36,17 +40,16 @@ use aj_conf::Config;
 
 use aj_models::types::UserContent;
 use aj_session::{
-    ConversationLog, ConversationPersistence, SessionLock, compact_tool_details,
-    is_valid_session_id, resolve_tool_details,
+    ProjectSessions, SessionLock, compact_tool_details, is_valid_session_id, resolve_tool_details,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Each dropped record and the parent its children move to.
+/// Each dropped entry and the parent its children move to.
 type Dropped = HashMap<String, Option<String>>;
 
-/// The fields of a record that decide whether it can be dropped.
+/// The fields of an entry that decide whether it can be dropped.
 #[derive(Deserialize)]
 struct Head {
     id: String,
@@ -103,7 +106,7 @@ pub fn handle_compact_sessions(directory: Option<PathBuf>, write: bool) -> Resul
         saved % 10,
     );
     println!(
-        "  {} goal records dropped, {} edits turned into diffs, {} details turned into references",
+        "  {} goal entries dropped, {} edits turned into diffs, {} details turned into references",
         report.goals_dropped, report.edits_diffed, report.details_referenced
     );
     if !report.skipped.is_empty() {
@@ -168,7 +171,7 @@ fn session_id(path: &Path) -> Option<&str> {
 
 fn compact_session(project: &Path, path: &Path, write: bool) -> Result<Counts> {
     let id = session_id(path).context("not a session file")?;
-    let persistence = ConversationPersistence::new(project.to_path_buf());
+    let persistence = ProjectSessions::new(project.to_path_buf());
     let _lock = if write {
         Some(SessionLock::try_acquire(&persistence, id, "compact-sessions")?.context("in use")?)
     } else {
@@ -200,11 +203,7 @@ fn compact_session(project: &Path, path: &Path, write: bool) -> Result<Counts> {
         let original = digest(&persistence, id, &dropped)?;
         // Nothing is dropped from the rewritten file: a parent it still names
         // must be an entry it holds.
-        let rewritten = digest(
-            &ConversationPersistence::new(scratch.clone()),
-            id,
-            &Dropped::new(),
-        )?;
+        let rewritten = digest(&ProjectSessions::new(scratch.clone()), id, &Dropped::new())?;
         if original != rewritten {
             bail!("the rewritten session does not load as the original");
         }
@@ -220,12 +219,12 @@ fn compact_session(project: &Path, path: &Path, write: bool) -> Result<Counts> {
     result
 }
 
-/// The goal records that only repeat the goal their successor records.
+/// The goal entries that only repeat the goal their successor records.
 fn repeated_goal_records(path: &Path) -> Result<Dropped> {
     struct Record {
         id: String,
         parent: Option<String>,
-        /// The goal without its usage, for a goal record on the user thread.
+        /// The goal without its usage, for a goal entry on the user thread.
         goal: Option<String>,
     }
 
@@ -376,20 +375,24 @@ fn compact_details(entry: &mut Value) -> Option<Change> {
     })
 }
 
-/// What a session loads as: a hash of each entry that is not dropped, with
-/// details resolved and parents moved past dropped records, then the head and
-/// the goal at it.
+/// What a session's file reads as: a hash of each entry that is not dropped,
+/// with details resolved and parents moved past dropped entries, then the
+/// last entry and the goal on its ancestry.
 fn digest(
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     id: &str,
     dropped: &Dropped,
 ) -> Result<(Vec<u64>, Value, Value)> {
-    let log = ConversationLog::resume(persistence, id)?;
-    let mut entries = Vec::new();
-    for entry in log.entries_in_order() {
+    let mut hashes = Vec::new();
+    let mut kept: HashMap<String, Value> = HashMap::new();
+    let mut last = None;
+    for entry in persistence.read_entries(id)? {
         let mut entry = serde_json::to_value(entry)?;
-        let entry_id = entry["id"].as_str().context("an entry without an id")?;
-        if dropped.contains_key(entry_id) {
+        let entry_id = entry["id"]
+            .as_str()
+            .context("an entry without an id")?
+            .to_string();
+        if dropped.contains_key(&entry_id) {
             continue;
         }
         let parent = entry["parent_id"].as_str().map(str::to_string);
@@ -402,15 +405,25 @@ fn digest(
         }
         let mut hasher = DefaultHasher::new();
         entry.to_string().hash(&mut hasher);
-        entries.push(hasher.finish());
+        hashes.push(hasher.finish());
+        // Only what the goal walk reads is kept.
+        if let Some(entry) = entry.as_object_mut() {
+            entry.remove("message");
+        }
+        kept.insert(entry_id.clone(), entry);
+        last = Some(entry_id);
     }
-    let head = log.head().cloned();
-    let goal = head.as_ref().and_then(|head| log.snapshot().goal_at(head));
-    Ok((
-        entries,
-        serde_json::to_value(head)?,
-        serde_json::to_value(goal)?,
-    ))
+
+    let mut goal = Value::Null;
+    let mut cursor = last.clone();
+    while let Some(entry) = cursor.as_ref().and_then(|id| kept.get(id)) {
+        if entry["type"] == "goal_change" && entry["thread"] == "user" {
+            goal = entry["goal"].clone();
+            break;
+        }
+        cursor = entry["parent_id"].as_str().map(str::to_string);
+    }
+    Ok((hashes, last.into(), goal))
 }
 
 /// The file's lines, each with its newline. A last line without one is an
@@ -539,7 +552,7 @@ mod tests {
         let path = old_session(&project);
         let original = fs::read(&path).unwrap();
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
-        let persistence = ConversationPersistence::new(project.clone());
+        let persistence = ProjectSessions::new(project.clone());
         let loaded = digest(&persistence, ID, &Dropped::new()).unwrap();
         let dropped = Dropped::from([
             ("g1".to_string(), Some("prompt".to_string())),
@@ -586,7 +599,7 @@ mod tests {
         let edit = &records["edit"]["message"]["details"];
         assert!(edit.get("before").is_none() && edit.get("lines").is_some());
 
-        // What it loads as is the original without the two goal records.
+        // What it loads as is the original without the two goal entries.
         assert_eq!(digest(&persistence, ID, &Dropped::new()).unwrap(), expected);
         assert_eq!(
             fs::read_dir(&project).unwrap().count(),

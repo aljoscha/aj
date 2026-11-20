@@ -468,7 +468,7 @@ fn convert_messages(messages: &[Message]) -> Vec<MessageParam> {
                 let block = convert_tool_result(tr);
                 // Append into a previous all-tool-results user message
                 // when possible so multiple sequential results land in
-                // the same turn.
+                // the same message.
                 if let Some(last) = out.last_mut()
                     && matches!(last.role, ARole::User)
                     && all_tool_results(&last.content)
@@ -574,12 +574,12 @@ fn convert_assistant_message(m: &AssistantMessage) -> MessageParam {
 
 /// Project an [`AssistantMessage`] onto the Anthropic Messages request item
 /// shape — the [`MessageParam`] with `role: "assistant"` that gets sent as
-/// part of `messages[]` on a follow-up turn.
+/// part of `messages[]` on a follow-up request.
 ///
 /// This is the serialize side of the round-trip invariant. It is the
 /// same projection the provider uses internally when building a request
 /// body, surfaced under the `test-support` feature so the round-trip
-/// integration tests can materialize a single assistant turn into its
+/// integration tests can materialize a single assistant message into its
 /// wire form without spinning up a full request.
 ///
 /// Behaviour:
@@ -1041,7 +1041,7 @@ struct StreamState {
     /// Captured refusal text from a `stop_details: refusal` payload.
     refusal_message: Option<String>,
     /// Whether the wire stream delivered its terminal frame (a
-    /// `message_stop` or `error` event). Distinguishes a finished turn
+    /// `message_stop` or `error` event). Distinguishes a finished response
     /// from a truncated one when the SSE byte stream simply ends.
     saw_terminal: bool,
 }
@@ -1358,7 +1358,7 @@ impl StreamState {
     }
 
     /// Whether the wire stream delivered its terminal frame
-    /// (`message_stop` or `error`). When `false` at stream end the turn
+    /// (`message_stop` or `error`). When `false` at stream end the response
     /// was truncated mid-flight.
     fn saw_terminal(&self) -> bool {
         self.saw_terminal
@@ -1411,7 +1411,7 @@ impl StreamState {
         } else {
             tracing::debug!(
                 api = %self.partial.api,
-                "stream ended before terminal frame; treating turn as truncated (retryable)"
+                "stream ended before terminal frame; treating response as truncated (retryable)"
             );
             self.seal();
             AssistantMessageEvent::truncated(self.partial.clone())
@@ -1429,7 +1429,7 @@ impl StreamState {
             // server-side tool call) collapses to a plain `Stop`. We run
             // tools in the agent loop rather than using server-side tools,
             // so pause-turn doesn't arise in practice, and treating it as
-            // a completed turn is the safe default.
+            // a completed response is the safe default.
             Some(AStopReason::EndTurn)
             | Some(AStopReason::PauseTurn)
             | Some(AStopReason::StopSequence)

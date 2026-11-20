@@ -57,8 +57,8 @@ use aj_models::registry::{ModelInfo, default_thinking_level, validate_thinking_l
 use aj_models::types::{Speed, UserContent};
 use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder,
-    PersistenceFailure, SessionLock, normalize_tag, project_suffix, validate_session_env,
+    EntryId, LockHolder, PersistenceFailure, ProjectSessions, SessionLock, SessionLog,
+    normalize_tag, project_suffix, validate_session_env,
 };
 use aj_wire::{
     AgentQueue, Cursor, DurableEvent, Frame, Hello, MAX_HOST_NAME_BYTES, ModelSelection,
@@ -106,7 +106,7 @@ pub const DEFAULT_LIST_COALESCE: Duration = Duration::from_secs(1);
 /// session this one is done with, which is the failure this exists to fix.
 pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
-/// The `error` frame code a session's stream carries when its conversation
+/// The `error` frame code a session's stream carries when its session
 /// log refused a write and the materialization ended over it. A client
 /// re-asks for the session at once: the host rebuilds it from disk.
 pub const PERSISTENCE_FAILED_CODE: &str = "persistence_failed";
@@ -195,6 +195,10 @@ pub enum HostError {
     Internal(#[source] BoxError),
 }
 
+/// Most log entries one history page covers, so one request cannot
+/// materialize a whole long session in memory.
+const MAX_HISTORY_PAGE: u64 = 4000;
+
 impl HostError {
     /// The protocol code this failure travels as: in an error body, and in the
     /// `error` frame that refuses one session's attach.
@@ -246,32 +250,20 @@ pub enum CreateError {
 /// a caller acts on: it attaches the session and retries the step that did
 /// not land, rather than creating a second session.
 #[derive(Debug, thiserror::Error)]
-#[error("session {session} created, {step} not applied: {source}")]
+#[error("session {session} created, first prompt not applied: {source}")]
 pub struct PartialCreate {
     /// The session the create minted, which the caller acts on.
     pub session: String,
-    /// What did not land, worded for the message ("tag", "first prompt").
-    step: &'static str,
     #[source]
     source: BoxError,
 }
 
 impl PartialCreate {
-    /// The label did not land, so the store still says what it said before.
-    fn tag(session: String, source: HostError) -> Self {
-        Self {
-            session,
-            step: "tag",
-            source: Box::new(source),
-        }
-    }
-
     /// The first prompt was not taken, so the session is idle rather than
     /// working.
     fn prompt(session: String, source: HostError) -> Self {
         Self {
             session,
-            step: "first prompt",
             source: Box::new(source),
         }
     }
@@ -301,7 +293,7 @@ pub struct HostSetup {
     pub defaults: RunConfigDefaults,
     /// Resume-time settings restoration, `None` on the scripted path.
     pub restore: Option<RestoreContext>,
-    pub persistence: ConversationPersistence,
+    pub persistence: ProjectSessions,
     pub auth: AuthStorage,
     /// The one working directory this host serves.
     pub working_directory: PathBuf,
@@ -375,6 +367,9 @@ fn keep_tail(path: &str) -> &str {
 pub enum Command {
     /// Read or change the goal on the selected user branch.
     Goal(aj_agent::goal::GoalRequest),
+    /// Send a prompt. It is saved as the agent's pending input before the
+    /// command is answered. An idle agent is then woken to take it, and
+    /// behind a running turn it waits as a follow-up.
     Prompt {
         agent: AgentId,
         content: Vec<UserContent>,
@@ -435,6 +430,9 @@ pub enum Command {
     KillTask {
         task: TaskId,
     },
+    /// Resume the main agent's interrupted turn without a new message.
+    /// Refused while it is busy or when its last turn finished.
+    Continue,
 }
 
 /// Which entry a head switch moves to.
@@ -559,8 +557,8 @@ enum Serving {
 /// stop being one path.
 ///
 /// The tests do use them to stage state the command surface cannot reach: an
-/// idle session's queue, which no command can fill because queueing only
-/// happens while an agent is busy.
+/// idle session's queue, which no command leaves filled because a prompt to
+/// an idle agent starts the turn that takes it.
 ///
 /// Nothing outside this process can have them, so no protocol rule may come
 /// to depend on them.
@@ -569,13 +567,16 @@ pub struct LocalHandles {
     pub queues: MessageQueues,
     pub task_registry: TaskRegistry,
     pub registry: SubAgentRegistry,
-    pub log: Arc<TokioMutex<ConversationLog>>,
+    pub log: Arc<TokioMutex<SessionLog>>,
     pub run_config: Arc<StdMutex<RunConfigSnapshot>>,
     pub sub_overrides: Arc<StdMutex<HashMap<usize, SubAgentOverrides>>>,
     pub env: AgentEnv,
-    /// Persistence-writer lifetime state for composed lifecycle tests.
+    /// The session's journal, for composed lifecycle tests.
     #[cfg(any(test, feature = "test-support"))]
-    pub persistence_fence: aj_session::PersistenceFence,
+    pub journal: aj_session::Journal,
+    /// The main agent, for a test that emits an event on the session's bus.
+    #[cfg(any(test, feature = "test-support"))]
+    pub agent: aj_agent::SharedAgent,
     /// Legacy in-process restoration diagnostics.
     ///
     /// New frontends render one local summary from
@@ -595,10 +596,6 @@ pub(crate) struct HostShared {
     pub(crate) auth: AuthStorage,
     pub(crate) restore: Option<RestoreContext>,
     pub(crate) fanout: Arc<Fanout>,
-    /// The store the session's own files live in. A driver reaches it for the
-    /// tag sidecar, which is written under the session's advisory lock and so
-    /// belongs to the task that holds it.
-    pub(crate) persistence: ConversationPersistence,
 }
 
 /// The session map, held.
@@ -635,7 +632,7 @@ struct ShutdownState {
 struct HostInner {
     usage_sources: crate::usage::UsageSources,
     shared: Arc<HostShared>,
-    persistence: ConversationPersistence,
+    persistence: ProjectSessions,
     run_config_defaults: RunConfigDefaults,
     host_id: String,
     working_directory: PathBuf,
@@ -652,7 +649,7 @@ struct HostInner {
     /// needs cached against the files they came from. A `list` refresh runs on
     /// a coalescing tick that session events drive, so it must not rescan the
     /// store's contents.
-    cold: ColdSessions<ConversationPersistence>,
+    cold: ColdSessions<ProjectSessions>,
     idle_grace: Duration,
     list_coalesce: Duration,
     /// How many directories the list publisher has composed, see
@@ -672,14 +669,12 @@ struct HostInner {
 impl Drop for HostInner {
     fn drop(&mut self) {
         // An abandoned host must still stop its drivers. Their outer owners
-        // retain writer locks through cleanup, but forced cancellation does not
-        // finish transcript events or flush pending log entries.
+        // close each session and retain its writer lock through cleanup.
+        // What is left is what a shutdown leaves, less the command a driver
+        // was in the middle of.
         let abandoned: Vec<&String> = self.sessions.get_mut().keys().collect();
         if !abandoned.is_empty() {
-            tracing::warn!(
-                "host dropped without shutdown: aborting the drivers of {abandoned:?} \
-                 without graceful turn completion or log flush"
-            );
+            tracing::warn!("host dropped without shutdown: aborting the drivers of {abandoned:?}");
         }
         for entry in self.sessions.get_mut().values() {
             // Leave the outer owner task alive. It observes this inner abort,
@@ -742,7 +737,6 @@ impl SessionHost {
                 auth,
                 restore,
                 fanout: Arc::new(Fanout::new(live_capacity)),
-                persistence: persistence.clone(),
             }),
             cold: ColdSessions::new(persistence.clone()),
             persistence,
@@ -944,7 +938,7 @@ impl SessionHost {
     /// Create a session in the host's working directory and hold it live.
     pub async fn create(&self) -> Result<String, HostError> {
         self.alive()?;
-        self.mint(None, None).await
+        self.mint(None, None, None).await
     }
 
     /// Whether a create naming `host` is this host's to serve.
@@ -975,15 +969,14 @@ impl SessionHost {
     /// log is created, so a request this host refuses
     /// ([`CreateError::Refused`]) leaves no discoverable empty session behind.
     ///
-    /// The tag and the prompt are applied once the session is live, through
-    /// the same commands a later relabelling or prompt takes, so they land
-    /// under the session's own lock. They are best-effort: a step that fails
-    /// on its own terms, a store that will not take the sidecar write, say,
-    /// is not a failed create. The answer is a [`PartialCreate`] naming the
-    /// session, which is live and in the directory, and what did not land
-    /// ("session <id> created, tag not applied: <reason>"), so the caller
-    /// retags rather than creating a second session. A minted session is
-    /// durable user state and is never deleted to make an error tidier.
+    /// The tag is part of the mint: it waits in the session's draft and is
+    /// stored with its first input. The prompt is applied once the session
+    /// is live, through the command a later prompt takes. A prompt the
+    /// session refuses is not a failed create: the answer is a
+    /// [`PartialCreate`] naming the session, which is live and in the
+    /// directory ("session <id> created, first prompt not applied:
+    /// <reason>"), so the caller prompts again rather than creating a second
+    /// session. A minted session is never deleted to make an error tidier.
     pub async fn create_with(
         &self,
         settings: Option<SessionSettings>,
@@ -1001,12 +994,7 @@ impl SessionHost {
             validate_session_env(env)
                 .map_err(|err| HostError::Invalid(format!("session env: {err}")))?;
         }
-        let session = self.mint(settings.as_ref(), session_env).await?;
-        if tag.is_some() {
-            if let Err(err) = self.command(&session, Command::Tag { tag }).await {
-                return Err(PartialCreate::tag(session, err).into());
-            }
-        }
+        let session = self.mint(settings.as_ref(), session_env, tag).await?;
         if let Some(content) = prompt {
             let prompt = Command::Prompt {
                 agent: AgentId::Main,
@@ -1029,11 +1017,11 @@ impl SessionHost {
         &self,
         settings: Option<&SessionSettings>,
         session_env: Option<BTreeMap<String, String>>,
+        tag: Option<String>,
     ) -> Result<String, HostError> {
         let mut sessions = self.inner.sessions.lock().await;
-        let live = self
-            .materialize(&mut sessions, None, settings.cloned(), session_env)
-            .await?;
+        let create = (settings.cloned(), session_env, tag);
+        let live = self.materialize(&mut sessions, None, create).await?;
         Ok(live.id().to_string())
     }
 
@@ -1109,13 +1097,14 @@ impl SessionHost {
         for request in requests {
             match self.live(&request.session).await {
                 Ok(session) => {
-                    // The open that repaired an interrupted final write owes
-                    // its opening client one ephemeral notice. Published
-                    // after the block is bound, so the attaching subscriber
-                    // retains it as a reliable transient and releases it
-                    // after its CaughtUp; taken once, so later attaches to
-                    // this materialization stay ordinary.
-                    if let Some(text) = session.core.take_recovery_notice() {
+                    // An open that repaired an interrupted final write, or
+                    // could not restore a sub-agent, owes its opening client
+                    // an ephemeral notice. Published after the block is
+                    // bound, so the attaching subscriber retains it as a
+                    // reliable transient and releases it after its CaughtUp;
+                    // taken once, so later attaches to this materialization
+                    // stay ordinary.
+                    for text in session.core.take_open_notices() {
                         let epoch = session.status().epoch.clone();
                         self.inner.shared.fanout.publish(Frame::Event {
                             session: request.session.clone(),
@@ -1258,10 +1247,8 @@ impl SessionHost {
                         id: session.id,
                         live: false,
                         working: false,
-                        // A cold row carries no durable position: the count
-                        // is not recorded anywhere, so producing one would
-                        // mean reading the log, and a list-observed seq is
-                        // never a cursor anyway.
+                        // A cold row carries no position: a list-observed
+                        // seq is never a cursor.
                         last_seq: None,
                         last_activity: session.last_activity,
                         tag: session.tag,
@@ -1394,7 +1381,7 @@ impl SessionHost {
     /// the host has no row, which is every session on a host that just
     /// started. A created session has neither, and being created is the
     /// activity.
-    fn opening_stamp(&self, log: &ConversationLog, session_id: &str) -> DateTime<Utc> {
+    fn opening_stamp(&self, log: &SessionLog, session_id: &str) -> DateTime<Utc> {
         self.inner
             .cold
             .stamp(session_id)
@@ -1570,25 +1557,17 @@ impl SessionHost {
         tokio::task::spawn_blocking(move || {
             if let Some(session) = &session
                 && !live
-                && !persistence
-                    .sessions_dir()
-                    .join(format!("{session}.jsonl"))
-                    .is_file()
+                && persistence
+                    .session_metadata(session)
+                    .map_err(|error| HostError::Internal(Box::new(error)))?
+                    .is_none()
             {
                 return Err(HostError::UnknownSession(session.clone()));
             }
             let all = session.is_none();
-            let dir = if all {
-                persistence
-                    .sessions_dir()
-                    .parent()
-                    .unwrap_or_else(|| persistence.sessions_dir())
-            } else {
-                persistence.sessions_dir()
-            };
             let mut history = aj_wire::PromptHistory::default();
             if let Err(err) = aj_session::prompt_history::recent_history_streaming(
-                dir,
+                &persistence,
                 all,
                 aj_wire::PROMPT_HISTORY_LIMIT,
                 &|| cancel.is_cancelled(),
@@ -1650,7 +1629,68 @@ impl SessionHost {
     /// Aggregate facts from the session log, materializing the session if needed.
     pub async fn session_info(&self, session: &str) -> Result<aj_session::SessionStats, HostError> {
         let live = self.live(session).await?;
-        Ok(live.core.log.lock().await.stats())
+        // The totals cover the whole session, which the log may have to
+        // read: off the log lock, so a turn does not wait for it.
+        let whole = live.core.log.lock().await.whole();
+        let whole = tokio::task::spawn_blocking(move || whole.read())
+            .await
+            .map_err(|err| HostError::Internal(Box::new(err)))?
+            .map_err(|err| HostError::Internal(Box::new(err)))?;
+        Ok(live.core.log.lock().await.stats_over(&whole))
+    }
+
+    /// One page of `agent`'s history before position `before`: the frames
+    /// an attach block would have carried for that agent, starting at one
+    /// of its messages at least `limit` entries back. Materializes the session if needed.
+    pub async fn history(
+        &self,
+        session: &str,
+        agent: AgentId,
+        before: u64,
+        limit: u64,
+    ) -> Result<aj_wire::HistoryPage, HostError> {
+        let live = self.live(session).await?;
+        // Position, epoch and the running sub-agents are read under the log
+        // lock, as for an attach.
+        let (mut snapshot, epoch, live_subs) = {
+            let log = live.core.log.lock().await;
+            let snapshot = log.snapshot();
+            let status = live.status();
+            // The sub-agents an attach block leaves open (see `serve_block`).
+            let (running, assigned) = live.live_subs();
+            let live_subs: std::collections::BTreeSet<usize> =
+                running.union(&assigned).copied().collect();
+            (snapshot, status.epoch.clone(), live_subs)
+        };
+        let persistence = self.inner.persistence.clone();
+        let session = session.to_string();
+        // Reading and projecting a page is the slow part, so it runs on the
+        // blocking pool against the snapshot, with the log lock released.
+        tokio::task::spawn_blocking(move || {
+            let before = before.clamp(1, snapshot.last_seq() + 1);
+            let limit = limit.min(MAX_HISTORY_PAGE);
+            let start = persistence.load_page(&mut snapshot, agent, before, limit)?;
+            let frames = aj_session::project_page(&snapshot, agent, start, before, &live_subs)
+                .map(|tagged| Frame::Event {
+                    session: session.clone(),
+                    epoch: epoch.clone(),
+                    durability: tagged
+                        .entry
+                        .map(|entry| durable_event(entry, tagged.branch_settings)),
+                    event: tagged.event.into(),
+                })
+                .collect();
+            Ok::<_, aj_session::SessionError>(aj_wire::HistoryPage {
+                epoch,
+                agent,
+                start,
+                end: before,
+                frames,
+            })
+        })
+        .await
+        .map_err(|err| HostError::Internal(Box::new(err)))?
+        .map_err(|err| HostError::Internal(Box::new(err)))
     }
 
     /// Render the complete session log as HTML, materializing it if needed.
@@ -1662,12 +1702,14 @@ impl SessionHost {
             // Rendering holds a consistent log view on the blocking pool. A turn
             // may wait for this rare manual read, without parking the serving loop
             // or duplicating the entire log in memory.
-            let log = log.blocking_lock();
-            aj_wire::SessionExport {
+            let mut log = log.blocking_lock();
+            log.load_all()?;
+            Ok::<_, aj_session::SessionError>(aj_wire::SessionExport {
                 html: crate::export::render_session_html(&log),
-            }
+            })
         })
         .await
+        .map_err(|err| HostError::Internal(Box::new(err)))?
         .map_err(|err| HostError::Internal(Box::new(err)))
     }
 
@@ -1696,10 +1738,10 @@ impl SessionHost {
         let live = self.live(session).await?;
         let log = live.core.log.lock().await;
         let entry = driver::resolve_head_target(&log, &HeadTarget::Before(message.to_string()))?;
-        Ok(log
+        let env = log
             .session_env_at(Some(&entry))
-            .cloned()
-            .unwrap_or_default())
+            .map_err(|err| HostError::Internal(Box::new(err)))?;
+        Ok(env.unwrap_or_default())
     }
 
     /// Account names and selection policy on the host, never bearer material.
@@ -1750,9 +1792,13 @@ impl SessionHost {
     /// is what a materialization does anyway.
     pub async fn tree(&self, session: &str) -> Result<SessionTree, HostError> {
         let live = self.live(session).await?;
-        // Cheap and in-memory, but it still walks the log, so snapshot
-        // under the lock and build outside it.
-        let snapshot = live.core.log.lock().await.snapshot();
+        // The tree spans every branch, which the log may have to read, so
+        // the read is planned under the lock and run outside it.
+        let read = live.core.log.lock().await.whole();
+        let snapshot = tokio::task::spawn_blocking(move || read.read())
+            .await
+            .map_err(|err| HostError::Internal(Box::new(err)))?
+            .map_err(|err| HostError::Internal(Box::new(err)))?;
         let head = snapshot.head().cloned();
         let tree = snapshot.session_tree();
         Ok(SessionTree {
@@ -1788,15 +1834,19 @@ impl SessionHost {
             sub_overrides: Arc::clone(&live.core.sub_overrides),
             env: live.core.env.clone(),
             #[cfg(any(test, feature = "test-support"))]
-            persistence_fence: live.core.persistence_fence.clone(),
+            journal: live.core.journal.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            agent: Arc::clone(&live.core.agent),
             restore_notices: live.core.restore_notices.clone(),
         })
     }
 
     /// Tear every live session down and close every client stream.
     ///
-    /// Sessions wind down concurrently. Their advisory locks remain held until
-    /// detached work and admitted persistence listeners finish. This call has no
+    /// Each session is stopped as a host that died stops it (see the
+    /// driver's `wind_down`), behind a command it is in the middle of.
+    /// Sessions wind down concurrently. Their advisory locks remain held
+    /// until their detached work has let go. This call has no
     /// overall timeout: a frontend that must stop waiting owns that policy, and
     /// cannot treat cancelling this await as completion of session cleanup.
     /// Every caller waits for the same teardown, even if an earlier caller was
@@ -1856,9 +1906,12 @@ impl SessionHost {
         self.inner.shared.fanout.stop_blocks();
         let entries = std::mem::take(&mut *self.inner.sessions.lock().await);
         for entry in entries.values() {
-            // Cancel detached work without waiting for an in-flight command
-            // ahead of the shutdown request to finish.
-            entry.session.core.task_registry.shutdown();
+            // The driver stops its session when it reaches the request,
+            // behind a command it is in the middle of. That command ends
+            // as it would have, and is the last thing the session writes.
+            // Nothing is cancelled from here: a task cancelled while the
+            // session can still be written would record its own end,
+            // which a host that died would not have.
             entry.session.request_shutdown();
         }
         // All owners are already running and every shutdown request was sent
@@ -1892,7 +1945,7 @@ impl SessionHost {
     /// one's teardown. Short in practice: the driver answers this at its own
     /// queue position, so at worst we wait out one command it had already
     /// started, and a session that is releasable has no turn to drain and no
-    /// task to quiesce, which leaves a log flush.
+    /// task to quiesce.
     ///
     /// The driver has the last word on releasability (see
     /// [`Request::Release`]), so a caller may ask about a session that has
@@ -1928,7 +1981,7 @@ impl SessionHost {
             .remove(session)
             .expect("the entry is ours: the map has been held throughout");
         // The driver returns right after answering. The outer owner then
-        // completes task and persistence cleanup before dropping the lock.
+        // waits for the task drivers before dropping the lock.
         let _ = entry.driver.await;
         drop(sessions);
         if reaped {
@@ -1987,7 +2040,7 @@ impl SessionHost {
         validate_session_id(session)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(&mut sessions, Some(session), None, None)
+            .materialize(&mut sessions, Some(session), (None, None, None))
             .await?;
         Ok((sessions, live))
     }
@@ -2062,8 +2115,11 @@ impl SessionHost {
         &self,
         sessions: &mut HashMap<String, LiveEntry>,
         id: Option<&str>,
-        create_settings: Option<SessionSettings>,
-        create_session_env: Option<BTreeMap<String, String>>,
+        (create_settings, create_session_env, create_tag): (
+            Option<SessionSettings>,
+            Option<BTreeMap<String, String>>,
+            Option<String>,
+        ),
     ) -> Result<Arc<LiveSession>, HostError> {
         if let Some(id) = id {
             if let Some(entry) = sessions.get(id) {
@@ -2085,11 +2141,10 @@ impl SessionHost {
             }
         }
         // A resume's lock is taken before the build, because the build is
-        // not read-only: `ConversationLog::resume` may repair the sole
-        // final undelimited tail (removing an interrupted record or adding
-        // a missing framing newline) and the repair walk appends
-        // synthesized tool results. A materialization this host refuses
-        // must have done neither.
+        // not read-only: `SessionLog::resume` imports a JSONL session
+        // into the database and the repair walk appends synthesized tool
+        // results. A materialization this host refuses must have done
+        // neither.
         //
         // A create has nothing on disk to read or repair, and it mints its
         // id by an atomic `create_new` claim on that id's lock-file path,
@@ -2108,12 +2163,6 @@ impl SessionHost {
                 session_env: create_session_env,
             },
         };
-        // NOTE: the build does blocking IO (a resume reads the whole log,
-        // and the agent environment re-reads the context files and skills)
-        // while this task holds the session map. Every other
-        // materialization waits behind it. Acceptable while a host holds a
-        // handful of sessions. If it starts to hurt, the build moves to the
-        // blocking pool.
         let config = self
             .inner
             .shared
@@ -2134,27 +2183,41 @@ impl SessionHost {
             .await
             .map_err(HostError::Invalid)?;
         }
-        let (mut core, _seed) = SessionCore::build(
-            &config,
-            run_config,
-            &self.inner.persistence,
-            &spec,
-            self.inner.shared.restore.as_ref(),
-        )
-        .map_err(|err| HostError::Internal(err.into()))?;
+        // The build does blocking I/O: a resume reads the session, imports
+        // it first when it is still a JSONL file, and the agent environment
+        // reads the context files and skills. It runs on the blocking pool
+        // so the sessions already live keep being served meanwhile. This
+        // task holds the session map throughout, so another
+        // materialization still waits behind it.
+        let (persistence, restore) = (
+            self.inner.persistence.clone(),
+            self.inner.shared.restore.clone(),
+        );
+        let built = tokio::task::spawn_blocking(move || {
+            SessionCore::build(&config, run_config, &persistence, &spec, restore.as_ref())
+        });
+        let (mut core, _seed) = built
+            .await
+            .map_err(|err| HostError::Internal(Box::new(err)))?
+            .map_err(|err| HostError::Internal(err.into()))?;
         let session_id = core.session_id.clone();
         let lock = match claimed {
             Some(lock) => lock,
             None => self.acquire(&session_id)?,
         };
 
-        let handoff = AppendHandoff::default();
-        let (events, persistence_failure) = core.install_persisting_forwarder(&handoff).await;
         // One small read, on a path that has just read the whole log. From
         // here the session answers its own label out of memory, so no
         // directory refresh ever reaches the sidecar for it. A
         // label we cannot read is not worth failing a materialization over.
         let tag = match self.inner.persistence.read_tag(&session_id) {
+            // A created session's label waits in its draft and is stored
+            // with its first input, so the store has nothing to say yet.
+            Ok(None) if id.is_none() && create_tag.is_some() => {
+                let set = core.log.lock().await.set_tag(create_tag.as_deref());
+                set.map_err(|err| HostError::Internal(Box::new(err)))?;
+                create_tag
+            }
             Ok(tag) => tag,
             Err(err) => {
                 tracing::warn!(
@@ -2182,27 +2245,30 @@ impl SessionHost {
                 self.inner.cold.archived(&session_id)
             }
         };
-        let mut log = core.log.lock().await;
-        let goal =
-            driver::restore_goal(&mut log).map_err(|err| HostError::Internal(Box::new(err)))?;
-        let goal_revision = u64::from(driver::has_goal_history(&log));
+        // The map remains locked through insertion. If shutdown starts after
+        // this check, its drain still includes this owner.
+        self.alive()?;
+        // The last step that can fail is behind us. What the build
+        // recovered is installed from here on by steps that cannot, so an
+        // open either fails with nothing live or yields a whole session:
+        // the stream below starts the watchers of the task records,
+        // which hold the store until the owner task has shut them down.
+        let (events, persistence_failure) = core.event_stream().await;
+        let log = core.log.lock().await;
+        let goal = core.goal.clone();
+        let goal_revision = u64::from(core.goal_history);
         let (settings, oracle_settings) = settings_of(&core.run_config);
         let status = SessionStatus {
             epoch: mint_epoch(),
-            last_seq: log.last_seq(),
+            // A draft's entries are published when the draft is created.
+            last_seq: log.stored_seq(),
             working: false,
             session_working: false,
+            turn_interrupted: core.interrupted.contains(&AgentId::Main),
             turn_outcome: None,
             settings,
             oracle_settings,
             goal,
-            // Nothing runs at materialization, so every sub-agent the log
-            // names has finished. Seeding them is what keeps a backfill
-            // concluding a resumed session's boxes while leaving the
-            // brackets of runs this host starts open (see
-            // `SessionStatus::finished_subs`).
-            finished_subs: log.sub_agent_ids(),
-            driven_subs: std::collections::BTreeSet::new(),
             last_activity: self.opening_stamp(&log, &session_id),
             tag,
             archived,
@@ -2249,7 +2315,7 @@ impl SessionHost {
                 }),
             );
         }
-        let session = Arc::new(LiveSession::new(core, handoff, status, requests_tx));
+        let session = Arc::new(LiveSession::new(core, status, requests_tx));
         let driver = Driver::new(
             Arc::clone(&session),
             Arc::clone(&self.inner.shared),
@@ -2258,13 +2324,10 @@ impl SessionHost {
             persistence_failure,
             goal_revision,
         );
-        // The map remains locked through insertion. If shutdown starts after
-        // this check, its drain still includes this owner.
-        self.alive()?;
         // The outer owner keeps the advisory lock even if the inner driver
         // panics or is aborted when the host is dropped.
         let task_registry = session.core.task_registry.clone();
-        let persistence_fence = session.core.persistence_fence.clone();
+        let journal = session.core.journal.clone();
         let inner = tokio::spawn(driver.run());
         let driver_abort = inner.abort_handle();
         let owner_session = session_id.clone();
@@ -2278,6 +2341,10 @@ impl SessionHost {
                     "session driver ended abnormally: {err}"
                 );
             }
+            // A driver that was aborted, as when the host is dropped, did
+            // not close the session itself. Closed before the tasks are
+            // stopped, so stopping them writes nothing.
+            journal.close();
             if !crate::shutdown_background_tasks_owned(&task_registry).await {
                 tracing::warn!(
                     session = owner_session,
@@ -2285,7 +2352,6 @@ impl SessionHost {
                     "forced background-task teardown completed after the shutdown grace"
                 );
             }
-            persistence_fence.close().await;
             drop(lock);
         });
         sessions.insert(
@@ -2354,12 +2420,12 @@ impl SessionHost {
             snapshot,
             epoch,
             working_seen,
+            turn_interrupted_seen,
             turn_outcome_seen,
             settings_seen,
             oracle_settings_seen,
             goal_seen,
-            finished_subs,
-            driven_subs,
+            running_subs,
             assigned_subs,
         ) = {
             let log = tokio::select! {
@@ -2367,30 +2433,24 @@ impl SessionHost {
                 _ = stopped.cancelled() => return false,
                 log = session.core.log.lock() => log,
             };
+            let (running_subs, assigned_subs) = session.live_subs();
             let status = session.status();
             (
                 log.snapshot(),
                 status.epoch.clone(),
                 status.working,
+                status.turn_interrupted,
                 status.turn_outcome,
                 status.settings.clone(),
                 status.oracle_settings.clone(),
                 status.goal.clone(),
-                status.finished_subs.clone(),
-                status.driven_subs.clone(),
-                session
-                    .core
-                    .registry
-                    .ids()
-                    .into_iter()
-                    .filter(|n| session.core.registry.assignment(*n).is_some())
-                    .collect::<std::collections::BTreeSet<_>>(),
+                running_subs,
+                assigned_subs,
             )
         };
         let boundary = snapshot.last_seq();
-        // Only the epoch is checked here. A cursor past the boundary is treated
-        // as a mismatch too, which `project_suffix` does: it owns
-        // the clamp because it is the layer that knows the log's own mark.
+        // A cursor from another epoch, or one past the boundary, names no
+        // prefix of this log and is served a fresh block.
         let cursor = request
             .cursor
             .as_ref()
@@ -2417,24 +2477,24 @@ impl SessionHost {
             self.inner.shared.restore.is_some(),
         )
         .await;
-        // A turn is live if the log names it and the host has not seen it
-        // finish, or if the host is driving a continuation. A foreground
-        // assignment also stays open between turns. Deriving turn activity
-        // from the log keeps the one unavoidable lag (a spawn root reaches
-        // disk before the host consumes the run's `AgentStart`) on the safe
-        // side: the worst case is a bracket left open a moment too long,
-        // which the live `SubAgentEnd` closes, instead of a fabricated
-        // conclusion for a running sub-agent.
-        let running_subs: std::collections::BTreeSet<usize> = snapshot
-            .sub_agent_ids()
-            .difference(&finished_subs)
-            .copied()
-            .chain(driven_subs)
-            .collect();
+        // A sub-agent's box stays open while its turn runs, and between the
+        // turns of a foreground assignment (see `LiveSession::live_subs`).
         let live_subs = running_subs.union(&assigned_subs).copied().collect();
         // Projected outside the log lock: a full backfill walks the whole
         // log, and holding the lock would stall the session's next append
         // for the length of it.
+        //
+        // A block that starts afresh shows the recent tail only. The client
+        // learns where it starts from `caught_up` and fetches what precedes
+        // it in pages (see [`Self::history`]). A cursor past the boundary
+        // names no position here, so it starts afresh too.
+        let history_start = cursor
+            .is_none_or(|seq| seq > boundary)
+            .then(|| snapshot.display_start());
+        let cursor = match history_start {
+            Some(start) => (start > 1).then(|| start - 1),
+            None => cursor,
+        };
         let mut backfill = project_suffix(&snapshot, cursor, &live_subs);
 
         if !send_block_frame(
@@ -2450,6 +2510,7 @@ impl SessionHost {
                 goal: goal_seen,
                 credential_warning,
                 turn_outcome: turn_outcome_seen,
+                turn_interrupted: turn_interrupted_seen,
             },
         )
         .await
@@ -2519,7 +2580,12 @@ impl SessionHost {
         // Each lifecycle snapshot states activity and ownership together, so
         // independent continuations do not inherit foreground ownership from
         // their historical spawn root, and idle assignments remain open.
-        let open_subs = backfill.open_subs();
+        //
+        // A sub-agent whose run ended can still be taking a turn, when it
+        // was prompted again. Its box stays closed, and its lifecycle is
+        // stated here like that of a run still open.
+        let mut open_subs = backfill.open_subs();
+        open_subs.extend(backfill.seen_subs().intersection(&running_subs));
         for child in &open_subs {
             if !send_block_frame(
                 block,
@@ -2571,18 +2637,21 @@ impl SessionHost {
                 last_seq: boundary,
                 tasks,
                 queues,
+                history_start,
             },
         )
         .await
         {
             return false;
         }
-        // Every sub-agent the host knows to be idle is concluded after
-        // `caught_up`. A sub whose `SubAgentEnd` fell into this client's
-        // disconnected window would otherwise spin forever, and the
-        // backfill cannot carry the conclusion itself when no durable entry
-        // follows the cursor. The reducer's `AgentEnd` arm leaves a
-        // concluded box alone, so the sweep is idempotent.
+        // Every sub-agent the host knows to be idle is reported idle after
+        // `caught_up`. Whether a sub-agent is running is not in the log: it
+        // travels as `AgentStart` and `AgentEnd`, which a disconnected
+        // client misses, so without this it would go on counting a
+        // sub-agent that stopped while it was away as running. The run's
+        // box needs none of this, because its end is an entry the suffix
+        // carries. The reducer's `AgentEnd` arm leaves a concluded box
+        // alone, so the sweep is idempotent.
         //
         // Scoped to the runs the projection walked, and to the ones it did
         // not leave open. Both come out of the same walk as `live_subs`
@@ -2626,6 +2695,7 @@ impl SessionHost {
         // like a state change to every other client on the host.
         session.publish_state(&self.inner.shared.fanout, |status| {
             status.working != working_seen
+                || status.turn_interrupted != turn_interrupted_seen
                 || status.turn_outcome != turn_outcome_seen
                 || status.settings != settings_seen
                 || status.oracle_settings != oracle_settings_seen
@@ -2868,13 +2938,11 @@ fn validate_model_selection(selection: &ModelSelection) -> Result<(), HostError>
     Ok(())
 }
 
-/// The modification time of `log`'s file, or `None` for a log that has none
-/// yet (a created session defers its file to the first punctuating append).
-fn log_modified_at(log: &ConversationLog) -> Option<DateTime<Utc>> {
-    if !log.is_durable() {
-        return None;
-    }
-    Some(std::fs::metadata(log.path()).ok()?.modified().ok()?.into())
+/// When the stored session was last written, or `None` for a log the store
+/// does not hold yet (a created session defers its first commit to the first
+/// punctuating append).
+fn log_modified_at(log: &SessionLog) -> Option<DateTime<Utc>> {
+    Some(log.storage_metadata().ok()??.modified_at)
 }
 
 /// Project one live session onto its directory entry.

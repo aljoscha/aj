@@ -1,28 +1,24 @@
-//! Prompt-history extraction from persisted session logs.
+//! Prompt-history extraction from stored sessions.
 //!
-//! The session log is the authoritative record of every prompt a user
-//! has ever submitted in a project, so prompt-history search reads it
-//! rather than a separate history file. A `*.jsonl` log is
-//! line-independent: arbitrary bytes round-trip via `serde_json`
-//! escaping and each session file is owned by exactly one running
-//! process, so a corrupt or non-UTF-8 line is skipped without aborting
-//! the scan.
+//! A session's entries are the authoritative account of every prompt a
+//! user submitted in a project, so prompt-history search reads them and
+//! keeps no history of its own. A stored session's prompts are one query
+//! over its user messages, read at one snapshot. A session file that was
+//! never imported is scanned by [`crate::legacy`]. A session that cannot
+//! be read yields no prompts and does not end the scan.
 //!
 //! [`recent_history_streaming`] ranks prompts by their recorded timestamps for
-//! history search. The file-ordered [`workspace_history`] collector serves the
+//! history search. The session-ordered [`workspace_history`] collector serves the
 //! editor ring's bounded bootstrap. Both share the same prompt extraction rules.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_models::types::{Message, UserContent};
 
-use crate::log::{ConversationEntry, ConversationEntryKind, ThreadKind};
-use crate::persistence::ConversationPersistence;
+use crate::log::{LogEntry, LogEntryKind, SessionError, ThreadKind};
+use crate::persistence::ProjectSessions;
 
 /// One recallable prompt plus the project it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,11 +38,11 @@ pub struct RecordedPrompt {
 }
 
 /// Retain the newest occurrence of each trimmed text, newest first, capped at
-/// `max`. Used by both file scans and merges of independently read hosts.
+/// `max`. Used by both scans and merges of independently read hosts.
 ///
 /// The sort is stable, so prompts with equal timestamps keep the order they
-/// were given in. Callers hand over each file's prompts newest line first,
-/// which is the only recency a log without per-entry timestamps records.
+/// were given in. Callers hand over each session's prompts newest first,
+/// which is the only recency a session without per-entry timestamps records.
 pub fn retain_recent(prompts: &mut Vec<RecordedPrompt>, max: usize) {
     for prompt in prompts.iter_mut() {
         prompt.entry.text = prompt.entry.text.trim().to_string();
@@ -64,16 +60,16 @@ pub fn retain_recent(prompts: &mut Vec<RecordedPrompt>, max: usize) {
 /// more than its readers can see. Readers already paint at about this rate.
 const EMIT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Scan every file, emitting provisional newest-first snapshots capped at `max`.
-/// A file's name or traversal position cannot exclude a newer prompt in another
-/// file. Cancellation is cooperative, including within large logs.
+/// Scan every session, emitting provisional newest-first snapshots capped at `max`.
+/// A session's identity or traversal position cannot exclude a newer prompt in another
+/// session. Cancellation is cooperative, including within large logs.
 ///
-/// The first file's snapshot is emitted at once and later ones at most every
+/// The first session's snapshot is emitted at once and later ones at most every
 /// [`EMIT_INTERVAL`]. A scan that is not cancelled ends on the snapshot of
 /// everything it read, also when it fails partway. A cancelled one emits
 /// nothing further.
 pub fn recent_history_streaming(
-    dir: &Path,
+    persistence: &ProjectSessions,
     all: bool,
     max: usize,
     cancel: &dyn Fn() -> bool,
@@ -88,7 +84,7 @@ pub fn recent_history_streaming(
         last: None,
         pending: false,
     };
-    let scanned = scan_recent(dir, all, max, cancel, &mut recent, &mut paced);
+    let scanned = scan_recent(persistence, all, max, cancel, &mut recent, &mut paced);
     if !cancel() {
         paced.flush(&recent);
     }
@@ -127,44 +123,38 @@ impl Paced<'_> {
 }
 
 fn scan_recent(
-    dir: &Path,
+    persistence: &ProjectSessions,
     all: bool,
     max: usize,
     cancel: &dyn Fn() -> bool,
     recent: &mut Vec<RecordedPrompt>,
     paced: &mut Paced<'_>,
 ) -> std::io::Result<()> {
-    let mut dirs = if all {
-        std::fs::read_dir(dir)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect::<Vec<_>>()
+    let mut projects = if all {
+        persistence.projects().map_err(std::io::Error::other)?
     } else {
-        vec![dir.to_path_buf()]
+        vec![persistence.clone()]
     };
-    dirs.sort();
-    for dir in dirs {
+    projects.sort_by(|a, b| a.sessions_dir().cmp(b.sessions_dir()));
+    for persistence in projects {
         if cancel() {
             return Ok(());
         }
         let project = all.then(|| {
-            dir.file_name()
+            persistence
+                .sessions_dir()
+                .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned()
         });
-        let mut files = std::fs::read_dir(&dir)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-            .collect::<Vec<_>>();
-        files.sort();
-        for path in files {
+        let mut sessions = persistence.list_sessions().map_err(std::io::Error::other)?;
+        sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        for session in sessions {
             if cancel() {
                 return Ok(());
             }
-            let mut prompts = scan_file_recorded_prompts(&path, cancel);
+            let mut prompts = scan_session_prompts(&persistence, &session.session_id, cancel);
             if cancel() {
                 return Ok(());
             }
@@ -182,7 +172,7 @@ fn scan_recent(
 /// Collect the current workspace's submitted prompts, newest-first and
 /// deduplicated, capped at `max`.
 pub fn workspace_history(
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     max: usize,
     cancel: &dyn Fn() -> bool,
 ) -> Vec<PromptEntry> {
@@ -192,73 +182,62 @@ pub fn workspace_history(
 }
 
 /// Stream the current workspace's submitted prompts to `emit`, one
-/// per-file batch at a time, in the same newest-first, deduplicated,
+/// per-session batch at a time, in the same newest-first, deduplicated,
 /// `max`-capped order as [`workspace_history`].
 ///
-/// A batch carries a single session file's new (not-yet-seen) prompts so
+/// A batch carries a single session's new (not-yet-seen) prompts so
 /// a UI rendering the list incrementally can append rows as the scan
 /// walks the on-disk logs rather than blocking on the whole walk. Empty
-/// batches (a file with no new prompts) are not emitted.
+/// batches (a session with no new prompts) are not emitted.
 pub fn workspace_history_streaming(
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     max: usize,
     cancel: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(Vec<PromptEntry>),
 ) {
     let mut seen = HashSet::new();
     let mut remaining = max;
-    collect_dir(
-        persistence.sessions_dir(),
-        &mut seen,
-        &mut remaining,
-        cancel,
-        emit,
-    );
+    collect_dir(persistence, &mut seen, &mut remaining, cancel, emit);
 }
 
-/// Walk every `*.jsonl` file in `dir`, newest file first, emitting each
-/// file's new prompts (newest-first, skipping bodies already in `seen`)
-/// as one batch through `emit`. `remaining` is the shared budget, decremented as entries are produced. The walk
-/// stops once it hits zero. A file that yields no new prompts emits
-/// nothing.
+/// Walk sessions newest identity first, emitting each session's unseen prompts
+/// newest first. SQLite owns an identity once imported, even if its source file
+/// remains in the directory.
 fn collect_dir(
-    dir: &Path,
+    persistence: &ProjectSessions,
     seen: &mut HashSet<String>,
     remaining: &mut usize,
     cancel: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(Vec<PromptEntry>),
 ) {
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
+    if *remaining == 0 || cancel() {
+        return;
+    }
+    let sessions = match persistence.list_sessions() {
+        Ok(sessions) => sessions,
         Err(e) => {
-            tracing::debug!("could not read sessions dir {}: {e}", dir.display());
+            tracing::debug!(
+                "could not list sessions in {}: {e}",
+                persistence.sessions_dir().display()
+            );
             return;
         }
     };
 
-    let mut files: Vec<_> = read_dir
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .collect();
-    // Filenames are timestamps; reverse-lexicographic = newest-first.
-    files.sort();
-    files.reverse();
-
-    for path in &files {
+    for session in sessions {
         if *remaining == 0 || cancel() {
             return;
         }
-        // Within a file prompts are chronological; reverse so the most
-        // recent prompt in this file lands first.
-        let mut prompts = load_file_prompts(path, cancel);
-        // A mid-file cancel returns a partial (still chronological) read.
-        // Drop it rather than reverse-and-emit an out-of-order partial
-        // batch. A sticky `cancel` is true here after an in-file break.
+        let prompts = scan_session_prompts(persistence, &session.session_id, cancel);
+        // A cancelled read is incomplete. Reversing it would expose older
+        // prompts before the unread newer ones.
         if cancel() {
             return;
         }
-        prompts.reverse();
+        let prompts = prompts.into_iter().rev().filter_map(|prompt| {
+            let text = prompt.entry.text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        });
         let mut batch = Vec::new();
         for text in prompts {
             if *remaining == 0 {
@@ -278,119 +257,69 @@ fn collect_dir(
     }
 }
 
-/// Extract the user-submitted prompt texts from a single session file,
-/// in chronological (file) order, each fully trimmed with blanks
-/// dropped.
-fn load_file_prompts(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<String> {
-    scan_file_user_prompts_cancellable(path, cancel)
-        .into_iter()
-        .filter_map(|text| {
-            let trimmed = text.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .collect()
-}
-
-/// Read the user-typed prompt texts from one session file, in
-/// chronological (file) order.
-///
-/// A session log is mostly assistant turns and tool results whose
-/// bodies dwarf the occasional user prompt. To keep a scan of a large
-/// project's logs cheap, each line is first parsed into a tiny
-/// [`PromptHead`] capturing only the thread and message role. The
-/// expensive full [`ConversationEntry`] parse (which allocates the
-/// message-content tree) runs only for lines that really are top-level
-/// user messages.
-///
-/// Failure-isolation: an unreadable file yields no prompts, and
-/// non-UTF-8 or unparseable lines are skipped without aborting the rest
-/// of the file.
-///
-/// `cancel` is polled periodically while reading so a large file doesn't
-/// pin a blocking-pool scan after the consumer has gone away.
-fn scan_file_user_prompts_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<String> {
-    scan_file_recorded_prompts(path, cancel)
-        .into_iter()
-        .map(|p| p.entry.text)
-        .collect()
-}
-
-fn scan_file_recorded_prompts(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<RecordedPrompt> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!("skipping unreadable session file {}: {e}", path.display());
-            return Vec::new();
-        }
-    };
-
-    // A missing persisted time uses the session's creation time, then the file's
-    // modification time, then the epoch.
-    let fallback = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .and_then(crate::persistence::parse_session_id_created_at)
-        .or_else(|| {
-            file.metadata()
-                .ok()?
-                .modified()
-                .ok()
-                .map(chrono::DateTime::from)
-        })
-        .unwrap_or_default();
-    let mut prompts = Vec::new();
-    for (lineno, line) in BufReader::new(file).lines().enumerate() {
-        // Cooperative cancellation: this runs on the blocking pool, so we
-        // poll `cancel` and stop reading once the consumer is gone. The
-        // caller (`collect_dir`) re-checks `cancel` and drops the partial
-        // read, so no out-of-order batch is emitted.
-        if lineno % crate::SCAN_CANCEL_CHECK_LINES == 0 && cancel() {
-            break;
-        }
-        // A non-UTF-8 (or IO-erroring) line is skipped, not fatal: the
-        // failure-isolation property a flat-file format lacks.
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let head: PromptHead = match serde_json::from_str(&line) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::debug!(
-                    "skipping unparseable line {} in {}: {e}",
-                    lineno + 1,
-                    path.display()
-                );
-                continue;
-            }
-        };
-        if !head.is_user_prompt() {
-            continue;
-        }
-        // Confirmed a top-level user message. The full parse is what
-        // actually pulls the text content out. Task-completion notices
-        // are stored with `role:"task_notification"`, so `is_user_prompt`
-        // already excluded them above and they never reach here.
-        if let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line)
-            && let ConversationEntryKind::Message { message: msg } = entry.entry
-            && let Some(text) = extract_user_prompt_text(&msg)
-        {
-            let message_time = match &msg.kind {
-                AgentMessageKind::Wire(Message::User(user)) if user.timestamp > 0 => {
-                    chrono::DateTime::from_timestamp_millis(user.timestamp)
-                }
-                _ => None,
-            };
-            prompts.push(RecordedPrompt {
-                entry: PromptEntry {
-                    text,
-                    project: None,
-                },
-                timestamp: entry.timestamp.or(message_time).unwrap_or(fallback),
-            });
+fn scan_session_prompts(
+    persistence: &ProjectSessions,
+    session_id: &str,
+    cancel: &dyn Fn() -> bool,
+) -> Vec<RecordedPrompt> {
+    match read_session_prompts(persistence, session_id, cancel) {
+        Ok(prompts) => prompts,
+        Err(error) => {
+            // A failed authoritative read must never resurrect the JSONL source.
+            tracing::debug!("skipping unreadable session {session_id}: {error}");
+            Vec::new()
         }
     }
-    prompts
+}
+
+fn read_session_prompts(
+    persistence: &ProjectSessions,
+    session_id: &str,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<RecordedPrompt>, SessionError> {
+    if let Some(store) = persistence.sqlite_reader()?
+        && let Some(metadata) = store.session_metadata(session_id)?
+    {
+        let fallback = crate::persistence::parse_session_id_created_at(session_id)
+            .unwrap_or(metadata.updated_at);
+        let mut prompts = Vec::new();
+        // One statement reads one snapshot, so concurrent appends cannot
+        // keep the scan alive.
+        store.scan(session_id, "user", true, |stored| {
+            if let Some(prompt) = recorded_prompt(&stored, fallback) {
+                prompts.push(prompt);
+            }
+            !cancel()
+        })?;
+        return Ok(prompts);
+    }
+    Ok(crate::legacy::prompts(persistence, session_id, cancel))
+}
+
+pub(crate) fn recorded_prompt(
+    entry: &LogEntry,
+    fallback: chrono::DateTime<chrono::Utc>,
+) -> Option<RecordedPrompt> {
+    if !matches!(entry.thread, ThreadKind::Main) {
+        return None;
+    }
+    let LogEntryKind::Message { message } = &entry.entry else {
+        return None;
+    };
+    let text = extract_user_prompt_text(message)?;
+    let message_time = match &message.kind {
+        AgentMessageKind::Wire(Message::User(user)) if user.timestamp > 0 => {
+            chrono::DateTime::from_timestamp_millis(user.timestamp)
+        }
+        _ => None,
+    };
+    Some(RecordedPrompt {
+        entry: PromptEntry {
+            text,
+            project: None,
+        },
+        timestamp: entry.timestamp.or(message_time).unwrap_or(fallback),
+    })
 }
 
 /// Join a user message's text blocks with a newline. `None` when there
@@ -415,38 +344,11 @@ fn extract_user_prompt_text(msg: &AgentMessage) -> Option<String> {
     }
 }
 
-/// A minimal view of one log line: just enough to tell whether it is a
-/// top-level user message. Unlisted fields (including the message
-/// `content`) are ignored, so serde walks past the heavy body without
-/// allocating it.
-#[derive(serde::Deserialize)]
-struct PromptHead {
-    thread: ThreadKind,
-    #[serde(default)]
-    message: Option<PromptHeadMessage>,
-}
-
-#[derive(serde::Deserialize)]
-struct PromptHeadMessage {
-    #[serde(default)]
-    role: Option<String>,
-}
-
-impl PromptHead {
-    /// A line is a user prompt when it is on the user thread and its
-    /// message role is `user`. Assistant / tool-result messages and
-    /// non-message entries (system prompt, settings records) are
-    /// excluded.
-    fn is_user_prompt(&self) -> bool {
-        matches!(self.thread, ThreadKind::User)
-            && self.message.as_ref().and_then(|m| m.role.as_deref()) == Some("user")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::File;
     use std::io::Write;
+    use std::path::Path;
 
     use tempfile::TempDir;
 
@@ -473,7 +375,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A persisted task-completion notice line: `role:"task_notification"`,
+    /// A persisted task notification line: `role:"task_notification"`,
     /// the on-disk shape the drain writes.
     fn notification_line(body: &str, id: &str) -> String {
         serde_json::to_string(&serde_json::json!({
@@ -499,6 +401,134 @@ mod tests {
         }
     }
 
+    fn write_sqlite(dir: &Path, name: &str, lines: &[String]) {
+        write_sqlite_to(&ProjectSessions::new(dir.to_path_buf()), name, lines);
+    }
+
+    fn write_sqlite_to(persistence: &ProjectSessions, name: &str, lines: &[String]) {
+        let mut entries: Vec<LogEntry> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for index in 1..entries.len() {
+            entries[index].parent_id = Some(entries[index - 1].id.clone());
+        }
+        let mut store = persistence.sqlite_writer().unwrap();
+        let (now, none) = (chrono::Utc::now(), Default::default());
+        crate::jsonl::import_entries(&mut store, name, &entries, now, &none).unwrap();
+    }
+
+    #[test]
+    fn mixed_history_uses_sqlite_authority_and_preserves_both_orders() {
+        let root = scratch_dir("mixed");
+        let project = root.path().join("project");
+        let other = root.path().join("other");
+        let database = root.path().join("sessions.sqlite3");
+        let persistence =
+            ProjectSessions::for_project(database.clone(), project.clone(), "project".into());
+        let other_store = ProjectSessions::for_project(database, other, "other".into());
+        std::fs::create_dir(&project).unwrap();
+        let older = "2024-01-01-00-00-00-000";
+        let newer = "2024-02-01-00-00-00-000";
+        let mut latest: serde_json::Value =
+            serde_json::from_str(&user_line("latest recorded", "1")).unwrap();
+        latest["timestamp"] = serde_json::json!("2025-01-01T00:00:00Z");
+        write_jsonl(
+            &project,
+            older,
+            &[latest.to_string(), user_line("shared", "2")],
+        );
+        let mut subagent: serde_json::Value =
+            serde_json::from_str(&user_line("not submitted by user", "3")).unwrap();
+        subagent["thread"] = serde_json::json!("subagent");
+        subagent["agent_id"] = serde_json::json!(1);
+        write_sqlite_to(
+            &persistence,
+            newer,
+            &[
+                user_line(" shared ", "1"),
+                user_line("sqlite", "2"),
+                subagent.to_string(),
+                notification_line("not a prompt", "4"),
+                user_line("  ", "5"),
+            ],
+        );
+        // An imported identity can retain a source that differs from SQLite.
+        write_jsonl(&project, newer, &[user_line("stale source", "1")]);
+        write_sqlite_to(&other_store, newer, &[user_line("other project", "1")]);
+        std::fs::write(
+            project.join("sessions.sqlite3"),
+            b"ignored intermediate store",
+        )
+        .unwrap();
+        assert_eq!(persistence.list_sessions().unwrap().len(), 2);
+        assert!(persistence.in_database(newer).unwrap());
+        assert!(project.join(format!("{newer}.jsonl")).exists());
+
+        let workspace = workspace_history(&persistence, 10, &|| false);
+        assert_eq!(
+            workspace
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            ["sqlite", "shared", "latest recorded"]
+        );
+        assert!(workspace.iter().all(|p| p.project.is_none()));
+        assert_eq!(
+            workspace_history(&persistence, 1, &|| false),
+            workspace[..1]
+        );
+
+        let mut recent = Vec::new();
+        recent_history_streaming(&persistence, true, 10, &|| false, &mut |p| recent = p).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|p| (p.entry.text.as_str(), p.entry.project.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("latest recorded", Some("project")),
+                ("other project", Some("other")),
+                ("sqlite", Some("project")),
+                ("shared", Some("project"))
+            ]
+        );
+        assert_eq!(
+            recent[2].timestamp,
+            crate::persistence::parse_session_id_created_at(newer).unwrap()
+        );
+    }
+
+    #[test]
+    fn sqlite_history_reads_a_long_session_and_cancels_without_emitting_partial_batches() {
+        let dir = scratch_dir("sqlite-pages");
+        let count = 769;
+        let lines: Vec<_> = (0..count)
+            .map(|i| user_line(&format!("prompt {i}"), &i.to_string()))
+            .collect();
+        write_sqlite(dir.path(), "session", &lines);
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let history = workspace_history(&persistence, count, &|| false);
+        assert_eq!(history.len(), count);
+        assert_eq!(
+            history.first().unwrap().text,
+            format!("prompt {}", count - 1)
+        );
+        assert_eq!(history.last().unwrap().text, "prompt 0");
+
+        let polls = std::cell::Cell::new(0);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 4
+        };
+        let partial = workspace_history(&persistence, count, &cancel);
+        assert!(polls.get() >= 4, "must poll within a session");
+        assert!(
+            partial.is_empty(),
+            "cancelled session must not emit older prompts"
+        );
+    }
+
     #[test]
     fn recent_history_preserves_extraction_and_deterministic_legacy_fallback() {
         let dir = scratch_dir("recorded");
@@ -511,7 +541,7 @@ mod tests {
             .push(serde_json::json!({"type": "text", "text": "second "}));
         let mut sub = blocks.clone();
         sub["thread"] = serde_json::json!("subagent");
-        serde_json::from_value::<ConversationEntry>(sub.clone()).expect("valid subagent fixture");
+        serde_json::from_value::<LogEntry>(sub.clone()).expect("valid subagent fixture");
         write_jsonl(
             dir.path(),
             stem,
@@ -532,7 +562,14 @@ mod tests {
             .write_all(b"\xff\n")
             .unwrap();
         let mut first = Vec::new();
-        recent_history_streaming(dir.path(), false, 2000, &|| false, &mut |p| first = p).unwrap();
+        recent_history_streaming(
+            &ProjectSessions::new(dir.path().to_path_buf()),
+            false,
+            2000,
+            &|| false,
+            &mut |p| first = p,
+        )
+        .unwrap();
         assert_eq!(
             first
                 .iter()
@@ -543,14 +580,21 @@ mod tests {
         let expected = crate::persistence::parse_session_id_created_at(stem).unwrap();
         assert!(first.iter().all(|p| p.timestamp == expected));
         let mut second = Vec::new();
-        recent_history_streaming(dir.path(), false, 2000, &|| false, &mut |p| second = p).unwrap();
+        recent_history_streaming(
+            &ProjectSessions::new(dir.path().to_path_buf()),
+            false,
+            2000,
+            &|| false,
+            &mut |p| second = p,
+        )
+        .unwrap();
         assert_eq!(
             first.iter().map(|p| &p.entry.text).collect::<Vec<_>>(),
             second.iter().map(|p| &p.entry.text).collect::<Vec<_>>(),
             "equal fallback timestamps keep newest-line-first order across scans"
         );
         assert_eq!(
-            scan_file_user_prompts_cancellable(&path, &|| false),
+            crate::legacy::scan_file_user_prompts_cancellable(&path, &|| false),
             [" first \nsecond ", " ", "last"]
         );
     }
@@ -562,10 +606,16 @@ mod tests {
         write_jsonl(dir.path(), "z", &[user_line("second", "2")]);
         let cancelled = std::cell::Cell::new(false);
         let mut batches = Vec::new();
-        recent_history_streaming(dir.path(), false, 2000, &|| cancelled.get(), &mut |p| {
-            batches.push(p);
-            cancelled.set(true);
-        })
+        recent_history_streaming(
+            &ProjectSessions::new(dir.path().to_path_buf()),
+            false,
+            2000,
+            &|| cancelled.get(),
+            &mut |p| {
+                batches.push(p);
+                cancelled.set(true);
+            },
+        )
         .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0][0].entry.text, "first");
@@ -582,8 +632,14 @@ mod tests {
             write_jsonl(dir.path(), &format!("{index:03}"), &[user_line(&text, "1")]);
         }
         let mut batches: Vec<Vec<RecordedPrompt>> = Vec::new();
-        recent_history_streaming(dir.path(), false, 2000, &|| false, &mut |p| batches.push(p))
-            .unwrap();
+        recent_history_streaming(
+            &ProjectSessions::new(dir.path().to_path_buf()),
+            false,
+            2000,
+            &|| false,
+            &mut |p| batches.push(p),
+        )
+        .unwrap();
         // Scanning this store takes a few milliseconds. The bound leaves room
         // for a machine a hundred times slower.
         assert!(
@@ -619,7 +675,7 @@ mod tests {
             &[user_line("second", "1"), user_line("third", "2")],
         );
 
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let entries = workspace_history(&persistence, 2000, &|| false);
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         // Newest file first, prompts within a file newest-first, then
@@ -643,7 +699,7 @@ mod tests {
             &[user_line("second", "1"), user_line("third", "2")],
         );
 
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let mut batches: Vec<Vec<String>> = Vec::new();
         workspace_history_streaming(&persistence, 2000, &|| false, &mut |batch| {
             batches.push(batch.into_iter().map(|e| e.text).collect());
@@ -674,7 +730,7 @@ mod tests {
             c > 0
         };
 
-        let prompts = scan_file_user_prompts_cancellable(&path, &cancel);
+        let prompts = crate::legacy::scan_file_user_prompts_cancellable(&path, &cancel);
         // Bails at the line-1024 poll, having read lines 0..1023. Without the
         // in-file check it would read all 3072.
         assert_eq!(prompts.len(), crate::SCAN_CANCEL_CHECK_LINES);
@@ -696,7 +752,7 @@ mod tests {
 
         // Trip the predicate after the first file's batch: the between-files
         // check must break before reading the older file.
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let seen = std::cell::Cell::new(0usize);
         let mut batches: Vec<Vec<String>> = Vec::new();
         workspace_history_streaming(&persistence, 2000, &|| seen.get() > 0, &mut |batch| {
@@ -718,7 +774,7 @@ mod tests {
                 user_line("c", "3"),
             ],
         );
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let entries = workspace_history(&persistence, 2, &|| false);
         assert_eq!(entries.len(), 2, "cap honored: {entries:?}");
     }
@@ -734,7 +790,7 @@ mod tests {
                 notification_line("background task done", "2"),
             ],
         );
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let entries = workspace_history(&persistence, 2000, &|| false);
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, vec!["real prompt"], "harness notice excluded");

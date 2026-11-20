@@ -178,8 +178,7 @@ impl ToolDefinition for TaskStopTool {
 ///
 /// A task whose owner has finished is therefore unreachable through
 /// these tools. That is deliberate. Its output stays readable in the
-/// owner's transcript, the task picker can kill it, and session
-/// shutdown kills whatever is left.
+/// owner's transcript and the task picker can kill it.
 fn may_resolve(caller: AgentId, owner: AgentId) -> bool {
     caller == owner
 }
@@ -257,7 +256,7 @@ fn report_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolO
         // the run is live the body points at the sub-agent's chat;
         // once terminal the driver has stored the final report on the
         // output source, so a read returns it (the same text the
-        // completion notice delivers).
+        // task notification delivers).
         let body = match read.report {
             Some(report) if status.is_terminal() => report,
             _ => format!("Sub-agent {agent_id} runs this task in its own chat."),
@@ -403,7 +402,6 @@ fn error_outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -429,9 +427,13 @@ mod tests {
     }
 
     /// Start `command` as a background bash task on `ctx`, returning
-    /// the task id and spill path.
-    async fn start_background(ctx: &mut DummyToolContext, command: &str) -> (TaskId, PathBuf) {
-        let outcome = BashTool::default()
+    /// the task id and the guard of the directory that holds its files.
+    async fn start_background(
+        ctx: &mut DummyToolContext,
+        command: &str,
+    ) -> (TaskId, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let outcome = BashTool::new(false, Some(dir.path().to_path_buf()))
             .execute(
                 ctx,
                 BashInput {
@@ -446,9 +448,9 @@ mod tests {
         match &outcome.details {
             ToolDetails::Bash {
                 task_id: Some(id),
-                full_output_path: Some(path),
+                full_output_path: Some(_),
                 ..
-            } => (*id, path.clone()),
+            } => (*id, dir),
             other => panic!("expected started Bash details, got {other:?}"),
         }
     }
@@ -655,7 +657,7 @@ mod tests {
         let mut ctx = DummyToolContext::default();
         // ~200KB of stdout overflows the 50KB display budget; the
         // command exits so the read sees the final tail.
-        let (id, spill) = start_background(&mut ctx, "yes ABCDEFGH | head -c 200000").await;
+        let (id, _dir) = start_background(&mut ctx, "yes ABCDEFGH | head -c 200000").await;
 
         let outcome = read_task(&mut ctx, id, true, 30).await;
         assert!(!outcome.is_error);
@@ -672,8 +674,6 @@ mod tests {
             }
             other => panic!("expected truncated Bash details, got {other:?}"),
         }
-
-        std::fs::remove_file(spill).ok();
     }
 
     /// Unknown ids are an error outcome that lists the live task ids
@@ -681,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_id_lists_live_tasks() {
         let mut ctx = DummyToolContext::default();
-        let (id, spill) = start_background(&mut ctx, "sleep 30").await;
+        let (id, _dir) = start_background(&mut ctx, "sleep 30").await;
 
         let outcome = read_task(&mut ctx, 999, false, 30).await;
         assert!(outcome.is_error);
@@ -703,7 +703,6 @@ mod tests {
         assert!(stop.is_error);
 
         ctx.task_registry().kill(id);
-        std::fs::remove_file(spill).ok();
     }
 
     /// `task_stop` kills the whole process group: a grandchild
@@ -715,7 +714,7 @@ mod tests {
         // grandchild even when tests run in parallel.
         let marker = format!("60.{}", std::process::id());
         let command = format!("sleep {marker} & wait");
-        let (id, spill) = start_background(&mut ctx, &command).await;
+        let (id, _dir) = start_background(&mut ctx, &command).await;
 
         let grandchild_alive = || {
             std::process::Command::new("pgrep")
@@ -737,8 +736,6 @@ mod tests {
 
         // The process-group SIGKILL reaches the shell's grandchild.
         wait_for(|| !grandchild_alive(), "grandchild to die").await;
-
-        std::fs::remove_file(spill).ok();
     }
 
     /// Stopping an already-finished task is a normal report of its
@@ -746,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn task_stop_on_terminal_task_reports_normally() {
         let mut ctx = DummyToolContext::default();
-        let (id, spill) = start_background(&mut ctx, "echo hi").await;
+        let (id, _dir) = start_background(&mut ctx, "echo hi").await;
         let registry = ctx.task_registry();
         tokio::time::timeout(Duration::from_secs(10), registry.wait_terminal(id))
             .await
@@ -760,8 +757,6 @@ mod tests {
         assert!(!outcome.is_error);
         let wire = extract_text(&outcome.content);
         assert!(wire.contains("exit code 0"), "wire: {wire:?}");
-
-        std::fs::remove_file(spill).ok();
     }
 
     /// Register a `Running` task owned by `owner`, standing in for a
@@ -858,7 +853,7 @@ mod tests {
     #[tokio::test]
     async fn owned_task_is_readable_and_stoppable() {
         let mut ctx = DummyToolContext::default().with_agent_id(AgentId::Sub(1));
-        let (id, spill) = start_background(&mut ctx, "sleep 30").await;
+        let (id, _dir) = start_background(&mut ctx, "sleep 30").await;
 
         let read = read_task(&mut ctx, id, false, 30).await;
         assert!(!read.is_error);
@@ -871,8 +866,6 @@ mod tests {
             .expect("task_stop executes");
         assert!(!stop.is_error);
         assert_eq!(ctx.task_registry().status(id), Some(TaskStatus::Killed));
-
-        std::fs::remove_file(spill).ok();
     }
 
     /// Ownership does not reach down either: a parent may not read or
@@ -913,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn error_outcome_lists_only_callers_live_tasks() {
         let mut ctx = DummyToolContext::default().with_agent_id(AgentId::Sub(1));
-        let (own_id, spill) = start_background(&mut ctx, "sleep 30").await;
+        let (own_id, _dir) = start_background(&mut ctx, "sleep 30").await;
         let registry = ctx.task_registry();
         let (foreign_id, _cancel) = register_foreign(&registry, AgentId::Sub(2), "sibling work");
 
@@ -927,7 +920,6 @@ mod tests {
         assert!(!wire.contains(&format!("#{foreign_id}")), "wire: {wire:?}");
 
         registry.kill(own_id);
-        std::fs::remove_file(spill).ok();
     }
 
     /// Output source standing in for an agent-backed task: no
@@ -1175,11 +1167,13 @@ mod production_identity_tests {
         let provider: Arc<dyn Provider> =
             Arc::new(ScriptedProvider::new(scripts).on_exhausted(ExhaustedBehavior::Panic));
 
+        // The child's task leaves its files here.
+        let dir = tempfile::TempDir::new().expect("create temp dir");
         let mut agent = Agent::with_provider(
             std::env::temp_dir(),
             vec![
                 AgentTool.into(),
-                BashTool::default().into(),
+                BashTool::new(false, Some(dir.path().to_path_buf())).into(),
                 TaskOutputTool.into(),
             ],
             Vec::new(),
@@ -1244,12 +1238,8 @@ mod production_identity_tests {
         // stand-in entry has no driver, so only the real task is worth
         // waiting on.
         registry.shutdown();
-        let spill = registry.read(2).and_then(|(_, read)| read.spill_path);
         tokio::time::timeout(Duration::from_secs(5), registry.wait_terminal(2))
             .await
             .expect("the child's command exits on shutdown");
-        if let Some(path) = spill {
-            std::fs::remove_file(path).ok();
-        }
     }
 }

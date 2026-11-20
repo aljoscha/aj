@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use aj_agent::Agent;
-use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
 use aj_agent::message::{TaskNotificationKind, TaskOutcome};
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
@@ -23,9 +22,7 @@ use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{
     AssistantContent, AssistantMessage, StopReason, StreamOptions, TextContent,
 };
-use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, TaggedEvent, persisting_forwarder,
-};
+use aj_session::{Committed, Journal, ProjectSessions, SessionLog};
 use aj_wire::QueueState;
 use serde::Serialize;
 use serde_json::Value;
@@ -67,7 +64,7 @@ pub fn scripted_model_info() -> ModelInfo {
 }
 
 /// Finalized text-only assistant reply for scripting one-turn
-/// conversations (no tool calls, `EndTurn`).
+/// exchanges (no tool calls, `EndTurn`).
 pub fn finalized_text_message(text: &str) -> AssistantMessage {
     AssistantMessage {
         content: vec![AssistantContent::Text(TextContent {
@@ -147,20 +144,23 @@ pub fn scripted_run_config_with_window(
     }))
 }
 
+/// Give `agent` a prompt the way a host does: as pending input, which a
+/// turn started with [`crate::turn::TurnStart::Wake`] takes.
+pub fn queue_prompt(agent: &Agent, text: &str) {
+    let queues = agent.message_queues();
+    queues.append_follow_up(agent.agent_id(), text);
+}
+
 /// Build a headless agent over a fresh (`Create`) session by running
 /// the frontend-agnostic session setup through [`SessionCore::build`],
-/// then decomposing the core into the owned agent, its shared log, and
-/// the persistence subscription. This keeps the seeding sequence in one
-/// place: the same path a live interactive session takes.
-///
-/// The returned [`SubscriptionHandle`] must be kept alive for the life
-/// of the agent: dropping it detaches the persistence listener, so a
-/// caller that needs driven turns persisted (compaction reads the log)
-/// binds it rather than discarding it.
+/// then decomposing the core into the owned agent, its shared log and
+/// its journal. This keeps the seeding sequence in one place: the same
+/// path a live interactive session takes. The agent commits every turn it
+/// is driven through to the log.
 pub fn build_test_agent(
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     run_config: &Arc<StdMutex<RunConfigSnapshot>>,
-) -> (Agent, Arc<TokioMutex<ConversationLog>>, SubscriptionHandle) {
+) -> (Agent, Arc<TokioMutex<SessionLog>>, Journal) {
     let config = Config::default();
     let spec = SessionSpec::Create {
         entry: SessionEntry::Startup,
@@ -179,39 +179,28 @@ pub fn build_test_agent(
     core.into_test_agent()
 }
 
-/// [`build_test_agent`] with the durable tagger in place of the plain
-/// persistence listener: every event the agent emits arrives on the
-/// returned receiver paired with the log entry it appended, which is the
-/// shape a session host fans out to its clients.
-///
-/// The forwarder persists as well, so the plain listener is dropped here.
-/// Keeping both would append every message twice.
+/// [`build_test_agent`] with the journal's stream: every event the agent
+/// emits arrives on the returned receiver paired with the log entry it
+/// appended, which is what a session host fans out to its clients.
 pub fn build_tagged_test_agent(
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     run_config: &Arc<StdMutex<RunConfigSnapshot>>,
 ) -> (
     Agent,
-    Arc<TokioMutex<ConversationLog>>,
-    SubscriptionHandle,
-    UnboundedReceiver<TaggedEvent>,
+    Arc<TokioMutex<SessionLog>>,
+    Journal,
+    UnboundedReceiver<Committed>,
 ) {
-    let (agent, log, persistence_handle) = build_test_agent(persistence, run_config);
-    drop(persistence_handle);
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = agent.subscribe(persisting_forwarder(
-        Arc::clone(&log),
-        AppendHandoff::default(),
-        tx,
-        aj_session::PersistenceFence::default(),
-    ));
-    (agent, log, handle, rx)
+    let (agent, log, journal) = build_test_agent(persistence, run_config);
+    let rx = journal.stream();
+    (agent, log, journal, rx)
 }
 
 /// Comparable projection of a [`ChatState`] and the client that folded
 /// into it: the equality oracle for reducer-equivalence tests, and the
 /// full form of the canonical form's two tiers.
 ///
-/// Two states that would render the same conversation project onto the
+/// Two states that would render the same session project onto the
 /// same value, so `assert_eq!` on this type answers "did these two folds
 /// arrive at the same place". `ChatState` itself is not comparable (no
 /// `PartialEq`, and the reducer stamps `Instant::now()` into entries), so
@@ -232,7 +221,7 @@ pub fn build_tagged_test_agent(
 ///   stream.
 /// - Raw [`EntryId`](crate::chat::EntryId)s. Positional order carries the
 ///   same information without coupling the oracle to append counters,
-///   which two folds of the same conversation legitimately differ on.
+///   which two folds of the same session legitimately differ on.
 /// - A sub-agent box's `latest_activity`: transient detail a re-attach
 ///   quiesce drops, so two converged states may hold different values.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -358,7 +347,7 @@ pub enum CanonicalEntry {
         text: String,
         entry: Option<String>,
     },
-    TurnUsage {
+    RoundUsage {
         agent: AgentId,
         source_entry: Option<String>,
         usage: Value,
@@ -725,7 +714,7 @@ fn canonical_entry(entry: &Entry) -> CanonicalEntry {
             text: n.text.clone(),
             entry: n.entry.clone(),
         },
-        EntryKind::TurnUsage(u) => CanonicalEntry::TurnUsage {
+        EntryKind::RoundUsage(u) => CanonicalEntry::RoundUsage {
             agent: u.agent_id,
             source_entry: u.source_entry.clone(),
             usage: json(&u.usage),
@@ -802,6 +791,7 @@ mod tests {
                 child: AgentId::Sub(1),
                 task: "look into it".to_string(),
                 tool_name: "agent".into(),
+                call_id: None,
                 background: false,
                 settings: agent_settings(),
             },
@@ -962,6 +952,7 @@ mod tests {
         let _ = client.apply(
             &mut chat,
             Frame::State {
+                turn_interrupted: false,
                 session: session.to_string(),
                 epoch: epoch.to_string(),
                 opens_block: true,
@@ -981,6 +972,7 @@ mod tests {
                 last_seq: 0,
                 tasks: Default::default(),
                 queues: Default::default(),
+                history_start: None,
             },
         );
         let _ = client.apply(

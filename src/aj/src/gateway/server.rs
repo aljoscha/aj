@@ -1247,7 +1247,7 @@ mod tests {
         let created = namespace_created(
             answer(
                 StatusCode::OK,
-                r#"{"id":"s-1","incomplete":"tag not applied"}"#,
+                r#"{"id":"s-1","incomplete":"first prompt not applied"}"#,
             ),
             &target,
         )
@@ -1257,7 +1257,7 @@ mod tests {
         assert_eq!(body["id"], serde_json::json!("left:s-1"));
         assert_eq!(
             body["incomplete"],
-            serde_json::json!("tag not applied"),
+            serde_json::json!("first prompt not applied"),
             "and the rest of the host's answer is untouched",
         );
 

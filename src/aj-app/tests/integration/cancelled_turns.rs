@@ -1,4 +1,4 @@
-//! Cancelled-turn facts through the real agent and persistence listener.
+//! Cancelled-turn facts through the real agent and journal.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
     StopReason, StreamOptions, TextContent, Usage, UsageCost,
 };
-use aj_session::{ConversationLog, ConversationPersistence, ThreadFilter};
+use aj_session::{ProjectSessions, SessionLog, ThreadFilter};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -105,15 +105,12 @@ fn partial(text: &str) -> AssistantMessage {
     partial
 }
 
-fn persisted_assistants(
-    persistence: &ConversationPersistence,
-    session_id: &str,
-) -> Vec<AssistantMessage> {
-    let log = ConversationLog::resume(persistence, session_id).expect("resume persisted session");
+fn persisted_assistants(persistence: &ProjectSessions, session_id: &str) -> Vec<AssistantMessage> {
+    let log = SessionLog::resume(persistence, session_id).expect("resume persisted session");
     let head = log
-        .latest_leaf(ThreadFilter::USER)
-        .expect("persisted user-thread head");
-    log.linearize(&head, ThreadFilter::USER)
+        .latest_leaf(ThreadFilter::MAIN)
+        .expect("persisted main-thread head");
+    log.linearize(&head, ThreadFilter::MAIN)
         .messages()
         .into_iter()
         .filter_map(|message| match message {
@@ -195,7 +192,7 @@ async fn cancellation_drains_a_queued_priced_terminal_before_persisting() {
     ]);
 
     let root = TempDir::new().expect("tempdir");
-    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let persistence = ProjectSessions::new(root.path().join("sessions"));
     let (mut agent, log, persistence_handle) =
         build_test_agent(&persistence, &run_config(vec![script], priced_model()));
     let session_id = log.lock().await.session_id().to_string();
@@ -306,7 +303,7 @@ async fn cancellation_keeps_the_queued_providers_exact_price() {
     });
 
     let root = TempDir::new().expect("tempdir");
-    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let persistence = ProjectSessions::new(root.path().join("sessions"));
     let (mut agent, log, persistence_handle) =
         build_test_agent(&persistence, &provider_run_config(provider, priced_model()));
     let session_id = log.lock().await.session_id().to_string();
@@ -369,7 +366,7 @@ async fn cancellation_persists_an_anthropic_shaped_priced_partial() {
         );
 
     let root = TempDir::new().expect("tempdir");
-    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let persistence = ProjectSessions::new(root.path().join("sessions"));
     let (mut agent, log, persistence_handle) =
         build_test_agent(&persistence, &run_config(vec![script], priced_model()));
     let session_id = log.lock().await.session_id().to_string();

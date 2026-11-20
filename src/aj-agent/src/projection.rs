@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn task_notification_projects_to_framed_user_message() {
         // A notice has no stored wire form, but the provider must see
-        // it framed so the model knows the turn was harness-injected.
+        // it framed so the model knows the message was harness-injected.
         let transcript = vec![AgentMessage::task_notification(TaskNotification::new(
             "sleep 1".into(),
             TaskNotificationKind::Bash,

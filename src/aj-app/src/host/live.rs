@@ -1,7 +1,7 @@
 //! One live session: the composed [`SessionCore`], the state the host
 //! publishes about it, and the channel its driver takes requests on.
 //!
-//! **Lock ordering.** The conversation log's async mutex is the outer
+//! **Lock ordering.** The session log's async mutex is the outer
 //! lock, [`LiveSession::status`] the inner one. Anything that needs both
 //! takes the log first (an attach, a head switch), and nothing takes the
 //! log lock while holding `status`. `status` is a std mutex precisely so
@@ -17,7 +17,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::Instant;
 
 use aj_agent::events::{AgentId, AgentSettings};
-use aj_session::{AppendHandoff, SessionMetadata};
+use aj_session::SessionMetadata;
 use aj_wire::Frame;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::UnboundedSender;
@@ -46,9 +46,9 @@ pub(crate) enum Request {
         command: Command,
         reply: oneshot::Sender<Result<CommandOutcome, HostError>>,
     },
-    /// Wind the session down: cancel its turns through the graceful path,
-    /// quiesce background tasks, flush the log. The driver returns
-    /// afterwards, which is what releases the session lock.
+    /// Stop the session as a host that died stops it: close it for
+    /// writing, abort its turns, let its task drivers go. The driver
+    /// returns afterwards, which is what releases the session lock.
     Shutdown,
     /// Wind down and return, but only if the session is [`releasable`] and has
     /// a log on disk to be handed back to.
@@ -123,6 +123,9 @@ pub(crate) struct SessionStatus {
     /// Whether the **main** agent has a turn in flight. Says nothing about
     /// sub-agents, whose liveness travels through lifecycle events.
     pub(crate) working: bool,
+    /// Whether the process that ran Main's last turn ended before the turn
+    /// did, cached off the session's stored turn state.
+    pub(crate) turn_interrupted: bool,
     pub(crate) turn_outcome: Option<aj_wire::TurnOutcome>,
     /// Session-wide activity for directory rows, independent of Main's turn.
     pub(crate) session_working: bool,
@@ -132,26 +135,6 @@ pub(crate) struct SessionStatus {
     /// The Oracle settings staged for the next main turn, cached beside main.
     pub(crate) oracle_settings: Option<AgentSettings>,
     pub(crate) goal: Option<aj_agent::goal::Goal>,
-    /// The sub-agents the host has observed going idle, plus every one the
-    /// log already named when the session was materialized (nothing runs at
-    /// that point, so they are all finished).
-    ///
-    /// Monotone: it only ever grows, because a sub-agent id is minted once
-    /// per session. A backfill's `live_subs` is derived from it as "in the
-    /// log and not in here", plus [`Self::driven_subs`], which is what puts
-    /// the lag in the safe direction. The alternative, tracking the live set
-    /// directly, lags the log: a spawn root reaches disk several bus emits
-    /// before the host consumes the `AgentStart` that would record the run as
-    /// live, and a backfill served in that window would fabricate a
-    /// conclusion for a sub-agent that is still running.
-    pub(crate) finished_subs: BTreeSet<usize>,
-    /// The sub-agents the host is driving a turn for.
-    ///
-    /// A continuation prompt re-opens the run of a sub-agent that already
-    /// finished, and `finished_subs` is monotone, so this is what says "live
-    /// again". It is recorded before the turn's task exists, so no append of
-    /// the new run can land while the run still reads as finished.
-    pub(crate) driven_subs: BTreeSet<usize>,
     pub(crate) last_activity: DateTime<Utc>,
     /// The session's label, read from its sidecar when the session
     /// was materialized and kept current by the tag command.
@@ -201,6 +184,7 @@ impl SessionStatus {
             oracle_settings: self.oracle_settings.clone(),
             goal: self.goal.clone(),
             turn_outcome: self.turn_outcome,
+            turn_interrupted: self.turn_interrupted,
             credential_warning: None,
         }
     }
@@ -218,10 +202,6 @@ pub(crate) fn settings_of(
 /// A session the host holds live.
 pub(crate) struct LiveSession {
     pub(crate) core: SessionCore,
-    /// The compaction append handoff shared with the session's event
-    /// forwarder, so a compaction's `CompactionEnd` reaches the fan-out
-    /// tagged with the checkpoint entry it belongs to.
-    pub(crate) handoff: AppendHandoff,
     status: StdMutex<SessionStatus>,
     requests: UnboundedSender<Request>,
     /// Set before shutdown is queued, so work becoming ready behind an
@@ -232,13 +212,11 @@ pub(crate) struct LiveSession {
 impl LiveSession {
     pub(crate) fn new(
         core: SessionCore,
-        handoff: AppendHandoff,
         status: SessionStatus,
         requests: UnboundedSender<Request>,
     ) -> Self {
         Self {
             core,
-            handoff,
             status: StdMutex::new(status),
             requests,
             draining: AtomicBool::new(false),
@@ -247,6 +225,23 @@ impl LiveSession {
 
     pub(crate) fn id(&self) -> &str {
         &self.core.session_id
+    }
+
+    /// The sub-agents with a turn this process started and has not ended,
+    /// and the ones whose parent's tool call still waits for them. A
+    /// backfill leaves the boxes of both open, and tells clients the first
+    /// are running.
+    ///
+    /// The turn state is stored with the entry that starts a run, so a
+    /// caller that reads this under the log lock, with its snapshot, never
+    /// sees a run's spawn record without its turn. A box is then never
+    /// concluded for a sub-agent that is still running.
+    pub(crate) fn live_subs(&self) -> (BTreeSet<usize>, BTreeSet<usize>) {
+        let running = self.core.turn.working_subs().into_iter().collect();
+        let registry = &self.core.registry;
+        let assigned = registry.ids().into_iter();
+        let assigned = assigned.filter(|n| registry.assignment(*n).is_some());
+        (running, assigned.collect())
     }
 
     /// The published status. Never hold this across an await, and never
@@ -318,18 +313,18 @@ impl LiveSession {
         self.requests.is_closed()
     }
 
-    /// Whether the session has anything queued for `agent`.
-    pub(crate) fn has_queued(&self, agent: AgentId) -> bool {
+    /// Whether the session has a pending input for `agent`.
+    pub(crate) fn has_pending(&self, agent: AgentId) -> bool {
         self.core.message_queues.has_pending(agent)
     }
 }
 
-/// Whether `session` is releasable: nothing running, nothing queued, no
-/// undelivered task notice, nobody attached.
+/// Whether `session` is releasable: nothing running, no pending input, no
+/// undelivered task notification, nobody attached.
 ///
-/// Queued messages and task notices hold a session live because both live in
-/// memory only: releasing a session holding one would discard something the
-/// user or a finished task handed us. Attachment is the retention signal, so a
+/// Pending inputs and task notifications hold a session live: releasing it would
+/// drop the copy in memory, and the saved one is restored only when the
+/// session is next opened. Attachment is the retention signal, so a
 /// client that keeps a session attached keeps its lock, deliberately.
 ///
 /// Read off the published status and the session's own registries, so the
@@ -340,12 +335,14 @@ impl LiveSession {
 pub(crate) fn releasable(session: &LiveSession, fanout: &Fanout) -> bool {
     {
         let status = session.status();
-        // `working` covers the main agent, and a sub-agent's turn is either
-        // nested in a main turn or driven on its own, which `driven_subs`
-        // records. A background sub-agent shows up in the task registry below.
-        if status.working || !status.driven_subs.is_empty() {
+        if status.working {
             return false;
         }
+    }
+    // A sub-agent's turn: nested in a main turn, driven on its own, or a
+    // background run.
+    if !session.core.turn.working_subs().is_empty() {
+        return false;
     }
     if session.core.message_queues.pending_counts() != (0, 0)
         || session.core.task_registry.has_any_notices()

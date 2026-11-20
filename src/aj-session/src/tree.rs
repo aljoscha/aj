@@ -1,29 +1,28 @@
 //! The session tree: a segment-collapsed view of a log's branch structure.
 //!
-//! A conversation log is a tree of entries linked by `parent_id`. Deliberate
-//! branches (see the branching flow in the binary) grow sibling chains off a
-//! shared prefix. [`SessionTree`] projects that raw entry tree onto a compact
+//! A session's entries form a tree linked by `parent_id`. A head switch to
+//! an earlier entry grows a sibling chain off a shared prefix. [`SessionTree`] projects that raw entry tree onto a compact
 //! model the tree-view overlay renders: one node per *segment*, a maximal
-//! linear run of user-thread entries between forks.
+//! line of main-thread entries between fork points.
 //!
-//! The model is pure and built on demand from the in-memory log image
-//! ([`ConversationLog::session_tree`]). It carries untruncated labels and
-//! append-order children. Truncation and active-first display ordering are the
-//! view's concern, not the model's.
+//! The model is pure and built on demand from the entries a
+//! [`LogSnapshot`] holds, and shows only those. An open log holds part of
+//! its session, so a caller that wants every branch reads the whole
+//! session first ([`SessionLog::whole`]). The tree carries untruncated
+//! labels and append-order children. Truncation and active-first display
+//! ordering are the view's concern, not the model's.
 
 use std::collections::{HashMap, HashSet};
 
 use aj_models::types::{AssistantContent, Message, UserContent};
 use chrono::{DateTime, Utc};
 
-use crate::log::{
-    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, LogSnapshot, ThreadKind,
-};
+use crate::log::{EntryId, LogEntry, LogEntryKind, LogSnapshot, SessionLog, ThreadKind};
 
 /// The branch structure of a session, collapsed to one node per segment.
 ///
 /// A degenerate log (empty or never persisted) yields no segments; a
-/// branchless session yields exactly one; a fork yields the shared-prefix
+/// branchless session yields exactly one; a fork point yields the shared-prefix
 /// segment plus one child segment per branch.
 pub struct SessionTree {
     /// Segments in DFS pre-order from the roots (each root, then its
@@ -32,9 +31,9 @@ pub struct SessionTree {
     pub segments: Vec<TreeSegment>,
 }
 
-/// One node in a [`SessionTree`]: a maximal linear run of user-thread entries
-/// running from a root (or a fork child) down through single-child
-/// descendants until the next fork or a leaf.
+/// One node in a [`SessionTree`]: a maximal line of main-thread entries
+/// running from a root (or a child of a fork point) down through single-child
+/// descendants until the next fork point or a leaf.
 pub struct TreeSegment {
     /// The segment's last entry. This is the switch target for the branch:
     /// setting the log head here selects this branch's tip.
@@ -53,20 +52,20 @@ pub struct TreeSegment {
     /// Whether any of the segment's entries lie on the head's root->head
     /// chain. `false` for every segment when the log has no head.
     pub on_active_path: bool,
-    /// Whether the segment's last entry has no user-thread children.
+    /// Whether the segment's last entry has no main-thread children.
     pub is_leaf: bool,
 }
 
 impl LogSnapshot {
-    /// Build the [`SessionTree`] on demand from the current log image. Cheap
+    /// Build the [`SessionTree`] of the entries this snapshot holds. Cheap
     /// and in-memory: one pass to index children plus a DFS over the
-    /// user-thread forest.
+    /// main-thread forest.
     pub fn session_tree(&self) -> SessionTree {
         SessionTree::build(&self.entries_in_order(), self.head())
     }
 }
 
-impl ConversationLog {
+impl SessionLog {
     /// See [`LogSnapshot::session_tree`].
     pub fn session_tree(&self) -> SessionTree {
         self.core().session_tree()
@@ -74,22 +73,21 @@ impl ConversationLog {
 }
 
 impl SessionTree {
-    fn build(entries: &[&ConversationEntry], head: Option<&EntryId>) -> SessionTree {
+    fn build(entries: &[&LogEntry], head: Option<&EntryId>) -> SessionTree {
         // Index every entry by id for the active-path walk. Values borrow the
         // caller's slice.
-        let by_id: HashMap<&str, &ConversationEntry> =
-            entries.iter().map(|e| (e.id.as_str(), *e)).collect();
+        let by_id: HashMap<&str, &LogEntry> = entries.iter().map(|e| (e.id.as_str(), *e)).collect();
 
-        // The set of user-thread entry ids. Sub-agent and meta entries are
+        // The set of main-thread entry ids. Sub-agent and meta entries are
         // excluded so a spawn root never reads as a branch point.
         let user_ids: HashSet<&str> = entries
             .iter()
             .copied()
-            .filter(|e| e.thread == ThreadKind::User)
+            .filter(|e| e.thread == ThreadKind::Main)
             .map(|e| e.id.as_str())
             .collect();
 
-        // Children index over user-thread entries plus the virtual root's
+        // Children index over main-thread entries plus the virtual root's
         // children (the roots). A user entry whose parent is another user
         // entry is that entry's child; anything else (no parent, the
         // system-prompt meta entry, a missing parent) is a root of the virtual
@@ -99,7 +97,7 @@ impl SessionTree {
         for e in entries
             .iter()
             .copied()
-            .filter(|e| e.thread == ThreadKind::User)
+            .filter(|e| e.thread == ThreadKind::Main)
         {
             match e.parent_id.as_deref() {
                 Some(p) if user_ids.contains(p) => {
@@ -123,7 +121,7 @@ impl SessionTree {
 /// Empty when there is no head. The insert guard tolerates a cycle in a
 /// hand-edited file.
 fn active_path_set<'a>(
-    by_id: &HashMap<&'a str, &'a ConversationEntry>,
+    by_id: &HashMap<&'a str, &'a LogEntry>,
     head: Option<&EntryId>,
 ) -> HashSet<&'a str> {
     let mut set = HashSet::new();
@@ -140,13 +138,13 @@ fn active_path_set<'a>(
     set
 }
 
-/// Walk the linear run from `start` (a root or a fork child) to the next fork
-/// or leaf, push the resulting segment onto `out`, and recurse into a fork's
-/// children. Returns the new segment's index.
+/// Walk the line from `start` (a root or a child of a fork point) to the
+/// next fork point or leaf, push the resulting segment onto `out`, and
+/// recurse into a fork point's children. Returns the new segment's index.
 fn build_segment<'a>(
     start: &'a str,
     parent: Option<usize>,
-    by_id: &HashMap<&'a str, &'a ConversationEntry>,
+    by_id: &HashMap<&'a str, &'a LogEntry>,
     children: &HashMap<&'a str, Vec<&'a str>>,
     active: &HashSet<&'a str>,
     out: &mut Vec<TreeSegment>,
@@ -164,14 +162,11 @@ fn build_segment<'a>(
     let kids = child_ids(head);
     let is_leaf = kids.is_empty();
 
-    let seg_entries: Vec<&ConversationEntry> = chain
+    let seg_entries: Vec<&LogEntry> = chain
         .iter()
         .filter_map(|id| by_id.get(id).copied())
         .collect();
-    let message_count = seg_entries
-        .iter()
-        .filter(|e| matches!(e.entry, ConversationEntryKind::Message { .. }))
-        .count();
+    let message_count = seg_entries.iter().filter(|e| e.entry.is_message()).count();
     let label = segment_label(&seg_entries);
     let last_timestamp = by_id.get(head).and_then(|e| e.timestamp);
     let on_active_path = chain.iter().any(|id| active.contains(id));
@@ -209,7 +204,7 @@ fn build_segment<'a>(
 /// The segment's display label: its first user message text, falling back to
 /// the first message of any role, then to a dim kind placeholder for a
 /// message-free segment.
-fn segment_label(entries: &[&ConversationEntry]) -> String {
+fn segment_label(entries: &[&LogEntry]) -> String {
     if let Some(text) = entries.iter().copied().find_map(user_message_text) {
         return text;
     }
@@ -223,8 +218,8 @@ fn segment_label(entries: &[&ConversationEntry]) -> String {
 }
 
 /// Non-empty text of a user-role message entry, if any.
-fn user_message_text(entry: &ConversationEntry) -> Option<String> {
-    let ConversationEntryKind::Message { message } = &entry.entry else {
+fn user_message_text(entry: &LogEntry) -> Option<String> {
+    let LogEntryKind::Message { message } = &entry.entry else {
         return None;
     };
     match message.as_stored_wire()? {
@@ -234,8 +229,8 @@ fn user_message_text(entry: &ConversationEntry) -> Option<String> {
 }
 
 /// Non-empty text of a message entry of any role, if any.
-fn any_message_text(entry: &ConversationEntry) -> Option<String> {
-    let ConversationEntryKind::Message { message } = &entry.entry else {
+fn any_message_text(entry: &LogEntry) -> Option<String> {
+    let LogEntryKind::Message { message } = &entry.entry else {
         return None;
     };
     match message.as_stored_wire()? {
@@ -264,26 +259,26 @@ fn non_empty(text: &str) -> Option<String> {
 
 /// A dim placeholder for a segment that carries no message text, keyed on its
 /// first entry's kind.
-fn kind_placeholder(kind: &ConversationEntryKind) -> &'static str {
+fn kind_placeholder(kind: &LogEntryKind) -> &'static str {
     match kind {
-        ConversationEntryKind::Message { .. } => "(message)",
-        ConversationEntryKind::SystemPrompt { .. } => "(system prompt)",
-        ConversationEntryKind::ModelChange { .. }
-        | ConversationEntryKind::OracleModelChange { .. }
-        | ConversationEntryKind::OracleThinkingChange { .. }
-        | ConversationEntryKind::OracleSpeedChange { .. }
-        | ConversationEntryKind::OracleVerbosityChange { .. }
-        | ConversationEntryKind::AccountChange { .. }
-        | ConversationEntryKind::ThinkingChange { .. }
-        | ConversationEntryKind::SpeedChange { .. }
-        | ConversationEntryKind::VerbosityChange { .. } => "(settings)",
-        ConversationEntryKind::EnvChange { .. } => "(environment)",
-        ConversationEntryKind::GoalChange { .. } => "(goal)",
-        ConversationEntryKind::CodeModeStore { .. } => "(code-mode store)",
-        ConversationEntryKind::Context { .. } => "(context)",
-        ConversationEntryKind::SubAgentSpawn { .. } => "(subagent)",
-        ConversationEntryKind::Compaction { .. } => "(compaction)",
-        ConversationEntryKind::CompactionFailed { .. } => "(compaction failed)",
+        LogEntryKind::Message { .. } => "(message)",
+        LogEntryKind::SystemPrompt { .. } => "(system prompt)",
+        LogEntryKind::ModelChange { .. }
+        | LogEntryKind::OracleModelChange { .. }
+        | LogEntryKind::OracleThinkingChange { .. }
+        | LogEntryKind::OracleSpeedChange { .. }
+        | LogEntryKind::OracleVerbosityChange { .. }
+        | LogEntryKind::AccountChange { .. }
+        | LogEntryKind::ThinkingChange { .. }
+        | LogEntryKind::SpeedChange { .. }
+        | LogEntryKind::VerbosityChange { .. } => "(settings)",
+        LogEntryKind::EnvChange { .. } => "(environment)",
+        LogEntryKind::GoalChange { .. } => "(goal)",
+        LogEntryKind::CodeModeStore { .. } => "(code-mode store)",
+        LogEntryKind::Context { .. } => "(context)",
+        LogEntryKind::SubAgentSpawn { .. } | LogEntryKind::SubAgentEnd { .. } => "(subagent)",
+        LogEntryKind::Compaction { .. } => "(compaction)",
+        LogEntryKind::CompactionFailed { .. } => "(compaction failed)",
     }
 }
 
@@ -296,8 +291,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::log::{ConversationLog, ConversationView, ThreadFilter};
-    use crate::persistence::ConversationPersistence;
+    use crate::log::{AgentLog, SessionLog, ThreadFilter};
+    use crate::persistence::ProjectSessions;
 
     /// A scratch directory for one test's persistence state, removed when the
     /// returned guard drops. Callers must hold the guard for as long as they
@@ -309,10 +304,10 @@ mod tests {
     /// A log on disk, plus the guard that removes its directory. The log keeps
     /// writing to that directory, so a caller has to hold the guard for as long
     /// as it uses the log.
-    fn new_log() -> (TempDir, ConversationLog) {
+    fn new_log() -> (TempDir, SessionLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let mut log = SessionLog::create(&persistence).expect("create log");
         log.set_system_prompt("prompt".to_string())
             .expect("set system prompt");
         (dir, log)
@@ -332,12 +327,9 @@ mod tests {
         }))
     }
 
-    /// Append `message` to the user thread and return the new entry id.
-    fn add(log: &mut ConversationLog, message: AgentMessage) -> EntryId {
-        ConversationView::user(log)
-            .add_message(message)
-            .expect("append")
-            .id
+    /// Append `message` to the main thread and return the new entry id.
+    fn add(log: &mut SessionLog, message: AgentMessage) -> EntryId {
+        AgentLog::main(log).add_message(message).expect("append").id
     }
 
     fn segment_with_head<'a>(tree: &'a SessionTree, head: &str) -> &'a TreeSegment {
@@ -351,13 +343,13 @@ mod tests {
     #[test]
     fn empty_log_has_no_segments() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let log = ConversationLog::create(&persistence).expect("create log");
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
+        let log = SessionLog::create(&persistence).expect("create log");
         assert!(log.session_tree().segments.is_empty());
     }
 
     /// A branchless session is exactly one segment spanning the whole
-    /// conversation, with its head at the last entry and the whole chain
+    /// thread, with its head at the last entry and the whole chain
     /// active.
     #[test]
     fn linear_session_is_one_segment() {
@@ -381,7 +373,7 @@ mod tests {
         assert!(seg.on_active_path, "the head's chain is active");
     }
 
-    /// A fork mid-session yields the shared-prefix segment plus one child
+    /// A fork point mid-session yields the shared-prefix segment plus one child
     /// segment per branch, with correct heads, labels, and counts. Only the
     /// prefix and the branch holding the head are marked active.
     #[test]
@@ -455,7 +447,7 @@ mod tests {
         assert_eq!(segment_with_head(&tree, &root_b).label, "root B");
     }
 
-    /// A branch whose first (and only) entry is a settings record carries no
+    /// A branch whose first (and only) entry is a settings entry carries no
     /// message, so its label falls back to the dim `(settings)` placeholder.
     #[test]
     fn message_free_segment_falls_back_to_settings_label() {
@@ -471,7 +463,7 @@ mod tests {
         // anchored back at the fork point.
         log.set_head(fork.clone()).expect("set head to fork");
         let settings = log
-            .append_model_change(ThreadFilter::USER, "prov", "model", 0)
+            .append_model_change(ThreadFilter::MAIN, "prov", "model", 0)
             .expect("append settings entry")
             .id;
 
@@ -528,7 +520,7 @@ mod tests {
     /// A session with a spawned sub-agent stays a single linear segment: the
     /// spawn root and the sub-agent's messages live on the sub thread, so the
     /// spawning assistant message never reads as a fork, and `message_count`
-    /// counts only user-thread `Message` entries.
+    /// counts only main-thread `Message` entries.
     #[test]
     fn sub_agent_thread_does_not_fork_the_segment() {
         use aj_agent::events::AgentSettings;
@@ -539,7 +531,7 @@ mod tests {
 
         // A real sub-agent: a spawn root anchored at the spawning assistant
         // message, then one message on the sub thread. Neither advances the
-        // user-thread head.
+        // main-thread head.
         let settings = AgentSettings {
             context_window: 0,
             provider: "anthropic".into(),
@@ -555,17 +547,18 @@ mod tests {
                 spawner.clone(),
                 "do the thing",
                 "agent",
+                None,
                 false,
                 &settings,
             )
             .expect("spawn root")
             .id;
         {
-            let mut view = ConversationView::subagent(&mut log, spawn, 1);
+            let mut view = AgentLog::sub(&mut log, spawn, 1);
             view.add_message(user_text("subtask")).expect("sub message");
         }
 
-        // The user thread continues after the spawn, chaining onto the
+        // The main thread continues after the spawn, chaining onto the
         // spawning assistant message (still the head).
         let last = add(&mut log, user_text("second question"));
 
@@ -576,10 +569,10 @@ mod tests {
             "the sub-agent spawn does not split the segment"
         );
         let seg = &tree.segments[0];
-        assert_eq!(seg.head, last, "head is the last user-thread entry");
+        assert_eq!(seg.head, last, "head is the last main-thread entry");
         assert_eq!(
             seg.message_count, 3,
-            "only user-thread Message entries counted (spawn root and sub message excluded)"
+            "only main-thread Message entries counted (spawn root and sub message excluded)"
         );
         assert!(seg.is_leaf);
     }

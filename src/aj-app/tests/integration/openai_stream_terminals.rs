@@ -14,7 +14,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, ServiceTier, StopReason,
     StreamOptions,
 };
-use aj_session::{ConversationEntryKind, ConversationLog, ConversationPersistence};
+use aj_session::{LogEntryKind, ProjectSessions, SessionLog};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
@@ -299,11 +299,11 @@ fn chat_completed(text: &str, usage: Option<(u64, u64)>) -> Vec<String> {
     events
 }
 
-fn persisted_assistants(log: &ConversationLog) -> Vec<AssistantMessage> {
+fn persisted_assistants(log: &SessionLog) -> Vec<AssistantMessage> {
     log.entries_in_order()
         .into_iter()
         .filter_map(|entry| match &entry.entry {
-            ConversationEntryKind::Message { message } => match message.as_stored_wire() {
+            LogEntryKind::Message { message } => match message.as_stored_wire() {
                 Some(Message::Assistant(message)) => Some(message.clone()),
                 _ => None,
             },
@@ -353,7 +353,7 @@ async fn a_preterminal_responses_failure_retries_once_and_persists_its_partial()
     let model = model("openai-responses", format!("{}/v1", server.base_url));
     let run_config = run_config(Arc::new(OpenAiResponsesProvider::default()), model);
     let root = TempDir::new().expect("session root");
-    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let persistence = ProjectSessions::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
 
     tokio::time::timeout(
@@ -368,6 +368,9 @@ async fn a_preterminal_responses_failure_retries_once_and_persists_its_partial()
 
     let mut events = Vec::new();
     while let Ok(frame) = frames.try_recv() {
+        let aj_session::Committed::Event(frame) = frame else {
+            continue;
+        };
         events.push(frame.event);
     }
     assert_eq!(event_counts(&events), (1, 1));
@@ -382,7 +385,7 @@ async fn a_preterminal_responses_failure_retries_once_and_persists_its_partial()
     assert_eq!(message_text(&messages[0]), "partial");
     assert_eq!(messages[1].stop_reason, StopReason::Stop);
     assert_eq!(message_text(&messages[1]), "recovered");
-    let stats = log.stats();
+    let stats = log.stats().unwrap();
     assert_eq!(stats.assistant_messages, 2);
     assert_eq!(agent.accumulated_usage().total_tokens, 25);
 }
@@ -405,7 +408,7 @@ async fn a_chat_finish_before_body_failure_is_not_reissued() {
     let model = model("openai-completions", format!("{}/v1", server.base_url));
     let run_config = run_config(Arc::new(OpenAiCompletionsProvider::default()), model);
     let root = TempDir::new().expect("session root");
-    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let persistence = ProjectSessions::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
 
     tokio::time::timeout(
@@ -420,6 +423,9 @@ async fn a_chat_finish_before_body_failure_is_not_reissued() {
 
     let mut events = Vec::new();
     while let Ok(frame) = frames.try_recv() {
+        let aj_session::Committed::Event(frame) = frame else {
+            continue;
+        };
         events.push(frame.event);
     }
     assert_eq!(event_counts(&events), (0, 1));
@@ -428,7 +434,7 @@ async fn a_chat_finish_before_body_failure_is_not_reissued() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].stop_reason, StopReason::Stop);
     assert_eq!(message_text(&messages[0]), "complete");
-    assert_eq!(log.stats().assistant_messages, 1);
+    assert_eq!(log.stats().unwrap().assistant_messages, 1);
 }
 
 #[tokio::test]
@@ -449,7 +455,7 @@ async fn a_responses_completion_before_body_failure_is_not_reissued() {
     let model = model("openai-responses", format!("{}/v1", server.base_url));
     let run_config = run_config(Arc::new(OpenAiResponsesProvider::default()), model);
     let root = TempDir::new().expect("session root");
-    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let persistence = ProjectSessions::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
 
     tokio::time::timeout(
@@ -464,6 +470,9 @@ async fn a_responses_completion_before_body_failure_is_not_reissued() {
 
     let mut events = Vec::new();
     while let Ok(frame) = frames.try_recv() {
+        let aj_session::Committed::Event(frame) = frame else {
+            continue;
+        };
         events.push(frame.event);
     }
     assert_eq!(event_counts(&events), (0, 1));
@@ -473,8 +482,8 @@ async fn a_responses_completion_before_body_failure_is_not_reissued() {
     assert_eq!(messages[0].stop_reason, StopReason::Stop);
     assert_eq!(message_text(&messages[0]), "complete");
     assert_eq!(messages[0].usage.total_tokens, 25);
-    assert_eq!(log.stats().assistant_messages, 1);
-    assert_eq!(log.stats().usage.total_tokens, 25);
+    assert_eq!(log.stats().unwrap().assistant_messages, 1);
+    assert_eq!(log.stats().unwrap().usage.total_tokens, 25);
 }
 
 #[tokio::test]
@@ -495,7 +504,7 @@ async fn a_retryable_provider_terminal_persists_spend_but_accumulates_only_succe
     let model = model("openai-responses", format!("{}/v1", server.base_url));
     let run_config = run_config(Arc::new(OpenAiResponsesProvider::default()), model);
     let root = TempDir::new().expect("session root");
-    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let persistence = ProjectSessions::new(root.path().join("sessions"));
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
 
     tokio::time::timeout(
@@ -510,6 +519,9 @@ async fn a_retryable_provider_terminal_persists_spend_but_accumulates_only_succe
 
     let mut events = Vec::new();
     while let Ok(frame) = frames.try_recv() {
+        let aj_session::Committed::Event(frame) = frame else {
+            continue;
+        };
         events.push(frame.event);
     }
     assert_eq!(event_counts(&events), (1, 1));
@@ -528,7 +540,7 @@ async fn a_retryable_provider_terminal_persists_spend_but_accumulates_only_succe
     assert_eq!(messages[1].stop_reason, StopReason::Stop);
     assert_eq!(messages[1].usage.total_tokens, 25);
 
-    let stats = log.stats();
+    let stats = log.stats().unwrap();
     assert_eq!(stats.assistant_messages, 2);
     assert_eq!((stats.usage.input, stats.usage.output), (30, 9));
     assert_eq!(stats.usage.total_tokens, 39);

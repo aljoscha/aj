@@ -15,7 +15,7 @@ use aj_models::types::{
     AssistantError, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
     StopReason, StreamOptions,
 };
-use aj_session::{ConversationLog, ConversationPersistence, ThreadFilter};
+use aj_session::{ProjectSessions, SessionLog, ThreadFilter};
 use tempfile::TempDir;
 
 use crate::cli::args::Args;
@@ -79,7 +79,7 @@ impl Provider for CredentialProvider {
 
 struct Store {
     dir: TempDir,
-    persistence: ConversationPersistence,
+    persistence: ProjectSessions,
     provider: Arc<CredentialProvider>,
 }
 
@@ -87,7 +87,7 @@ impl Store {
     async fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let store = Self {
-            persistence: ConversationPersistence::new(dir.path().join("sessions")),
+            persistence: ProjectSessions::new(dir.path().join("sessions")),
             dir,
             provider: Arc::new(CredentialProvider::default()),
         };
@@ -164,14 +164,14 @@ impl Store {
         Ok((output, message))
     }
 
-    fn log(&self) -> ConversationLog {
+    fn log(&self) -> SessionLog {
         let id = self.persistence.get_latest_session_id().unwrap().unwrap();
-        ConversationLog::resume(&self.persistence, &id).unwrap()
+        SessionLog::resume(&self.persistence, &id).unwrap()
     }
 
     fn assert_pin(&self, pin: Option<&str>) {
         let log = self.log();
-        let transcript = log.linearize(log.head().unwrap(), ThreadFilter::USER);
+        let transcript = log.linearize(log.head().unwrap(), ThreadFilter::MAIN);
         let expected = pin
             .map(|name| (PROVIDER.to_string(), name.to_string()))
             .into_iter()

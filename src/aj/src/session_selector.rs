@@ -688,7 +688,6 @@ mod tests {
             modified: last,
             created_at: last,
             last_message_at: last,
-            size_bytes: 1024,
             message_count: count,
             first_user_message: first_user.map(|s| s.to_string()),
             tag: None,
@@ -1343,7 +1342,6 @@ mod tests {
                 .unwrap()
                 .and_utc(),
             last_message_at: now - Duration::hours(2),
-            size_bytes: 0,
             message_count: 42,
             first_user_message: Some("refactor".into()),
             tag: None,

@@ -1,8 +1,10 @@
-//! The on-disk part of the host's session directory.
+//! The stored part of the host's session directory: the sessions the host
+//! is not holding live, as it last read them from the store.
 //!
 //! A `list` frame is produced on a coalescing tick whose frequent trigger is
-//! session events, so producing one may not touch the filesystem. It does
-//! not: a refresh reads [`ColdSessions::rows`], which is memory. The rows
+//! session events, so producing one may touch neither the database nor the
+//! filesystem. It does not: a refresh reads [`ColdSessions::rows`], which
+//! is memory. The rows
 //! are brought up to date at enumeration points, which are rare and externally
 //! paced (host startup, an explicit session listing, a stream attach), and by
 //! the host recording its own structural changes.
@@ -15,22 +17,20 @@
 //! to it is refused, since membership is answered off the store rather than off
 //! these rows.
 //!
-//! An enumeration does not open session logs. The only per-session file it
-//! opens is a tag sidecar, only for cold sessions that have one. Labels are
-//! read afresh at each enumeration point. The archived sidecars cost
-//! one more listing of the same directory and no read at all: the file's
-//! existence is the whole answer. A row itself is built from the `stat` the
-//! enumeration already did, which is what keeps host startup off the store's
-//! bytes: deriving a cold session's `last_seq` would cost a read of every log
-//! in the directory, and the row does not carry one.
+//! An enumeration asks the store for its listing, its labels, its archived
+//! ids and its locks, one question each, and never reads a session's
+//! records. Labels arrive loaded, except that of a cold session file that
+//! was never imported, which costs one read of its sidecar. Labels are read
+//! afresh at each enumeration point. A row keeps the fingerprint its
+//! listing gave it, and an activity stamp in place of a durable position:
+//! the position of a cold session is not worth a query per row.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use aj_session::{
-    ConversationError, ConversationPersistence, LockMetadata, SessionLock, SessionMetadata,
-    SidecarMetadata,
+    LockMetadata, ProjectSessions, SessionError, SessionLock, SessionMetadata, TagListing,
 };
 
 use crate::host::live::ReleasedRow;
@@ -42,68 +42,62 @@ use chrono::{DateTime, Utc};
 /// *not* perform, which the values it returns cannot show. The tests drive it
 /// with a store that counts them.
 pub(crate) trait SessionStore {
-    /// Every session log in the store, with its fingerprint. Opens no file.
-    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError>;
+    /// Every stored session with its fingerprint, without reading transcripts.
+    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionError>;
 
     /// The fingerprint of one session's log, `Ok(None)` when the store holds
-    /// no log under that id. One `stat`, no directory read.
-    fn session_metadata(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionMetadata>, ConversationError>;
+    /// no log under that id. A SQLite metadata query or JSONL `stat`, no
+    /// directory read.
+    fn session_metadata(&self, session_id: &str) -> Result<Option<SessionMetadata>, SessionError>;
 
-    /// Every tag sidecar in the store, with its fingerprint. One directory
-    /// read, and none at all for a store that has no tagged session.
-    fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError>;
+    /// Labels loaded from SQLite and unread legacy sidecars. Only listings
+    /// with no loaded tag need a separate `read_tag`.
+    fn enumerate_tags(&self) -> Result<Vec<TagListing>, SessionError>;
 
-    /// Every archived sidecar in the store, with its fingerprint. The same
-    /// one directory read, for the axis whose answer is the file's existence.
-    fn enumerate_archived(&self) -> Result<Vec<SidecarMetadata>, ConversationError>;
+    /// Archived session IDs. The listing is the whole answer for this axis.
+    fn enumerate_archived(&self) -> Result<Vec<String>, SessionError>;
 
     /// Every session lock in the store, with whether it carries a holder
     /// record. One directory read plus a `stat` each, and no lock is asked
     /// about.
-    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError>;
+    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, SessionError>;
 
     /// Whether a writer holds this session's lock right now. One non-blocking
     /// shared probe, which writes nothing.
-    fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError>;
+    fn probe_lock(&self, session_id: &str) -> Result<bool, SessionError>;
 
-    /// The tag in one session's sidecar, `Ok(None)` when it has none or its
-    /// sidecar says nothing usable. Opens the file and reads it.
-    fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError>;
+    /// Read one session's label, `Ok(None)` when it has none. Enumeration
+    /// needs this only for legacy listings without a loaded label.
+    fn read_tag(&self, session_id: &str) -> Result<Option<String>, SessionError>;
 }
 
-impl SessionStore for ConversationPersistence {
-    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
-        ConversationPersistence::list_sessions(self)
+impl SessionStore for ProjectSessions {
+    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionError> {
+        ProjectSessions::list_sessions(self)
     }
 
-    fn session_metadata(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionMetadata>, ConversationError> {
-        ConversationPersistence::session_metadata(self, session_id)
+    fn session_metadata(&self, session_id: &str) -> Result<Option<SessionMetadata>, SessionError> {
+        ProjectSessions::session_metadata(self, session_id)
     }
 
-    fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
-        ConversationPersistence::enumerate_tags(self)
+    fn enumerate_tags(&self) -> Result<Vec<TagListing>, SessionError> {
+        ProjectSessions::enumerate_tags(self)
     }
 
-    fn enumerate_archived(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
-        ConversationPersistence::enumerate_archived(self)
+    fn enumerate_archived(&self) -> Result<Vec<String>, SessionError> {
+        ProjectSessions::enumerate_archived(self)
     }
 
-    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError> {
+    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, SessionError> {
         SessionLock::enumerate_locks(self)
     }
 
-    fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
+    fn probe_lock(&self, session_id: &str) -> Result<bool, SessionError> {
         SessionLock::is_held(self, session_id)
     }
 
-    fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
-        ConversationPersistence::read_tag(self, session_id)
+    fn read_tag(&self, session_id: &str) -> Result<Option<String>, SessionError> {
+        ProjectSessions::read_tag(self, session_id)
     }
 }
 
@@ -115,11 +109,9 @@ impl SessionStore for ConversationPersistence {
 pub(crate) struct ColdSession {
     pub(crate) id: String,
     pub(crate) last_activity: DateTime<Utc>,
-    /// The session's label, `None` when it has no sidecar or none this host
-    /// could read.
+    /// The session's label, `None` when it has none this host could read.
     pub(crate) tag: Option<String>,
-    /// Whether the user has put the session away, which is the existence of
-    /// its archived sidecar.
+    /// Whether the user has put the session away.
     pub(crate) archived: bool,
     /// Whether a writer that is not this host holds the session's lock.
     pub(crate) locked: bool,
@@ -136,20 +128,21 @@ pub(crate) struct ColdSessions<S> {
     lock_probes: AtomicU64,
 }
 
-/// A log file's identity for caching: a file whose modification time and size
-/// have not moved cannot have changed shape.
+/// A session's identity for caching: one whose modification time and
+/// revision (see [`SessionMetadata::revision`]) have not moved cannot have
+/// changed shape.
 ///
 /// Not a content hash, so a rewrite that preserves both is invisible to it.
-/// Only a hand-edited log does that.
+/// Only a hand-edited JSONL file does that.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
     modified: DateTime<Utc>,
-    size: u64,
+    revision: u64,
 }
 
 impl Fingerprint {
-    fn of(modified: DateTime<Utc>, size: u64) -> Self {
-        Self { modified, size }
+    fn of(modified: DateTime<Utc>, revision: u64) -> Self {
+        Self { modified, revision }
     }
 }
 
@@ -182,9 +175,9 @@ struct Row {
 /// that [`ColdSessions::contains`] adds in between are not evicted until the
 /// next enumeration.
 ///
-/// Sidecars can outlive their logs. Labels also retain cleared publications
+/// Metadata can outlive its log. Labels also retain cleared publications
 /// while the session exists, so overlapping scans cannot resurrect a label
-/// after its sidecar has been removed.
+/// after its stored label has been removed.
 #[derive(Default)]
 struct Cache {
     /// The answer a refresh serves. What an enumeration point last found, plus
@@ -195,19 +188,18 @@ struct Cache {
     /// when its text is unchanged. A release records clears as `None` for the
     /// same reason. A cleared publication stays while its session exists.
     tags: HashMap<String, Arc<Option<String>>>,
-    /// One entry per session this host knows the archived bit of: those whose
-    /// sidecar a listing found, and those a release recorded. Absence is the
-    /// unarchived answer, which is what makes an unarchived store cost
-    /// nothing.
+    /// One entry per session this host knows the archived bit of: those a
+    /// listing found archived, and those a release recorded. Absence is the
+    /// unarchived answer.
     ///
     /// The bit is held rather than implied by the entry's presence, because a
-    /// listing only ever reports the sidecars that exist. An entry saying
+    /// listing only ever reports archived sessions. An entry saying
     /// `false` is what a release leaves behind to say the session was
     /// unarchived under its own lock, and it is what makes that release
     /// tellable from an id the cache never held (see
     /// [`ColdSessions::record_archived`]).
     ///
-    /// The listing's own report that the sidecar exists is the whole answer.
+    /// The listing's own report that a session is archived is the whole answer.
     archived: HashMap<String, bool>,
     /// The sessions a rival writer holds, as the host last established. Its
     /// members are the rows that read `locked`.
@@ -269,7 +261,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// The label this host holds for `id`, if it holds one.
     ///
     /// Touches no filesystem. What a materialization falls back to when it
-    /// cannot read the sidecar itself: a read that failed says nothing about
+    /// cannot read the stored metadata: a read that failed says nothing about
     /// the label (see [`Self::tag`]), and what the last enumeration or release
     /// recorded is the best answer left.
     pub(crate) fn label(&self, id: &str) -> Option<String> {
@@ -282,7 +274,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// Whether this host last knew `id` to be archived.
     ///
     /// Touches no filesystem. What a materialization falls back to when it
-    /// cannot read the sidecar itself, on the reasoning [`Self::label`] gives.
+    /// cannot read the stored metadata, on the reasoning [`Self::label`] gives.
     pub(crate) fn archived(&self, id: &str) -> bool {
         self.cache().archived.get(id).copied().unwrap_or(false)
     }
@@ -297,7 +289,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// stand rather than dropped, so a session released while this runs keeps
     /// the row its release recorded instead of falling out of the directory
     /// until the next enumeration point.
-    pub(crate) fn enumerate(&self, live: impl Fn(&str) -> bool) -> Result<(), ConversationError> {
+    pub(crate) fn enumerate(&self, live: impl Fn(&str) -> bool) -> Result<(), SessionError> {
         // What this scan is entitled to evict, taken before the directory read
         // so that everything in it predates this scan's view of the store.
         //
@@ -337,43 +329,34 @@ impl<S: SessionStore> ColdSessions<S> {
                 );
             }
         }
-        // The second directory read, over `meta/`. A store with no tagged
-        // session has no such directory, so this costs one failed open and
-        // reads nothing.
-        //
-        // A sidecar directory we cannot read costs the labels their refresh
-        // and nothing else: a label is display metadata, and one that cannot
-        // be re-read must not take a session's row down with it. The cached
-        // labels stand until a scan gets a look at the files again, which is
-        // also why nothing is evicted on this path.
-        match self.enumerate_sidecars() {
-            Ok(sidecars) => {
-                for sidecar in &sidecars {
-                    // A live session's label is the host's own, held in memory
-                    // and handed to the cold cache by its release, so reading
-                    // the file would only offer a staler answer.
-                    if live(&sidecar.session_id) {
+        // Labels refresh independently of rows. A failed enumeration says
+        // nothing about the labels, so cached publications stand until the
+        // store can be read again.
+        match self.enumerate_tags() {
+            Ok(tags) => {
+                for tag in &tags {
+                    // A live session answers from its driver's memory. Its
+                    // release hands that label to the cache.
+                    if live(&tag.session_id) {
                         continue;
                     }
-                    self.tag(&sidecar.session_id, labelled.get(&sidecar.session_id));
+                    self.tag(tag, labelled.get(&tag.session_id));
                 }
-                self.clear_missing_tags(&sidecars, &enumerated, &labelled);
+                self.clear_missing_tags(&tags, &enumerated, &labelled);
             }
-            Err(err) => tracing::warn!("could not read the store's tag sidecars: {err}"),
+            Err(err) => tracing::warn!("could not read the store's labels: {err}"),
         }
-        // The third, over the same directory for the second sidecar axis. It
-        // costs one more `readdir` at an enumeration point and no per-file
-        // read at all, since the sidecar's existence is the whole answer.
-        match self.enumerate_archived_sidecars() {
-            Ok(sidecars) => self.record_archived(&sidecars, &filed),
-            Err(err) => tracing::warn!("could not read the store's archived sidecars: {err}"),
+        // Archive metadata is a separate enumeration, with no per-session read.
+        match self.enumerate_archived() {
+            Ok(ids) => self.record_archived(&ids, &filed),
+            Err(err) => tracing::warn!("could not read the store's archived sessions: {err}"),
         }
         // The fourth, over `locks/`, for the one axis whose fact belongs to
         // another writer. A stat per lock file, and a probe only of
         // the ones a stat shows a holder record on.
         //
         // A directory this host cannot read costs the axis its refresh and
-        // nothing else, on the same reasoning as the tag sidecars: the bit is a
+        // nothing else, on the same reasoning as the labels: the bit is a
         // hint, and one that cannot be re-established must not take a row down
         // with it.
         match self.enumerate_locks() {
@@ -472,19 +455,18 @@ impl<S: SessionStore> ColdSessions<S> {
     /// on. Only [`Self::enumerate`] reads the directory: a membership question
     /// is answered off a single `stat` (see [`Self::contains`]).
     ///
-    /// The store's own directory. The sidecar one an enumeration also reads
-    /// has its own counter, [`Self::sidecar_directory_reads`].
+    /// Session enumeration. Label and archive enumeration have their own
+    /// counter, [`Self::sidecar_directory_reads`].
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn directory_reads(&self) -> u64 {
         self.directory_reads.load(Ordering::Relaxed)
     }
 
-    /// How many times this has read the store's `meta/` directory.
+    /// How many label and archive enumerations reached the store.
     ///
-    /// The same contract as [`Self::directory_reads`], for the sidecar
-    /// directory an enumeration also reads, once per axis. It needs its own
-    /// counter because a readdir and a `stat` transfer no bytes. A refresh
-    /// that listed the sidecars would be invisible to a byte-read budget.
+    /// Counted once per axis, whether it is a database query or a read of
+    /// a JSONL sidecar directory. A refresh must perform neither, even when
+    /// no transcript bytes are read.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn sidecar_directory_reads(&self) -> u64 {
         self.sidecar_directory_reads.load(Ordering::Relaxed)
@@ -504,7 +486,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// How many times this has read the store's lock directory.
     ///
     /// One read per enumeration point, never one per session: the same shape
-    /// the sidecar axes are swept with, and the number the `locked` axis's
+    /// the metadata axes are swept with, and the number the `locked` axis's
     /// cost budget is about.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn lock_directory_reads(&self) -> u64 {
@@ -539,7 +521,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// directory twice, once live and once cold, until the next enumeration
     /// drops the alias. Unreachable through a client that only ever echoes ids
     /// the directory gave it.
-    pub(crate) fn contains(&self, id: &str) -> Result<bool, ConversationError> {
+    pub(crate) fn contains(&self, id: &str) -> Result<bool, SessionError> {
         self.membership_lookups.fetch_add(1, Ordering::Relaxed);
         Ok(self.store.session_metadata(id)?.is_some())
     }
@@ -572,18 +554,24 @@ impl<S: SessionStore> ColdSessions<S> {
             .insert(file.session_id.clone(), Arc::new(tag.clone()));
         // The bit the driver held, including a cleared bit: an entry saying
         // the session is not archived is how a release states what it did
-        // under the session's lock, which a sidecar listing taken before that
+        // under the session's lock, which a metadata listing taken before that
         // write must not undo (see [`Self::record_archived`]).
         cache.archived.insert(file.session_id.clone(), *archived);
     }
 
-    /// Read a cold label without holding the directory lock. Only replace the
-    /// publication this scan started with, so a concurrent release wins.
+    /// Use a loaded label or read a legacy sidecar without the directory lock.
+    /// Only replace the publication this scan started with, so a concurrent
+    /// release wins regardless of where the label was read.
     ///
     /// A failed read leaves the known label alone rather than recording
     /// "untagged": the failure says nothing about the label.
-    fn tag(&self, session_id: &str, before: Option<&Arc<Option<String>>>) {
-        let tag = match self.store.read_tag(session_id) {
+    fn tag(&self, listing: &TagListing, before: Option<&Arc<Option<String>>>) {
+        let session_id = &listing.session_id;
+        let tag = match &listing.tag {
+            Some(tag) => Ok(Some(tag.clone())),
+            None => self.store.read_tag(session_id),
+        };
+        let tag = match tag {
             Ok(tag) => tag,
             Err(err) => {
                 tracing::warn!(
@@ -622,21 +610,18 @@ impl<S: SessionStore> ColdSessions<S> {
         cache.rows.retain(|id, _| !gone(id));
     }
 
-    /// Clear labels whose sidecars are gone, without undoing publications that
+    /// Clear labels absent from the listing, without undoing publications that
     /// arrived during the scan. Keep the clear while its session exists: an
     /// older scan may have started with no label and still be reading one.
     /// Removing the clear would let that scan mistake absence for permission
     /// to publish its stale read.
     fn clear_missing_tags(
         &self,
-        sidecars: &[SidecarMetadata],
+        tags: &[TagListing],
         sessions: &[SessionMetadata],
         labelled: &HashMap<String, Arc<Option<String>>>,
     ) {
-        let present: HashSet<&str> = sidecars
-            .iter()
-            .map(|sidecar| sidecar.session_id.as_str())
-            .collect();
+        let present: HashSet<&str> = tags.iter().map(|tag| tag.session_id.as_str()).collect();
         let sessions: HashSet<&str> = sessions
             .iter()
             .map(|session| session.session_id.as_str())
@@ -656,12 +641,11 @@ impl<S: SessionStore> ColdSessions<S> {
         });
     }
 
-    /// Fold the archived listing into the cache: the sidecars it found say
-    /// their sessions are archived, and the entries whose sidecars are gone
-    /// leave.
+    /// Fold the archived listing into the cache: listed sessions are archived,
+    /// and entries absent from the listing leave.
     ///
     /// One pass under one guard, where the label needs two, because this axis
-    /// opens no file: the listing is the entire answer, so there is no read to
+    /// needs no per-session read: the listing is the entire answer, with no I/O to
     /// keep out of the lock.
     ///
     /// `filed` is what the cache held before this scan read anything, and both
@@ -670,56 +654,51 @@ impl<S: SessionStore> ColdSessions<S> {
     /// listing does, a release recording the bit its driver held under the
     /// session's own lock, and the scan neither overwrites nor evicts it. The
     /// bit has to be compared, not just the entry's presence: a listing
-    /// reports only the sidecars that exist, so without the release's own
+    /// reports only archived sessions, so without the release's own
     /// `false` an unarchive that landed mid-scan would read as an id the cache
     /// never held and be quietly re-archived until the next enumeration point.
     ///
     /// The comparison catches a republished entry, it does not prove one is
     /// absent. A session archived and unarchived again while the scan ran
     /// leaves the value it started at and is written from the listing, which
-    /// stands until the next enumeration point. The window is the tail of one
-    /// `readdir` and no test can reach it; recording a generation per entry is
-    /// what closing it would cost, for a race between a scan and two commands
-    /// on one session.
+    /// stands until the next enumeration point. Recording a generation per
+    /// entry would close this race between a scan and two commands on one session.
     ///
     /// A live session's entry is written like any other. Nothing reads it
     /// while the session is live, a directory answers a live row from the
     /// host's own status, and its release overwrites the entry with what its
     /// driver held.
-    fn record_archived(&self, sidecars: &[SidecarMetadata], filed: &HashMap<String, bool>) {
-        let present: HashSet<&str> = sidecars
-            .iter()
-            .map(|sidecar| sidecar.session_id.as_str())
-            .collect();
+    fn record_archived(&self, archived: &[String], filed: &HashMap<String, bool>) {
+        let present: HashSet<&str> = archived.iter().map(String::as_str).collect();
         let mut cache = self.cache();
         let gone = |id: &String, held: &bool| {
             filed.get(id) == Some(held) && !present.contains(id.as_str())
         };
         cache.archived.retain(|id, held| !gone(id, held));
-        for sidecar in sidecars {
-            if cache.archived.get(&sidecar.session_id) != filed.get(&sidecar.session_id) {
+        for id in archived {
+            if cache.archived.get(id) != filed.get(id) {
                 continue;
             }
-            cache.archived.insert(sidecar.session_id.clone(), true);
+            cache.archived.insert(id.clone(), true);
         }
     }
 
-    fn enumerate_store(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+    fn enumerate_store(&self) -> Result<Vec<SessionMetadata>, SessionError> {
         self.directory_reads.fetch_add(1, Ordering::Relaxed);
         self.store.list_sessions()
     }
 
-    fn enumerate_sidecars(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
+    fn enumerate_tags(&self) -> Result<Vec<TagListing>, SessionError> {
         self.sidecar_directory_reads.fetch_add(1, Ordering::Relaxed);
         self.store.enumerate_tags()
     }
 
-    fn enumerate_archived_sidecars(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
+    fn enumerate_archived(&self) -> Result<Vec<String>, SessionError> {
         self.sidecar_directory_reads.fetch_add(1, Ordering::Relaxed);
         self.store.enumerate_archived()
     }
 
-    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError> {
+    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, SessionError> {
         self.lock_directory_reads.fetch_add(1, Ordering::Relaxed);
         self.store.enumerate_locks()
     }
@@ -727,7 +706,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// Ask the filesystem whether a rival holds one session's lock.
     ///
     /// Counted, because a probe transfers no bytes and no budget can see it.
-    pub(crate) fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
+    pub(crate) fn probe_lock(&self, session_id: &str) -> Result<bool, SessionError> {
         self.lock_probes.fetch_add(1, Ordering::Relaxed);
         self.store.probe_lock(session_id)
     }
@@ -738,7 +717,7 @@ impl<S: SessionStore> ColdSessions<S> {
 }
 
 fn fingerprint(metadata: &SessionMetadata) -> Fingerprint {
-    Fingerprint::of(metadata.modified_at, metadata.size_bytes)
+    Fingerprint::of(metadata.modified_at, metadata.revision)
 }
 
 #[cfg(test)]
@@ -749,10 +728,12 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         files: StdMutex<Vec<FakeFile>>,
-        sidecars: StdMutex<Vec<FakeSidecar>>,
-        /// The archived sidecars, by id and modification time. No contents:
-        /// the file's existence is the bit, so this axis has no read at all.
-        archived: StdMutex<Vec<(String, i64)>>,
+        sidecars: StdMutex<Vec<FakeTag>>,
+        tag_reads: StdMutex<Vec<String>>,
+        /// Archived session IDs. The listing is the whole answer.
+        archived: StdMutex<Vec<String>>,
+        /// Run after labels are captured, before the scan publishes them.
+        during_tag_listing: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Set to fail the read of the sidecar directory, as a permission
         /// change on `meta/` does.
         sidecars_unreadable: StdMutex<bool>,
@@ -801,27 +782,18 @@ mod tests {
         size: u64,
     }
 
-    /// One tag sidecar, independent of the session log.
+    /// One label, either loaded in the listing or deferred to a legacy read.
     #[derive(Clone)]
-    struct FakeSidecar {
+    struct FakeTag {
         id: String,
-        /// Epoch seconds, the sidecar's own modification time.
-        modified: i64,
+        /// Whether enumeration returns the label without a separate read.
+        loaded: bool,
         /// What the sidecar reads as, `None` for one that says nothing usable.
         tag: Option<String>,
         /// Whether the store can read the file at all. A sidecar that cannot
         /// be read is a different answer from one that reads as untagged, and
         /// the cache is only allowed to remember the second.
         readable: bool,
-    }
-
-    impl FakeSidecar {
-        /// The file size reported by the listing.
-        fn size(&self) -> u64 {
-            self.tag.as_ref().map_or(0, |tag| {
-                u64::try_from(tag.len()).expect("a label fits a u64")
-            })
-        }
     }
 
     impl FakeFile {
@@ -835,7 +807,7 @@ mod tests {
     }
 
     impl SessionStore for FakeStore {
-        fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+        fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionError> {
             // `list` preserves the store's order, and the real one is
             // latest-first. Ascending here, so assertions read in order.
             let mut files = self.files.lock().expect("files").clone();
@@ -852,7 +824,7 @@ mod tests {
         fn session_metadata(
             &self,
             session_id: &str,
-        ) -> Result<Option<SessionMetadata>, ConversationError> {
+        ) -> Result<Option<SessionMetadata>, SessionError> {
             // A `stat` of one path: it does not touch the directory, which is
             // what the `directory_reads` assertions rest on.
             Ok(self
@@ -860,23 +832,31 @@ mod tests {
                 .map(|file| SessionMetadata::new(file.id, at(file.modified), file.size)))
         }
 
-        fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
+        fn enumerate_tags(&self) -> Result<Vec<TagListing>, SessionError> {
             if *self.sidecars_unreadable.lock().expect("readable") {
                 return Err(std::io::Error::other("meta/ is not readable").into());
             }
             let mut sidecars = self.sidecars.lock().expect("sidecars").clone();
             sidecars.sort_by(|left, right| left.id.cmp(&right.id));
-            Ok(sidecars
+            let listed = sidecars
                 .iter()
-                .map(|sidecar| SidecarMetadata {
+                .map(|sidecar| TagListing {
                     session_id: sidecar.id.clone(),
-                    modified_at: at(sidecar.modified),
-                    size_bytes: sidecar.size(),
+                    tag: if sidecar.loaded {
+                        sidecar.tag.clone()
+                    } else {
+                        None
+                    },
                 })
-                .collect())
+                .collect();
+            let interleave = self.during_tag_listing.lock().expect("hook").take();
+            if let Some(interleave) = interleave {
+                interleave();
+            }
+            Ok(listed)
         }
 
-        fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError> {
+        fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, SessionError> {
             if *self.locks_unreadable.lock().expect("readable") {
                 return Err(std::io::Error::other("locks/ is not readable").into());
             }
@@ -895,7 +875,7 @@ mod tests {
             Ok(listed)
         }
 
-        fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
+        fn probe_lock(&self, session_id: &str) -> Result<bool, SessionError> {
             self.probes
                 .lock()
                 .expect("probes")
@@ -908,7 +888,11 @@ mod tests {
                 .any(|lock| lock.id == session_id && lock.held))
         }
 
-        fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
+        fn read_tag(&self, session_id: &str) -> Result<Option<String>, SessionError> {
+            self.tag_reads
+                .lock()
+                .expect("reads")
+                .push(session_id.to_string());
             let sidecar = self.sidecar(session_id);
             if sidecar.as_ref().is_some_and(|sidecar| !sidecar.readable) {
                 return Err(std::io::Error::other("the sidecar is not readable").into());
@@ -922,25 +906,16 @@ mod tests {
             Ok(read)
         }
 
-        fn enumerate_archived(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
+        fn enumerate_archived(&self) -> Result<Vec<String>, SessionError> {
             if *self.sidecars_unreadable.lock().expect("readable") {
                 return Err(std::io::Error::other("meta/ is not readable").into());
             }
             let mut archived = self.archived.lock().expect("archived").clone();
             archived.sort();
-            let listed: Vec<SidecarMetadata> = archived
-                .iter()
-                .map(|(id, modified)| SidecarMetadata {
-                    session_id: id.clone(),
-                    modified_at: at(*modified),
-                    // An archived sidecar is empty: its existence is the bit.
-                    size_bytes: 0,
-                })
-                .collect();
             if let Some(interleave) = self.during_archived_listing.lock().expect("hook").take() {
                 interleave();
             }
-            Ok(listed)
+            Ok(archived)
         }
     }
 
@@ -954,7 +929,7 @@ mod tests {
                 .cloned()
         }
 
-        fn sidecar(&self, id: &str) -> Option<FakeSidecar> {
+        fn sidecar(&self, id: &str) -> Option<FakeTag> {
             self.sidecars
                 .lock()
                 .expect("sidecars")
@@ -963,12 +938,20 @@ mod tests {
                 .cloned()
         }
 
-        /// Label `id` at sidecar modification time `modified`, as a tag
-        /// command's atomic rewrite would.
-        fn tag(&self, id: &str, tag: &str, modified: i64) {
-            self.write_sidecar(FakeSidecar {
+        /// A legacy label whose contents enumeration defers.
+        fn tag(&self, id: &str, tag: &str) {
+            self.write_sidecar(FakeTag {
                 id: id.to_string(),
-                modified,
+                loaded: false,
+                tag: Some(tag.to_string()),
+                readable: true,
+            });
+        }
+
+        fn loaded_tag(&self, id: &str, tag: &str) {
+            self.write_sidecar(FakeTag {
+                id: id.to_string(),
+                loaded: true,
                 tag: Some(tag.to_string()),
                 readable: true,
             });
@@ -984,7 +967,7 @@ mod tests {
             sidecar.readable = readable;
         }
 
-        fn write_sidecar(&self, sidecar: FakeSidecar) {
+        fn write_sidecar(&self, sidecar: FakeTag) {
             let mut sidecars = self.sidecars.lock().expect("sidecars");
             sidecars.retain(|held| held.id != sidecar.id);
             sidecars.push(sidecar);
@@ -1031,16 +1014,18 @@ mod tests {
             *self.during_tag_read.lock().expect("hook") = Some(Box::new(interleave));
         }
 
+        fn during_tag_listing(&self, interleave: impl FnOnce() + Send + 'static) {
+            *self.during_tag_listing.lock().expect("hook") = Some(Box::new(interleave));
+        }
+
         fn during_archived_listing(&self, interleave: impl FnOnce() + Send + 'static) {
             *self.during_archived_listing.lock().expect("hook") = Some(Box::new(interleave));
         }
 
-        /// Archive `id` at sidecar modification time `modified`, as the
-        /// archive command's create does.
-        fn archive(&self, id: &str, modified: i64) {
+        fn archive(&self, id: &str) {
             let mut archived = self.archived.lock().expect("archived");
-            archived.retain(|(held, _)| held != id);
-            archived.push((id.to_string(), modified));
+            archived.retain(|held| held != id);
+            archived.push(id.to_string());
         }
 
         /// Unarchive `id`, which removes its sidecar.
@@ -1078,7 +1063,7 @@ mod tests {
             self.archived
                 .lock()
                 .expect("archived")
-                .retain(|(held, _)| held != id);
+                .retain(|held| held != id);
         }
 
         fn remove(&self, id: &str) {
@@ -1414,13 +1399,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn loaded_labels_need_no_per_session_read() {
+        let store = FakeStore::default();
+        for id in ["loaded", "legacy", "live"] {
+            store.put(id, 5);
+        }
+        store.loaded_tag("loaded", "from listing");
+        store.tag("legacy", "from sidecar");
+        store.loaded_tag("live", "stale");
+        let cold = ColdSessions::new(store);
+        cold.note_released(&ReleasedRow {
+            tag: Some("driver label".to_string()),
+            ..released("live", 5, 100)
+        });
+
+        cold.enumerate(|id| id == "live").expect("enumerate");
+        assert_eq!(
+            labelled(cold.rows()),
+            [
+                ("legacy".to_string(), Some("from sidecar".to_string())),
+                ("live".to_string(), Some("driver label".to_string())),
+                ("loaded".to_string(), Some("from listing".to_string())),
+            ]
+        );
+        assert_eq!(*cold.store.tag_reads.lock().expect("reads"), ["legacy"]);
+        assert_eq!(
+            (cold.directory_reads(), cold.sidecar_directory_reads()),
+            (1, 2)
+        );
+
+        cold.store.loaded_tag("loaded", "updated listing");
+        cold.enumerate(|id| id == "live").expect("enumerate");
+        assert_eq!(cold.label("loaded").as_deref(), Some("updated listing"));
+        cold.store.untag("loaded");
+        cold.enumerate(|id| id == "live").expect("enumerate");
+        assert_eq!(cold.label("loaded"), None);
+        assert_eq!(
+            *cold.store.tag_reads.lock().expect("reads"),
+            ["legacy", "legacy", "legacy"]
+        );
+    }
+
+    #[test]
+    fn a_release_outranks_an_already_loaded_label() {
+        for tag in [Some("same label"), None] {
+            let store = FakeStore::default();
+            store.put("a", 5);
+            let cold = Arc::new(ColdSessions::new(store));
+            cold.note_released(&ReleasedRow {
+                tag: tag.map(str::to_string),
+                ..released("a", 5, 100)
+            });
+            cold.store.loaded_tag("a", "stale");
+            cold.store
+                .during_tag_read(|| panic!("a loaded label was read again"));
+            let releasing = Arc::downgrade(&cold);
+            cold.store.during_tag_listing(move || {
+                let cold = releasing.upgrade().expect("the cache outlives the scan");
+                cold.note_released(&ReleasedRow {
+                    tag: tag.map(str::to_string),
+                    ..released("a", 5, 100)
+                });
+                if tag.is_none() {
+                    cold.store.untag("a");
+                    cold.enumerate(|_| false).expect("overlapping scan");
+                }
+            });
+
+            cold.enumerate(|_| false).expect("enumerate");
+            assert_eq!(
+                labelled(cold.rows()),
+                [("a".to_string(), tag.map(str::to_string))]
+            );
+        }
+    }
+
     /// A label follows its sidecar, not its log: clearing a tag removes the
     /// file, and the row stays in the directory having lost only its label.
     #[test]
     fn a_cleared_label_leaves_the_row_behind() {
         let store = FakeStore::default();
         store.put("a", 5);
-        store.tag("a", "fix-auth", 6);
+        store.tag("a", "fix-auth");
         let cold = ColdSessions::new(store);
         cold.enumerate(|_| false).expect("enumerate");
         assert_eq!(
@@ -1445,7 +1506,7 @@ mod tests {
     fn a_live_sessions_sidecar_is_not_read() {
         let store = FakeStore::default();
         store.put("live", 5);
-        store.tag("live", "on disk", 6);
+        store.tag("live", "on disk");
         let cold = ColdSessions::new(store);
 
         cold.store
@@ -1482,7 +1543,7 @@ mod tests {
     fn a_release_without_a_label_clears_the_cached_one() {
         let store = FakeStore::default();
         store.put("a", 5);
-        store.tag("a", "fix-auth", 6);
+        store.tag("a", "fix-auth");
         let cold = ColdSessions::new(store);
         cold.enumerate(|_| false).expect("enumerate");
         assert_eq!(
@@ -1508,21 +1569,21 @@ mod tests {
         let store = FakeStore::default();
         store.put("a", 5);
         store.put("held", 5);
-        store.tag("a", "fix-auth", 6);
+        store.tag("a", "fix-auth");
         let cold = Arc::new(ColdSessions::new(store));
         // A first scan, so both sessions have rows and "a" has a label.
         cold.enumerate(|_| false).expect("enumerate");
 
         // "a" is relabelled, which is what gives the next scan a sidecar to
         // read and so a window for the release below to land in.
-        cold.store.tag("a", "fix-auth-again", 7);
+        cold.store.tag("a", "fix-auth-again");
         let releasing = Arc::downgrade(&cold);
         cold.store.during_tag_read(move || {
             let cold = releasing.upgrade().expect("the cache outlives the scan");
             // "held" was labelled while it was live and released with the
             // label its driver held. Its sidecar is on disk too, but the scan
             // took its listing before the file existed.
-            cold.store.tag("held", "live label", 9);
+            cold.store.tag("held", "live label");
             cold.note_released(&ReleasedRow {
                 tag: Some("live label".to_string()),
                 ..released("held", 5, 100)
@@ -1552,21 +1613,21 @@ mod tests {
         let store = FakeStore::default();
         store.put("a", 5);
         store.put("b", 5);
-        store.tag("a", "old", 6);
-        store.tag("b", "b-label", 6);
+        store.tag("a", "old");
+        store.tag("b", "b-label");
         let cold = Arc::new(ColdSessions::new(store));
         cold.enumerate(|_| false).expect("enumerate");
 
         // "a" is cleared, so the next scan's listing will not carry it, and
         // "b" is relabelled, which gives that scan a sidecar to read.
         cold.store.untag("a");
-        cold.store.tag("b", "b-again", 7);
+        cold.store.tag("b", "b-again");
         let releasing = Arc::downgrade(&cold);
         cold.store.during_tag_read(move || {
             let cold = releasing.upgrade().expect("the cache outlives the scan");
             // "a" was materialized and relabelled after the listing was
             // taken, then released with the label its driver held.
-            cold.store.tag("a", "re-tagged", 9);
+            cold.store.tag("a", "re-tagged");
             cold.note_released(&ReleasedRow {
                 tag: Some("re-tagged".to_string()),
                 ..released("a", 5, 100)
@@ -1596,18 +1657,18 @@ mod tests {
             let store = FakeStore::default();
             store.put("a", 5);
             if let Some(initial) = initial {
-                store.tag("a", initial, 6);
+                store.tag("a", initial);
             }
             let cold = Arc::new(ColdSessions::new(store));
             cold.enumerate(|_| false).expect("enumerate");
             assert_eq!(cold.label("a").as_deref(), initial);
-            cold.store.tag("a", "stale", 7);
+            cold.store.tag("a", "stale");
 
             let releasing = Arc::downgrade(&cold);
             cold.store.during_tag_read(move || {
                 let cold = releasing.upgrade().expect("the cache outlives the scan");
                 match tag {
-                    Some(tag) => cold.store.tag("a", tag, 8),
+                    Some(tag) => cold.store.tag("a", tag),
                     None => cold.store.untag("a"),
                 }
                 cold.note_released(&ReleasedRow {
@@ -1640,7 +1701,7 @@ mod tests {
     fn an_unreadable_sidecar_leaves_the_cached_label_alone() {
         let store = FakeStore::default();
         store.put("a", 5);
-        store.tag("a", "fix-auth", 6);
+        store.tag("a", "fix-auth");
         let cold = ColdSessions::new(store);
         cold.enumerate(|_| false).expect("enumerate");
         assert_eq!(
@@ -1649,7 +1710,7 @@ mod tests {
         );
 
         // An unreadable replacement does not erase the known label.
-        cold.store.tag("a", "relabelled", 7);
+        cold.store.tag("a", "relabelled");
         cold.store.sidecar_readable("a", false);
         for _ in 0..3 {
             cold.enumerate(|_| false).expect("enumerate");
@@ -1677,8 +1738,8 @@ mod tests {
     fn a_refresh_reads_neither_directory() {
         let store = FakeStore::default();
         store.put("a", 2);
-        store.tag("a", "fix-auth", 3);
-        store.archive("a", 3);
+        store.tag("a", "fix-auth");
+        store.archive("a");
         let cold = ColdSessions::new(store);
         cold.enumerate(|_| false).expect("enumerate");
         assert_eq!(cold.directory_reads(), 1);
@@ -1720,7 +1781,7 @@ mod tests {
         let store = FakeStore::default();
         store.put("a", 5);
         store.put("b", 5);
-        store.tag("a", "fix-auth", 6);
+        store.tag("a", "fix-auth");
         let cold = ColdSessions::new(store);
         cold.enumerate(|_| false).expect("enumerate");
 
@@ -1756,7 +1817,7 @@ mod tests {
         let store = FakeStore::default();
         store.put("a", 5);
         store.put("b", 5);
-        store.archive("a", 6);
+        store.archive("a");
         let cold = ColdSessions::new(store);
         cold.store
             .during_tag_read(|| panic!("an archived bit read a tag sidecar"));
@@ -1790,7 +1851,7 @@ mod tests {
 
         // Archived while live: the driver wrote the sidecar under the
         // session's lock and carried the bit in its status.
-        cold.store.archive("live", 9);
+        cold.store.archive("live");
         cold.note_released(&ReleasedRow {
             archived: true,
             ..released("live", 5, 100)
@@ -1836,7 +1897,7 @@ mod tests {
             // Materialized, archived and released while this scan runs: the
             // sidecar is on disk, but the scan listed the directory before it
             // was written.
-            cold.store.archive("held", 9);
+            cold.store.archive("held");
             cold.note_released(&ReleasedRow {
                 archived: true,
                 ..released("held", 5, 100)
@@ -1866,7 +1927,7 @@ mod tests {
     fn a_scan_does_not_re_archive_a_session_a_release_freed() {
         let store = FakeStore::default();
         store.put("held", 5);
-        store.archive("held", 6);
+        store.archive("held");
         let cold = Arc::new(ColdSessions::new(store));
         // A first scan, so the cache holds the bit pinned to the sidecar.
         cold.enumerate(|_| false).expect("enumerate");

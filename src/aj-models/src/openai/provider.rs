@@ -10,7 +10,7 @@
 //!
 //! Reasoning is **one-way** on this provider: streaming
 //! `delta.reasoning_content` is captured into a [`ThinkingContent`]
-//! block so the UI can render it live, but prior-turn thinking blocks
+//! block so the UI can render it live, but earlier thinking blocks
 //! are dropped on outbound requests because the public Chat
 //! Completions API does not accept reasoning content on input.
 //! Multi-turn reasoning continuity requires the OpenAI Responses
@@ -408,7 +408,7 @@ fn build_request(
 /// Build the system / developer message for the request.
 ///
 /// reasoning-capable models receive the prompt as a `developer`
-/// turn (consistent with OpenAI's GPT-5 / o-series convention);
+/// message (consistent with OpenAI's GPT-5 / o-series convention);
 /// everything else takes the classic `system` slot.
 fn build_system_message(model: &ModelInfo, prompt: &str) -> ChatCompletionRequestMessage {
     if model.reasoning {
@@ -428,7 +428,7 @@ fn build_system_message(model: &ModelInfo, prompt: &str) -> ChatCompletionReques
 /// message carrying any image parts (the API doesn't accept images
 /// inside `tool` content). Empty assistant messages — typically the
 /// residue of an aborted prior stream — are dropped because the API
-/// rejects assistant turns that are entirely empty.
+/// rejects assistant messages that are entirely empty.
 fn convert_messages(messages: &[Message], out: &mut Vec<ChatCompletionRequestMessage>) {
     for msg in messages {
         match msg {
@@ -455,7 +455,7 @@ fn convert_user_message(m: &UserMessage) -> ChatCompletionRequestMessage {
     let parts: Vec<ChatCompletionUserContentPart> =
         m.content.iter().map(user_content_to_part).collect();
     let content = if parts.iter().all(is_text_part) {
-        // All-text turns serialize as the cheaper `string` shape so the
+        // All-text messages serialize as the cheaper `string` shape so the
         // wire matches what most callers expect.
         let combined = parts
             .iter()
@@ -494,13 +494,13 @@ fn is_text_part(p: &ChatCompletionUserContentPart) -> bool {
 }
 
 /// Translate an [`AssistantMessage`] into a Chat Completions
-/// `assistant` turn.
+/// `assistant` message.
 ///
 /// thinking blocks are dropped (reasoning is not accepted on
 /// input here), tool calls flatten into the `tool_calls` array, and
 /// text blocks concatenate into a single string. Returns `None` when
 /// the assistant message carries no text and no tool calls — empty
-/// assistant turns get rejected by the API.
+/// assistant messages get rejected by the API.
 fn convert_assistant_message(m: &AssistantMessage) -> Option<ChatCompletionRequestMessage> {
     let mut text_buf = String::new();
     let mut tool_calls: Vec<ChatToolCall> = Vec::new();
@@ -545,7 +545,7 @@ fn convert_assistant_message(m: &AssistantMessage) -> Option<ChatCompletionReque
 /// optional `user` follow-up carrying any image parts.
 ///
 /// Chat Completions' `tool` role only accepts text, so image
-/// attachments from the tool ride along as a subsequent `user` turn.
+/// attachments from the tool ride along as a subsequent `user` message.
 fn convert_tool_result(
     t: &ToolResultMessage,
 ) -> (
@@ -600,12 +600,12 @@ fn convert_tool_result(
 
 /// Project an [`AssistantMessage`] onto the Chat Completions request item
 /// shape — the [`ChatCompletionRequestMessage::Assistant`] entry that
-/// gets sent as part of `messages[]` on a follow-up turn.
+/// gets sent as part of `messages[]` on a follow-up request.
 ///
 /// Serialize side of the round-trip invariant for
 /// `openai-completions`. Same projection the provider uses internally
 /// when building a request body, exposed publicly so the round-trip
-/// test suite (and any future caller that wants a single assistant turn
+/// test suite (and any future caller that wants a single assistant message
 /// materialized into its wire form) can reach it directly.
 ///
 /// Behaviour follows:
@@ -618,7 +618,7 @@ fn convert_tool_result(
 /// - Tool calls flatten into the `tool_calls` array, with each block's
 ///   JSON [`Value`] arguments serialized to a string per the wire shape.
 ///
-/// Returns `None` when the assistant turn carries no text and no tool
+/// Returns `None` when the assistant message carries no text and no tool
 /// calls — empty assistant messages are rejected by the API. Callers
 /// projecting a streamed message that has at least one block can rely
 /// on `Some(...)`; the streaming parser never produces empty messages
@@ -648,7 +648,7 @@ pub fn assistant_message_to_request_item(
 /// - `tool_calls` → [`AssistantContent::ToolCall`], one per entry, in
 ///   array order. The wire `function.arguments` string is parsed as
 ///   strict JSON first, with `parse_streaming_json` as a fallback so
-///   a malformed prior turn still yields a structured `Value` rather
+///   a malformed prior message still yields a structured `Value` rather
 ///   than failing the parse.
 ///
 /// Reasoning is intentionally not represented on the request side and
@@ -1216,7 +1216,7 @@ impl StreamState {
     /// Whether the wire stream delivered its terminal signal. For Chat
     /// Completions that is a non-null `finish_reason` on some choice; the
     /// stream closes after it (a trailing usage-only chunk may follow).
-    /// When `false` at stream end the turn was truncated mid-flight.
+    /// When `false` at stream end the response was truncated mid-flight.
     fn saw_terminal(&self) -> bool {
         self.finish_reason.is_some()
     }
@@ -1293,7 +1293,7 @@ impl StreamState {
         } else {
             tracing::debug!(
                 api = %self.partial.api,
-                "stream ended before terminal frame; treating turn as truncated (retryable)"
+                "stream ended before terminal frame; treating response as truncated (retryable)"
             );
             // OpenAI sends usage after `finish_reason`, so this is a no-op
             // for its truncations. Keep the harvest defensive for compatible

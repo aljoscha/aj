@@ -31,6 +31,9 @@ url = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 aj-agent = { path = "../aj-agent/", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -9,10 +9,7 @@ use aj_agent::message::AgentMessage;
 use aj_app::chat::{ChatState, reduce};
 use aj_app::session::AgentLifecycle;
 use aj_models::types::{Message, UserMessage};
-use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, PersistenceFence, ThreadFilter,
-    persistence_listener, persisting_forwarder, project_suffix,
-};
+use aj_session::{Journal, ProjectSessions, SessionLog, ThreadFilter, project_suffix};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -53,7 +50,7 @@ async fn native_error_completion_restores_store_through_session_core_after_compa
     use aj_app::session::{SessionCore, SessionEntry, SessionSpec};
 
     let dir = tempfile::TempDir::new().unwrap();
-    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
     let config = aj_conf::Config {
         code_mode: true,
         ..Default::default()
@@ -89,12 +86,12 @@ async fn native_error_completion_restores_store_through_session_core_after_compa
     let session_id = guard.session_id().to_owned();
     let tail = guard.head().unwrap().clone();
     assert_eq!(
-        guard.linearize(&tail, ThreadFilter::USER).code_mode_store(),
+        guard.linearize(&tail, ThreadFilter::MAIN).code_mode_store(),
         writes(json!({"saved": {"count": 42}}))
     );
     let checkpoint = guard
         .append_compaction(
-            ThreadFilter::USER,
+            ThreadFilter::MAIN,
             "compacted context".into(),
             tail,
             vec![],
@@ -103,15 +100,15 @@ async fn native_error_completion_restores_store_through_session_core_after_compa
             Default::default(),
         )
         .unwrap();
-    let conversation = guard.linearize(&checkpoint.id, ThreadFilter::USER);
-    assert!(conversation.entries().len() > conversation.agent_messages().len());
+    let branch = guard.linearize(&checkpoint.id, ThreadFilter::MAIN);
+    assert!(branch.entries().len() > branch.agent_messages().len());
     assert!(
-        !serde_json::to_string(&conversation.agent_messages())
+        !serde_json::to_string(&branch.agent_messages())
             .unwrap()
             .contains("original-script-error"),
         "the checkpoint must actually remove the storing script from model context"
     );
-    agent.reseed_transcript(conversation.agent_messages());
+    agent.reseed_transcript(branch.agent_messages());
     drop(guard);
     agent.reset_code_mode(Default::default()).await.unwrap();
     drop(agent);
@@ -155,7 +152,7 @@ async fn native_cancelled_cell_leaves_no_store_commit_on_reopen() {
     use aj_app::session::{SessionCore, SessionEntry, SessionSpec};
 
     let dir = tempfile::TempDir::new().unwrap();
-    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
     let config = aj_conf::Config {
         code_mode: true,
         ..Default::default()
@@ -190,10 +187,10 @@ async fn native_cancelled_cell_leaves_no_store_commit_on_reopen() {
     drop(agent);
     drop(subscription);
     drop(log);
-    let resumed = ConversationLog::resume(&persistence, &session_id).unwrap();
+    let resumed = SessionLog::resume(&persistence, &session_id).unwrap();
     assert!(
         resumed
-            .linearize(resumed.head().unwrap(), ThreadFilter::USER)
+            .linearize(resumed.head().unwrap(), ThreadFilter::MAIN)
             .code_mode_store()
             .is_empty()
     );
@@ -209,7 +206,7 @@ async fn completed_uncollected_cell_flushes_its_store_before_session_shutdown() 
     use aj_app::session::{SessionCore, SessionEntry, SessionSpec};
 
     let dir = tempfile::TempDir::new().unwrap();
-    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
     let (core, _) = SessionCore::build(
         &aj_conf::Config {
             code_mode: true,
@@ -247,10 +244,10 @@ async fn completed_uncollected_cell_flushes_its_store_before_session_shutdown() 
         "result is still uncollected"
     );
     let guard = log.lock().await;
-    let reopened = ConversationLog::resume(&persistence, guard.session_id()).unwrap();
+    let reopened = SessionLog::resume(&persistence, guard.session_id()).unwrap();
     assert_eq!(
         reopened
-            .linearize(reopened.head().unwrap(), ThreadFilter::USER)
+            .linearize(reopened.head().unwrap(), ThreadFilter::MAIN)
             .code_mode_store(),
         writes(json!({"uncollected": 42}))
     );
@@ -291,31 +288,30 @@ fn settings() -> AgentSettings {
 #[tokio::test]
 async fn code_mode_store_flushes_without_messages_and_replays_without_chat_or_usage() {
     let dir = tempfile::TempDir::new().unwrap();
-    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-    let log = Arc::new(Mutex::new(ConversationLog::create(&persistence).unwrap()));
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
+    let log = Arc::new(Mutex::new(SessionLog::create(&persistence).unwrap()));
     let bus = EventBus::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _subscription = bus.subscribe(persisting_forwarder(
-        Arc::clone(&log),
-        AppendHandoff::default(),
-        tx,
-        PersistenceFence::default(),
-    ));
+    let journal = Journal::new(Arc::clone(&log));
+    journal.stream_into(tx);
+    bus.set_committer(journal.committer());
     let event = commit(
         AgentId::Main,
         json!({"secret": {"nested": [1, null, true]}}),
     );
     bus.emit(event.clone()).await.unwrap();
-    let forwarded = rx.try_recv().unwrap();
+    let aj_session::Committed::Event(forwarded) = rx.try_recv().unwrap() else {
+        panic!("the store write is published as its event");
+    };
     let identity = forwarded.entry.unwrap();
     let guard = log.lock().await;
     // No explicit flush or following tool result can make this test pass.
-    let resumed = ConversationLog::resume(&persistence, guard.session_id()).unwrap();
-    let conversation = resumed.linearize(resumed.head().unwrap(), ThreadFilter::USER);
-    assert!(conversation.agent_messages().is_empty());
-    assert!(conversation.messages().is_empty());
+    let resumed = SessionLog::resume(&persistence, guard.session_id()).unwrap();
+    let branch = resumed.linearize(resumed.head().unwrap(), ThreadFilter::MAIN);
+    assert!(branch.agent_messages().is_empty());
+    assert!(branch.messages().is_empty());
     assert_eq!(
-        conversation.code_mode_store(),
+        branch.code_mode_store(),
         writes(json!({"secret": {"nested": [1, null, true]}}))
     );
     let replayed: Vec<_> = project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).collect();
@@ -338,10 +334,10 @@ async fn code_mode_store_flushes_without_messages_and_replays_without_chat_or_us
 #[tokio::test]
 async fn code_mode_store_follows_branch_and_thread_ancestry_across_compaction() {
     let dir = tempfile::TempDir::new().unwrap();
-    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-    let log = Arc::new(Mutex::new(ConversationLog::create(&persistence).unwrap()));
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
+    let log = Arc::new(Mutex::new(SessionLog::create(&persistence).unwrap()));
     let bus = EventBus::new();
-    let _subscription = bus.subscribe(persistence_listener(Arc::clone(&log)));
+    bus.set_committer(Journal::new(Arc::clone(&log)).committer());
     bus.emit(commit(AgentId::Main, json!({"common": 1, "value": "base"})))
         .await
         .unwrap();
@@ -354,6 +350,7 @@ async fn code_mode_store_follows_branch_and_thread_ancestry_across_compaction() 
         child: AgentId::Sub(1),
         task: "child".into(),
         tool_name: "agent".into(),
+        call_id: None,
         background: false,
         settings: settings(),
     })
@@ -381,7 +378,7 @@ async fn code_mode_store_follows_branch_and_thread_ancestry_across_compaction() 
     let tail = guard.head().unwrap().clone();
     guard
         .append_compaction(
-            ThreadFilter::USER,
+            ThreadFilter::MAIN,
             "summary".into(),
             tail,
             vec![],
@@ -395,8 +392,8 @@ async fn code_mode_store_follows_branch_and_thread_ancestry_across_compaction() 
         .await
         .unwrap();
     let guard = log.lock().await;
-    let resumed = ConversationLog::resume(&persistence, guard.session_id()).unwrap();
-    let current = resumed.linearize(resumed.head().unwrap(), ThreadFilter::USER);
+    let mut resumed = SessionLog::resume(&persistence, guard.session_id()).unwrap();
+    let current = resumed.linearize(resumed.head().unwrap(), ThreadFilter::MAIN);
     assert_eq!(
         current.agent_messages().len(),
         2,
@@ -406,19 +403,23 @@ async fn code_mode_store_follows_branch_and_thread_ancestry_across_compaction() 
         current.code_mode_store(),
         writes(json!({"common": 1, "value": null}))
     );
+    // A reopened log holds the branch it is on. Another is read before
+    // it is looked at, as a host reads it before moving there.
+    let read = resumed.branch_read(&sibling).unwrap().expect("not held");
+    resumed.install_branch(read.read().unwrap()).unwrap();
     assert_eq!(
         resumed
-            .linearize(&sibling, ThreadFilter::USER)
+            .linearize(&sibling, ThreadFilter::MAIN)
             .code_mode_store(),
         writes(json!({"common": 1, "value": "abandoned", "sibling_only": true}))
     );
     assert_eq!(
         resumed
-            .linearize(&fork, ThreadFilter::USER)
+            .linearize(&fork, ThreadFilter::MAIN)
             .code_mode_store(),
         writes(json!({"common": 1, "value": "base"}))
     );
-    let child = ThreadFilter::subagent(1);
+    let child = ThreadFilter::sub(1);
     assert_eq!(
         resumed
             .linearize(&resumed.latest_leaf(child).unwrap(), child)

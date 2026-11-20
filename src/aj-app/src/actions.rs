@@ -78,7 +78,7 @@ pub enum AjAction {
     /// Copy the focused user message to the clipboard, live only in
     /// transcript-focus mode (`aj.transcript.copy_message`).
     CopyMessage,
-    /// Branch the conversation from the focused user message, live only in
+    /// Branch the session from the focused user message, live only in
     /// transcript-focus mode (`aj.transcript.branch_message`).
     BranchMessage,
     /// Show or hide the session sidebar (`aj.sidebar.toggle`).

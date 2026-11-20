@@ -12,9 +12,7 @@ use aj_app::session_info::{InfoRow, digest, to_wire};
 use aj_models::anthropic::provider::replay_sse_events;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::types::{AssistantMessage, Message, Usage, UserMessage};
-use aj_session::{
-    ConversationEntryKind, ConversationLog, ConversationPersistence, ThreadFilter, ThreadKind,
-};
+use aj_session::{LogEntryKind, ProjectSessions, SessionLog, ThreadFilter, ThreadKind};
 use anthropic_sdk::messages::{
     ContentBlock as AContentBlock, ContentBlockDelta as AContentBlockDelta, Message as AMessage,
     MessageType, Role as ARole, ServerSentEvent, Usage as AUsage,
@@ -117,19 +115,19 @@ fn completed_turn() -> Message {
     Message::Assistant(completed_response())
 }
 
-fn log_with(responses: Vec<Message>) -> (TempDir, ConversationLog) {
+fn log_with(responses: Vec<Message>) -> (TempDir, SessionLog) {
     let dir = tempfile::tempdir().expect("scratch dir");
-    let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-    let mut log = ConversationLog::create(&persistence).expect("create log");
+    let persistence = ProjectSessions::new(dir.path().to_path_buf());
+    let mut log = SessionLog::create(&persistence).expect("create log");
     log.set_system_prompt("system".to_string())
         .expect("system prompt");
     let mut head = log.system_prompt_id().cloned().expect("system prompt id");
     head = log
         .append(
             Some(head),
-            ThreadKind::User,
+            ThreadKind::Main,
             None,
-            ConversationEntryKind::Message {
+            LogEntryKind::Message {
                 message: AgentMessage::wire(Message::User(UserMessage::text("go"))),
             },
         )
@@ -139,9 +137,9 @@ fn log_with(responses: Vec<Message>) -> (TempDir, ConversationLog) {
         head = log
             .append(
                 Some(head),
-                ThreadKind::User,
+                ThreadKind::Main,
                 None,
-                ConversationEntryKind::Message {
+                LogEntryKind::Message {
                     message: AgentMessage::wire(response),
                 },
             )
@@ -158,11 +156,11 @@ fn log_with(responses: Vec<Message>) -> (TempDir, ConversationLog) {
 /// `first_kept_entry_id` is the system prompt, so nothing is dropped.
 /// The cut is not what this fixture is about, and `stats()` reads only
 /// the entry's `usage`.
-fn log_with_compaction(responses: Vec<Message>, usage: Usage) -> (TempDir, ConversationLog) {
+fn log_with_compaction(responses: Vec<Message>, usage: Usage) -> (TempDir, SessionLog) {
     let (dir, mut log) = log_with(responses);
     let first_kept = log.system_prompt_id().cloned().expect("system prompt id");
     log.append_compaction(
-        ThreadFilter::USER,
+        ThreadFilter::MAIN,
         "summary".into(),
         first_kept,
         Vec::new(),
@@ -195,7 +193,7 @@ fn number(rows: &[InfoRow], key: &str) -> u64 {
 #[test]
 fn a_truncated_turn_contributes_tokens_and_dollars() {
     let (_dir, log) = log_with(vec![truncated_turn()]);
-    let stats = log.stats();
+    let stats = log.stats().unwrap();
 
     assert_eq!(
         stats.usage.input, 1_000,
@@ -226,7 +224,7 @@ fn a_truncated_turn_contributes_tokens_and_dollars() {
 #[test]
 fn the_overlay_token_rows_sum_to_the_total_it_prints() {
     let (_dir, log) = log_with(vec![completed_turn(), truncated_turn(), completed_turn()]);
-    let stats = log.stats();
+    let stats = log.stats().unwrap();
     let rows = digest(&to_wire(&stats), None);
 
     let parts = number(&rows, "input")
@@ -259,7 +257,7 @@ fn the_overlay_token_rows_sum_when_a_compaction_spent() {
     let summarizer = completed_response().usage;
     let turn_tokens = summarizer.total_tokens;
     let (_dir, log) = log_with_compaction(vec![completed_turn()], summarizer);
-    let stats = log.stats();
+    let stats = log.stats().unwrap();
     let rows = digest(&to_wire(&stats), None);
 
     let total = number(&rows, "total tokens");

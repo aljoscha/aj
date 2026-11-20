@@ -408,21 +408,21 @@ pub(crate) struct SidebarState {
     /// mirror, lapses with the process, and is never sent anywhere. Off by
     /// default, which is the whole point of archiving one.
     pub(crate) reveal_archived: bool,
-    /// Where the wheel anchored the drawn run. `None` is the resting state, in
-    /// which the run follows the focused row.
+    /// Where the wheel anchored the drawn window. `None` is the resting state, in
+    /// which the window follows the focused row.
     scroll: Option<Anchor>,
 }
 
-/// Where the wheel left the drawn run, and the session that was focused when
+/// Where the wheel left the drawn window, and the session that was focused when
 /// it did.
 ///
 /// The pairing is what makes a focus change drop the anchor. The layout
 /// follows the focused row, and can only do that while nothing else holds the
-/// run, so an anchor set before a switch would leave the user looking away
+/// window, so an anchor set before a switch would leave the user looking away
 /// from the session they just opened. Carried alongside the anchor rather than
 /// cleared on write so the rule holds however the mirror's rows arrive.
 struct Anchor {
-    /// Index into the display order the run starts at.
+    /// Index into the display order the window starts at.
     at: usize,
     /// The session focused when the wheel set it.
     focused: Option<String>,
@@ -492,24 +492,24 @@ impl SidebarState {
         true
     }
 
-    /// Move the drawn run `delta` rows in a strip `height` lines tall, and say
+    /// Move the drawn window `delta` rows in a strip `height` lines tall, and say
     /// whether it moved.
     ///
-    /// The wheel anchors the run where it lands, because the layout otherwise
+    /// The wheel anchors the window where it lands, because the layout otherwise
     /// follows the focused row and would pull the view straight back on the
-    /// next frame. A wheel with nowhere to go (the rows all fit, or the run
+    /// next frame. A wheel with nowhere to go (the rows all fit, or the window
     /// already sits against an end) leaves the anchor alone, so scrolling a
     /// strip that fits cannot quietly switch focus-following off.
     pub(crate) fn scroll_by(&mut self, delta: isize, height: u16) -> bool {
         let layout = Layout::of(&self.rows, &self.hosts, &self.unfolded);
         // The same division the draw lays out under, so the wheel cannot
-        // anchor the run somewhere the draw would not put it (see
+        // anchor the window somewhere the draw would not put it (see
         // [`Layout::split`]).
         let budget = layout.split(height).rows;
         if budget == 0 {
             return false;
         }
-        let from = layout.visible_run(budget, self.anchor()).start;
+        let from = layout.visible_window(budget, self.anchor()).start;
         let to = from
             .saturating_add_signed(delta)
             .min(layout.last_anchor(budget));
@@ -666,7 +666,7 @@ pub(crate) enum StripGesture {
 /// `unfolded` names the groups that show every row rather than the cap's share
 /// of them (see [`GROUP_CAP`]).
 ///
-/// `scroll` is where the wheel anchored the run, or `None` to follow the
+/// `scroll` is where the wheel anchored the window, or `None` to follow the
 /// focused row (see [`SidebarState::scroll_by`]).
 ///
 /// A height that cannot fit even the focused row and the chrome of its group
@@ -685,10 +685,10 @@ fn strip_lines(
     }
     let layout = Layout::of(rows, hosts, unfolded);
     let budget = layout.split(height);
-    layout.lines(layout.visible_run(budget.rows, scroll), budget)
+    layout.lines(layout.visible_window(budget.rows, scroll), budget)
 }
 
-/// A run of rows sharing a host, or a host the peer holds no rows for.
+/// A group of rows sharing a host, or a host the peer holds no rows for.
 struct Group<'a> {
     /// The host this group is, as its rows name it: the id its sessions are
     /// namespaced under, or the address for a host the peer has no id for.
@@ -701,7 +701,7 @@ struct Group<'a> {
     key: Option<&'a str>,
     /// What the header draws for it (see [`host_label`]). `None` exactly where
     /// the key is, both being held to the same rule about what names something
-    /// (see [`named`]): a headerless run belongs to no host by name.
+    /// (see [`named`]): a headerless group belongs to no host by name.
     label: Option<&'a str>,
     /// Whether the peer can reach none of it, which the header says once
     /// instead of the user reading it off every row.
@@ -822,7 +822,7 @@ impl<'a> Layout<'a> {
                     // The learned id where the peer has one, the configured
                     // address until it does. An entry naming neither
                     // is not a group: it can hold no rows, and a header keyed on
-                    // nothing would fold the plain host's unlabeled run.
+                    // nothing would fold the plain host's unlabeled group.
                     let key = named(&host.id).or_else(|| named(&host.address))?;
                     Some(Group {
                         key: Some(key),
@@ -840,7 +840,7 @@ impl<'a> Layout<'a> {
         // Alphabetical by the label the header draws, byte order and no
         // casefolding: a section that holds still is worth more when the place
         // it holds still in can be guessed. `None` sorts first, which is the
-        // rule it always had: a headerless run under someone else's header
+        // rule it always had: a headerless group under someone else's header
         // would read as theirs. Hosts with no rows interleave here rather than
         // sinking to the bottom, because a host is looked up by its name
         // whether or not it holds anything. Two hosts reporting one name break
@@ -891,7 +891,7 @@ impl<'a> Layout<'a> {
     /// How many headers the hosts the peer holds no rows for need.
     ///
     /// They are their headers and nothing else, so they take no part in the
-    /// run: a run reaches into a span of rows, and these have none. That is
+    /// window: a window reaches into a span of rows, and these have none. That is
     /// also why [`Self::headed`] does not gate them, and why they are given a
     /// budget of their own. Suppressing the header of a group with no rows
     /// draws the host as nothing at all, which is exactly the absence the peer
@@ -925,72 +925,72 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// The header a run reaching into `group` draws for it, if any.
-    fn header_of(&self, group: &Group<'a>, run: &Range<usize>) -> Option<&'a str> {
+    /// The header a window reaching into `group` draws for it, if any.
+    fn header_of(&self, group: &Group<'a>, window: &Range<usize>) -> Option<&'a str> {
         if !self.headed {
             return None;
         }
         let host = group.label?;
-        self.reaches(group, run).then_some(host)
+        self.reaches(group, window).then_some(host)
     }
 
-    /// Whether a run of the display order draws any of `group`'s rows.
+    /// Whether a window of the display order draws any of `group`'s rows.
     ///
-    /// A group with no rows is reached by nothing, however the run falls
-    /// around it. Its span is the empty range where it sits, which a run
+    /// A group with no rows is reached by nothing, however the window falls
+    /// around it. Its span is the empty range where it sits, which a window
     /// spanning that point would otherwise overlap, and it draws out of the
     /// budget of its own instead (see [`Self::split`]). Counting it here as
     /// well would charge its header twice and take the second line from the
     /// rows.
-    fn reaches(&self, group: &Group<'a>, run: &Range<usize>) -> bool {
-        !group.span.is_empty() && group.span.start < run.end && run.start < group.span.end
+    fn reaches(&self, group: &Group<'a>, window: &Range<usize>) -> bool {
+        !group.span.is_empty() && group.span.start < window.end && window.start < group.span.end
     }
 
-    /// Whether `group` draws its fold line under a run that reaches it: it has
+    /// Whether `group` draws its fold line under a window that reaches it: it has
     /// rows the cap holds back, or the user unfolded it and the line is what
     /// folds it again (the pointer must be able to undo what the pointer
     /// did).
     ///
-    /// Tied to the run the same way a header is, so a group that draws a row
+    /// Tied to the window the same way a header is, so a group that draws a row
     /// draws its affordance: a cap that held rows back silently would be a
     /// strip that lies about what the peer offers.
-    fn folds(&self, group: &Group<'a>, run: &Range<usize>) -> bool {
-        (group.hidden > 0 || group.unfolded) && self.reaches(group, run)
+    fn folds(&self, group: &Group<'a>, window: &Range<usize>) -> bool {
+        (group.hidden > 0 || group.unfolded) && self.reaches(group, window)
     }
 
-    /// Lines the run `order[run]` occupies: one per row, one per header and
+    /// Lines the window `order[window]` occupies: one per row, one per header and
     /// fold line it reaches, and one for the overflow row when it leaves any
-    /// row out. The create row is not counted, it is paid for before a run is
+    /// row out. The create row is not counted, it is paid for before a window is
     /// chosen.
-    fn cost(&self, run: Range<usize>) -> usize {
+    fn cost(&self, window: Range<usize>) -> usize {
         let chrome: usize = self
             .groups
             .iter()
             .map(|group| {
-                usize::from(self.header_of(group, &run).is_some())
-                    + usize::from(self.folds(group, &run))
+                usize::from(self.header_of(group, &window).is_some())
+                    + usize::from(self.folds(group, &window))
             })
             .sum();
-        chrome + run.len() + usize::from(run.len() < self.order.len())
+        chrome + window.len() + usize::from(window.len() < self.order.len())
     }
 
-    /// The run of the display order to draw in `budget` lines: the longest one
+    /// The window of the display order to draw in `budget` lines: the longest one
     /// that fits, anchored where `scroll` says or around the focused row when
     /// it says nothing.
     ///
-    /// Following focus scrolls by the least it can. The run stays anchored at
+    /// Following focus scrolls by the least it can. The window stays anchored at
     /// the top until focus would fall past its bottom edge, which keeps a step
     /// from jumping the whole strip. With no focused row it shows the top of
     /// the order.
-    fn visible_run(&self, budget: usize, scroll: Option<usize>) -> Range<usize> {
+    fn visible_window(&self, budget: usize, scroll: Option<usize>) -> Range<usize> {
         // An anchor the user set outranks the focused row: they scrolled to
         // look elsewhere, and following focus would undo that on the very next
         // frame. The anchor lapses on a focus change (see [`Anchor`]), which is
         // what hands the strip back to focus-following.
         if let Some(start) = scroll {
-            return self.run_from(budget, start.min(self.last_anchor(budget)));
+            return self.window_from(budget, start.min(self.last_anchor(budget)));
         }
-        let top = self.run_from(budget, 0);
+        let top = self.window_from(budget, 0);
         let Some(focus) = self
             .order
             .iter()
@@ -1001,41 +1001,41 @@ impl<'a> Layout<'a> {
         if focus < top.end {
             return top;
         }
-        // Focus fell past the bottom edge, so the run ends on it and reaches
-        // back as far as the budget allows. An empty run is the answer when
+        // Focus fell past the bottom edge, so the window ends on it and reaches
+        // back as far as the budget allows. An empty window is the answer when
         // even one row and its header will not fit (see [`strip_lines`]).
         (0..=focus)
             .find(|&start| self.cost(start..focus + 1) <= budget)
             .map_or(focus..focus, |start| start..focus + 1)
     }
 
-    /// The longest run beginning at `start` that fits `budget`.
+    /// The longest window beginning at `start` that fits `budget`.
     ///
-    /// Scanned downward because cost is not monotone in the run's length: the
-    /// run holding every row spends no line on the overflow row, so it can fit
-    /// where a run one row shorter does not.
-    fn run_from(&self, budget: usize, start: usize) -> Range<usize> {
+    /// Scanned downward because cost is not monotone in the window's length: the
+    /// window holding every row spends no line on the overflow row, so it can fit
+    /// where a window one row shorter does not.
+    fn window_from(&self, budget: usize, start: usize) -> Range<usize> {
         (start..=self.order.len())
             .rev()
             .find(|&end| self.cost(start..end) <= budget)
             .map_or(start..start, |end| start..end)
     }
 
-    /// The furthest down the run can be anchored: the first start whose run
+    /// The furthest down the window can be anchored: the first start whose window
     /// still reaches the last row. Anchoring past it would redraw the same
     /// last page, so this is where the wheel stops.
     fn last_anchor(&self, budget: usize) -> usize {
         let total = self.order.len();
-        // An empty run costs only the overflow line, so with a budget of at
+        // An empty window costs only the overflow line, so with a budget of at
         // least one line the scan always terminates.
         (0..=total)
             .find(|&start| self.cost(start..total) <= budget)
             .unwrap_or(total)
     }
 
-    /// The lines for a run, in draw order, within `budget`.
-    fn lines(&self, run: Range<usize>, budget: Budget) -> Vec<StripLine> {
-        let mut lines = Vec::with_capacity(run.len() + 2 * self.groups.len() + 2);
+    /// The lines for a window, in draw order, within `budget`.
+    fn lines(&self, window: Range<usize>, budget: Budget) -> Vec<StripLine> {
+        let mut lines = Vec::with_capacity(window.len() + 2 * self.groups.len() + 2);
         let mut empty = 0;
         for group in &self.groups {
             if group.span.is_empty() {
@@ -1052,12 +1052,12 @@ impl<'a> Layout<'a> {
                 }
                 continue;
             }
-            let from = group.span.start.max(run.start);
-            let to = group.span.end.min(run.end);
+            let from = group.span.start.max(window.start);
+            let to = group.span.end.min(window.end);
             if from >= to {
                 continue;
             }
-            if let Some(label) = self.header_of(group, &run) {
+            if let Some(label) = self.header_of(group, &window) {
                 lines.push(StripLine::Header {
                     label: label.to_string(),
                     unreachable: group.unreachable,
@@ -1066,14 +1066,14 @@ impl<'a> Layout<'a> {
             lines.extend((from..to).map(|at| StripLine::Session {
                 index: self.order[at],
             }));
-            if self.folds(group, &run) {
+            if self.folds(group, &window) {
                 lines.push(StripLine::Fold {
                     host: group.key.map(str::to_string),
                     hidden: group.hidden,
                 });
             }
         }
-        let hidden = self.order.len() - run.len();
+        let hidden = self.order.len() - window.len();
         // At a height of one line the create row has the only line there is, so
         // even the count goes. [`Self::split`] keeps a line for it at every
         // other height where there is anything to count.
@@ -1394,7 +1394,7 @@ impl SessionSidebar {
         }
     }
 
-    /// Wheel the drawn run by `delta` rows, if it has anywhere to go.
+    /// Wheel the drawn window by `delta` rows, if it has anywhere to go.
     fn wheel(&self, ctx: &mut EventContext, delta: isize) {
         if self.state.borrow_mut().scroll_by(delta, self.height) {
             ctx.consume_and_redraw();
@@ -2426,7 +2426,7 @@ mod tests {
     }
 
     /// A directory that names a host on some rows and not others still reads:
-    /// the nameless rows go first, so a headerless run never sits under
+    /// the nameless rows go first, so a headerless group never sits under
     /// someone else's header and looks like theirs.
     #[test]
     fn rows_without_a_host_sort_above_the_headers() {
@@ -2767,7 +2767,7 @@ mod tests {
     /// not police the grammar a gateway enforces at enrollment, so this is the
     /// peer's word taken as it arrives. Such an entry is not a group
     /// at all, which is also what keeps it from turning the one real host's
-    /// single run into a grouping that wears a header.
+    /// single group into a grouping that wears a header.
     #[test]
     fn a_host_named_by_neither_an_id_nor_an_address_draws_nothing() {
         let nameless = DirectoryHost {
@@ -2799,7 +2799,7 @@ mod tests {
             );
         }
 
-        // The rows of one real host are one run, and an entry that names nothing
+        // The rows of one real host are one group, and an entry that names nothing
         // is not a second group to head them with.
         let rows = vec![row("s-1").host("builder-1").build()];
         let hosts = vec![
@@ -2845,7 +2845,7 @@ mod tests {
     /// label sorts it to.
     ///
     /// Its header is drawn out of a budget of its own, so a layout that also
-    /// charged the run for it would take a second line from the rows and hide
+    /// charged the window for it would take a second line from the rows and hide
     /// a row it had room for. That can only happen where the host sorts
     /// between two hosts that do have rows, which is why the fixture puts it
     /// there and why the same strip is measured with the host renamed to sort
@@ -2885,7 +2885,7 @@ mod tests {
     }
 
     /// A host the user unfolded that later holds no rows costs nothing either.
-    /// It draws no fold line (there is nothing to fold), so charging the run
+    /// It draws no fold line (there is nothing to fold), so charging the window
     /// for one would take a line for something the strip never draws, and no
     /// affordance would be left to get it back.
     #[test]
@@ -2908,17 +2908,17 @@ mod tests {
         );
     }
 
-    /// A fold line is chrome the group pays for, so a run that reaches no row
+    /// A fold line is chrome the group pays for, so a window that reaches no row
     /// of a group pays for neither its header nor its fold line.
     #[test]
-    fn a_group_the_run_does_not_reach_costs_nothing() {
+    fn a_group_the_window_does_not_reach_costs_nothing() {
         let mut rows: Vec<SidebarRow> = (1..=8)
             .map(|n| row(&format!("a-{n}")).host("aaa").active(n).build())
             .collect();
         rows.extend((1..=8).map(|n| row(&format!("z-{n}")).host("zzz").active(n).build()));
         // Six lines: the create row, the overflow count, and four for the
         // first group's header, two of its rows and its fold line. The second
-        // group is out of the run and costs nothing at all.
+        // group is out of the window and costs nothing at all.
         let lines = folded(&rows, &[], 6);
         assert_eq!(headers(&lines), vec![("aaa", false)], "{lines:?}");
         assert_eq!(folds(&lines), vec![(Some("aaa"), 3)], "{lines:?}");
@@ -2978,12 +2978,12 @@ mod tests {
         }
         assert!(
             moved > 0,
-            "the wheel never moved the run, so this test measures nothing",
+            "the wheel never moved the window, so this test measures nothing",
         );
         let scrolled = drawn(&state.lines(6), &state.rows);
         assert!(
             !scrolled.contains(&"s-01"),
-            "the wheel moved the run off the top, or this test measures \
+            "the wheel moved the window off the top, or this test measures \
              nothing: {scrolled:?}",
         );
 
@@ -2992,7 +2992,7 @@ mod tests {
         assert_eq!(
             opened.first(),
             Some(&"s-01"),
-            "unfolding drew the group from its top rather than leaving the run \
+            "unfolding drew the group from its top rather than leaving the window \
              where the wheel had it, where the rows it revealed would all sit \
              above the view: {opened:?}",
         );
@@ -3058,7 +3058,7 @@ mod tests {
         }
         assert!(
             moved > 0,
-            "the wheel never moved the run, so the test measures nothing",
+            "the wheel never moved the window, so the test measures nothing",
         );
         let lines = state.lines(6);
         assert!(
@@ -3068,7 +3068,7 @@ mod tests {
     }
 
     /// Rows that do not fit are counted, not dropped in silence. What is cut is
-    /// the tail of the display order, which is where the run ends.
+    /// the tail of the display order, which is where the window ends.
     #[test]
     fn the_rows_that_do_not_fit_are_counted() {
         let rows = rows_named(&["a", "b", "c", "d", "e"]);
@@ -3333,7 +3333,7 @@ mod tests {
 
     /// The focused row is drawn even when the store holds more sessions than
     /// the terminal has lines, and the count still names every row left out,
-    /// above the run as well as below it.
+    /// above the window as well as below it.
     #[test]
     fn the_focused_row_stays_visible() {
         let mut rows = rows_named(&["a", "b", "c", "d", "e", "f"]);
@@ -3346,11 +3346,11 @@ mod tests {
     }
 
     /// It scrolls by the least it can: while focus still fits above the bottom
-    /// edge the run stays at the top, so a step does not jump the strip. The
-    /// run reaches past the focused row to fill the height, it does not stop
+    /// edge the window stays at the top, so a step does not jump the strip. The
+    /// window reaches past the focused row to fill the height, it does not stop
     /// on it.
     #[test]
-    fn the_run_holds_still_while_focus_fits() {
+    fn the_window_holds_still_while_focus_fits() {
         let mut rows = rows_named(&["a", "b", "c", "d", "e", "f"]);
         rows[0].focused = true;
         assert_eq!(
@@ -4469,10 +4469,10 @@ mod tests {
     }
 
     /// The wheel scrolls a strip that cannot show every row, and stops once
-    /// the run reaches an end rather than sliding the content off screen.
+    /// the window reaches an end rather than sliding the content off screen.
     ///
     /// A wheel report carries a position, so it also moves the hover band.
-    /// What says the run moved is the consume, which only a scroll that landed
+    /// What says the window moved is the consume, which only a scroll that landed
     /// somewhere new asks for.
     #[test]
     fn the_wheel_scrolls_a_strip_that_overflows() {
@@ -4493,7 +4493,7 @@ mod tests {
         redraw(&mut strip, 6);
         assert_eq!(shown(&strip), ["s-0", "s-1", "s-2", "s-3"]);
 
-        // Off the bottom: the run stops on the last row.
+        // Off the bottom: the window stops on the last row.
         for _ in 0..20 {
             deliver(&mut strip, &wheel(Button::WheelDown));
             redraw(&mut strip, 6);
@@ -4506,7 +4506,7 @@ mod tests {
     }
 
     /// A strip whose rows all fit has nowhere to scroll, and the wheel leaves
-    /// it exactly as it was rather than quietly anchoring the run where it
+    /// it exactly as it was rather than quietly anchoring the window where it
     /// already sits (which would switch focus-following off for nothing).
     #[test]
     fn the_wheel_is_inert_while_the_rows_fit() {
@@ -4521,11 +4521,11 @@ mod tests {
         assert_eq!(shown(&strip), ["a", "b", "c"]);
     }
 
-    /// The wheel moves the run from wherever it already sits, which is what
+    /// The wheel moves the window from wherever it already sits, which is what
     /// keeps it in step with the layout's own focus-following rather than
     /// re-deriving a top of its own.
     #[test]
-    fn the_wheel_scrolls_from_where_the_run_already_sits() {
+    fn the_wheel_scrolls_from_where_the_window_already_sits() {
         let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
         let mut rows: Vec<SidebarRow> = ids.iter().map(|id| row(id).attached().build()).collect();
         rows[9].focused = true;
@@ -4533,7 +4533,7 @@ mod tests {
         assert_eq!(
             shown(&strip),
             ["s-6", "s-7", "s-8", "s-9"],
-            "the layout put the run at the bottom to keep focus on screen",
+            "the layout put the window at the bottom to keep focus on screen",
         );
         deliver(&mut strip, &wheel(Button::WheelUp));
         redraw(&mut strip, 6);
@@ -4559,7 +4559,7 @@ mod tests {
                 .enumerate()
                 .map(|(at, id)| {
                     // Attached, so every row stays on screen and the wheel is
-                    // the only thing moving the run (see [`GROUP_CAP`]).
+                    // the only thing moving the window (see [`GROUP_CAP`]).
                     let built = row(id).attached();
                     if Some(at) == focused {
                         built.focused()

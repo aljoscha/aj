@@ -20,7 +20,7 @@ fn host(dir: &tempfile::TempDir, responses: Vec<AssistantMessage>) -> SessionHos
         catalog: Arc::new(Vec::new()),
         defaults: RunConfigDefaults::fixed(scripted_run_config(responses).lock().unwrap().clone()),
         restore: None,
-        persistence: aj_session::ConversationPersistence::new(dir.path().join("sessions")),
+        persistence: aj_session::ProjectSessions::new(dir.path().join("sessions")),
         auth: aj_models::auth::AuthStorage::new(dir.path().join("auth.json")),
         working_directory: dir.path().to_path_buf(),
         name: None,

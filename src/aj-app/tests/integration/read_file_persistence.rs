@@ -7,9 +7,7 @@ use aj_agent::message::AgentMessage;
 use aj_agent::tool::{ErasedToolDefinition, ToolDetails, ToolOutcome};
 use aj_app::export::render_session_html;
 use aj_models::types::{Message, ToolResultMessage, UserContent};
-use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener, replay,
-};
+use aj_session::{Journal, ProjectSessions, SessionLog, ThreadFilter, replay};
 use aj_tools::ReadFileTool;
 use aj_tools::testing::DummyToolContext;
 use base64::Engine;
@@ -129,7 +127,7 @@ fn exported_details<'a>(export: &'a Value, call_id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("exported result {call_id:?}"))
 }
 
-/// Crosses the real erased producer, persistence subscriber, JSONL codec,
+/// Crosses the real erased producer, persistence subscriber, storage codec,
 /// resume projections, replay, print JSON, and HTML export. The second result
 /// replaces only the display body at the post-hook boundary, proving that old
 /// local-gutter bytes remain inline and are never reinterpreted by readers.
@@ -179,16 +177,15 @@ async fn real_read_file_results_compact_and_preserve_post_hook_bodies() {
         "body": legacy_local_body,
     }));
 
-    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-    let mut created = ConversationLog::create(&persistence).expect("create log");
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
+    let mut created = SessionLog::create(&persistence).expect("create log");
     created
         .set_system_prompt("test prompt".to_string())
         .expect("set prompt");
     let session_id = created.session_id().to_string();
-    let log_path = created.path().to_path_buf();
     let log = Arc::new(Mutex::new(created));
     let bus = EventBus::new();
-    let listener = bus.subscribe(persistence_listener(Arc::clone(&log)));
+    bus.set_committer(Journal::new(Arc::clone(&log)).committer());
     for result in [canonical, hooked] {
         bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
@@ -198,11 +195,15 @@ async fn real_read_file_results_compact_and_preserve_post_hook_bodies() {
         .expect("persist tool result");
     }
 
-    let raw = std::fs::read_to_string(&log_path).expect("read JSONL");
-    let entries = raw
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("valid JSONL entry"))
-        .collect::<Vec<Value>>();
+    let stored = || {
+        persistence
+            .read_entries(&session_id)
+            .expect("read the stored session")
+            .iter()
+            .map(|entry| serde_json::to_value(entry).expect("record JSON"))
+            .collect::<Vec<Value>>()
+    };
+    let entries = stored();
     let canonical = persisted_result(&entries, CANONICAL_ID);
     let canonical_details = &canonical["message"]["details"];
     assert_eq!(canonical_details["body_ref"]["source"], "content_text");
@@ -224,23 +225,19 @@ async fn real_read_file_results_compact_and_preserve_post_hook_bodies() {
     assert_eq!(hooked_details["body"], legacy_local_body);
     assert!(hooked_details.get("body_ref").is_none());
 
-    drop(listener);
     drop(bus);
     drop(log);
-    let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
-    let head = resumed.latest_leaf(ThreadFilter::USER).expect("user head");
-    let conversation = resumed.linearize(&head, ThreadFilter::USER);
-    let projected = conversation.agent_messages();
+    let resumed = SessionLog::resume(&persistence, &session_id).expect("resume log");
+    let head = resumed.latest_leaf(ThreadFilter::MAIN).expect("user head");
+    let branch = resumed.linearize(&head, ThreadFilter::MAIN);
+    let projected = branch.agent_messages();
     assert_eq!(projected_body(&projected, CANONICAL_ID), expected_body);
     assert_eq!(projected_body(&projected, HOOKED_ID), legacy_local_body);
-    let wire = conversation.messages();
+    let wire = branch.messages();
     assert_eq!(wire_body(&wire, CANONICAL_ID), expected_body);
     assert_eq!(wire_body(&wire, HOOKED_ID), legacy_local_body);
     assert_eq!(
-        wire_body(
-            &[conversation.last_message().expect("last message")],
-            HOOKED_ID
-        ),
+        wire_body(&[branch.last_message().expect("last message")], HOOKED_ID),
         legacy_local_body,
     );
 
@@ -271,8 +268,8 @@ async fn real_read_file_results_compact_and_preserve_post_hook_bodies() {
         legacy_local_body,
     );
     assert_eq!(
-        std::fs::read_to_string(log_path).expect("reread JSONL"),
-        raw,
-        "resume, replay, and export leave the append-only source unchanged",
+        stored(),
+        entries,
+        "resume, replay, and export leave the stored entries unchanged",
     );
 }

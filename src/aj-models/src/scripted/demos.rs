@@ -5,8 +5,8 @@
 //! script per agent inference. The agent loop runs an inference, observes
 //! the resulting `Done`/`Error` event, executes any tool calls produced by
 //! the finalized [`AssistantMessage`], then runs the next inference; demos
-//! that span multiple turns (e.g. tool-use → result → follow-up text)
-//! supply one script per turn.
+//! that span multiple rounds (e.g. tool-use → result → follow-up text)
+//! supply one script per round.
 //!
 //! The library is hand-rolled (not loaded from disk) so each demo can be
 //! tuned for its rendering target: thinking-only flows have realistic
@@ -135,12 +135,12 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>
         ),
         (
             "background-task",
-            "bash launched with run_in_background: task badge lifecycle plus the completion notice",
+            "bash launched with run_in_background: task badge lifecycle plus the task notification",
             background_task,
         ),
         (
             "background-agent-failure",
-            "background sub-agent fails: failed agent box plus an error completion notice",
+            "background sub-agent fails: failed agent box plus an error task notification",
             background_agent_failure,
         ),
         (
@@ -608,7 +608,7 @@ the same turn, made its own bash call, and reported back independently.";
 /// `background-task`: one `bash` call launched with
 /// `run_in_background`, so the launch cell carries the task badge
 /// through its lifecycle (`[task #N]` → `[task #N · exited 0]`) and
-/// the completion notice arrives as a collapsible task-notification
+/// the task notification arrives as a collapsible task-notification
 /// user message.
 ///
 /// The command runs for real. `sleep 1` keeps the running badge on

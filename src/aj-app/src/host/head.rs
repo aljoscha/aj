@@ -1,4 +1,4 @@
-//! Detached branch preparation and explicit branch records.
+//! Detached branch preparation and explicit branch entries.
 use super::*;
 use aj_session::ThreadFilter;
 
@@ -59,52 +59,46 @@ pub(super) async fn prepare(
     Ok((run, env))
 }
 
+/// Append the entries of a branch's explicit `changes`. Call inside a
+/// journal write.
 pub(super) fn append_changes(
-    log: &mut aj_session::ConversationLog,
+    log: &mut aj_session::SessionLog,
     changes: &aj_wire::BranchChanges,
     run: &RunConfigSnapshot,
     env: &BTreeMap<String, String>,
-) -> Result<(), HostError> {
+) -> Result<(), aj_session::SessionError> {
     let settings = run.settings();
-    let persist = |err| HostError::Internal(Box::new(err));
     if let Some(model) = &changes.settings.oracle_model {
-        log.append_oracle_model_change(&model.api, &model.name)
-            .map_err(persist)?;
+        log.append_oracle_model_change(&model.api, &model.name)?;
     }
     if let Some(effort) = &changes.settings.oracle_thinking {
-        log.append_oracle_thinking_change(effort).map_err(persist)?;
+        log.append_oracle_thinking_change(effort)?;
     }
     if let Some(verbosity) = &changes.settings.oracle_verbosity {
-        log.append_oracle_verbosity_change(verbosity)
-            .map_err(persist)?;
+        log.append_oracle_verbosity_change(verbosity)?;
     }
     if changes.settings.model.is_some() {
         log.append_model_change(
-            ThreadFilter::USER,
+            ThreadFilter::MAIN,
             &settings.provider,
             &settings.model_id,
             settings.context_window,
-        )
-        .map_err(persist)?;
+        )?;
     }
     if changes.settings.thinking.is_some() {
-        log.append_thinking_change(ThreadFilter::USER, &settings.thinking)
-            .map_err(persist)?;
+        log.append_thinking_change(ThreadFilter::MAIN, &settings.thinking)?;
     }
     if changes.settings.speed.is_some() {
-        log.append_speed_change(ThreadFilter::USER, &settings.speed)
-            .map_err(persist)?;
+        log.append_speed_change(ThreadFilter::MAIN, &settings.speed)?;
     }
     if changes.settings.verbosity.is_some() {
-        log.append_verbosity_change(ThreadFilter::USER, &settings.verbosity)
-            .map_err(persist)?;
+        log.append_verbosity_change(ThreadFilter::MAIN, &settings.verbosity)?;
     }
     for (provider, account) in &changes.accounts {
-        log.append_account_change(provider, account.as_deref())
-            .map_err(persist)?;
+        log.append_account_change(provider, account.as_deref())?;
     }
     if !changes.env.is_empty() {
-        log.append_env_change(env.clone()).map_err(persist)?;
+        log.append_env_change(env.clone())?;
     }
     Ok(())
 }

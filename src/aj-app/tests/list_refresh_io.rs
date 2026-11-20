@@ -1,5 +1,5 @@
 //! The list refresh's I/O budget: a refresh touches no filesystem, and an
-//! enumeration reads directories per axis rather than files per session.
+//! enumeration reads directories and catalog metadata, not transcripts.
 //!
 //! One test, in its own binary, because the oracle is this process's
 //! cumulative read counter and any other test running beside it would show up
@@ -32,7 +32,7 @@ use aj_conf::{Config, ConfigLayer};
 use aj_models::auth::AuthStorage;
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::UserContent;
-use aj_session::ConversationPersistence;
+use aj_session::ProjectSessions;
 use tempfile::TempDir;
 
 /// Cold logs in the store. Enough that re-reading them is unmistakable next to
@@ -96,7 +96,7 @@ fn seed_cold_logs(sessions_dir: &std::path::Path) {
     }
 }
 
-fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
+fn setup(dir: &TempDir, persistence: &ProjectSessions) -> HostSetup {
     let provider = Arc::new(
         ScriptedProvider::from_messages(
             // Long and slow, so the turn spans many coalescing ticks.
@@ -162,11 +162,16 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
 /// enumeration point left.
 #[tokio::test]
 async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
+    jsonl_directory_io().await;
+    sqlite_directory_io().await;
+}
+
+async fn jsonl_directory_io() {
     let dir = TempDir::new().expect("tempdir");
     let sessions_dir = dir.path().join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
     seed_cold_logs(&sessions_dir);
-    let persistence = ConversationPersistence::new(sessions_dir);
+    let persistence = ProjectSessions::new(sessions_dir);
     // Everything the composition needs is built before the window opens, so
     // what it measures is the enumeration and nothing around it.
     let setup = setup(&dir, &persistence);
@@ -276,10 +281,14 @@ async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
     tokio::time::resume();
     host.shutdown().await;
 
+    // The live session is in the database, so each explicit listing reads
+    // its catalog pages, as in `sqlite_directory_io`. Reading the cold logs
+    // even once per listing would exceed this bound by 25 times.
+    let budget = polls * 4 * u64::try_from(LOG_BYTES).unwrap();
     assert!(
-        read < BUDGET,
+        read < budget,
         "a turn's refreshes read {read} bytes over a store of {COLD_LOGS} logs, \
-         budget {BUDGET}: the refresh is going back to the store for what the \
+         budget {budget}: the refresh is going back to the store for what the \
          host already holds",
     );
     assert_eq!(
@@ -304,4 +313,105 @@ async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
         "the host probed {probed} locks over {polls} listings of a store nobody \
          else holds: the record filter is not filtering",
     );
+}
+
+/// SQLite enumeration reads catalog pages. Measure it separately from automatic
+/// refreshes, which must still do no I/O. Streaming deltas in the latter window
+/// avoid counting the database reads required by the turn's durable appends.
+async fn sqlite_directory_io() {
+    use aj_agent::message::AgentMessage;
+    use aj_models::types::{Message, UserMessage};
+    use aj_session::{LogEntryKind, SessionLog, ThreadKind};
+
+    let dir = TempDir::new().unwrap();
+    let persistence = ProjectSessions::new(dir.path().join("sessions"));
+    for _ in 0..COLD_LOGS {
+        let message = AgentMessage::wire(Message::User(UserMessage::text("x".repeat(LOG_BYTES))));
+        SessionLog::create(&persistence)
+            .unwrap()
+            .append(
+                None,
+                ThreadKind::Main,
+                None,
+                LogEntryKind::Message { message },
+            )
+            .unwrap();
+    }
+    let metadata = persistence.list_sessions().unwrap();
+    let payload_bytes = u64::try_from(LOG_BYTES).unwrap();
+    assert_eq!(metadata.len(), COLD_LOGS);
+    let size = |row: &aj_session::SessionMetadata| persistence.session_size(&row.session_id);
+    assert!(
+        metadata
+            .iter()
+            .all(|row| size(row).unwrap() > Some(payload_bytes))
+    );
+    let mut setup = setup(&dir, &persistence);
+    setup.list_coalesce = Some(Duration::from_millis(20));
+    let before = read_bytes();
+    let host = SessionHost::new(setup).unwrap();
+    let startup = read_bytes() - before;
+    // Schema and catalog pages fit here. Reading the fixture's transcript
+    // payloads would exceed this bound by at least 25 times.
+    let catalog_budget = 4 * payload_bytes;
+    assert!(startup < catalog_budget, "startup read {startup} bytes");
+    let before = read_bytes();
+    let listed = host.sessions().await.unwrap().sessions;
+    let enumerated = read_bytes() - before;
+    assert_eq!(listed.len(), COLD_LOGS);
+    assert!(listed.iter().all(|row| !row.live && row.last_seq.is_none()));
+    assert!(
+        enumerated < catalog_budget,
+        "listing read {enumerated} bytes"
+    );
+
+    let session = host.create().await.unwrap();
+    tokio::time::pause();
+    host.command(
+        &session,
+        Command::Prompt {
+            agent: AgentId::Main,
+            content: vec![UserContent::text("go")],
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        host.sessions()
+            .await
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|row| row.id == session && row.working)
+    );
+    let builds = host.list_builds();
+    let directories = host.store_directory_reads();
+    let sidecars = host.store_sidecar_directory_reads();
+    let locks = host.store_lock_directory_reads();
+    let before = read_bytes();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let refreshed = read_bytes() - before;
+    assert!(
+        host.list_builds() > builds,
+        "the publisher ran in the measured window"
+    );
+    assert_eq!(host.store_directory_reads(), directories);
+    assert_eq!(host.store_sidecar_directory_reads(), sidecars);
+    assert_eq!(host.store_lock_directory_reads(), locks);
+    assert!(
+        refreshed < BUDGET,
+        "automatic refreshes read {refreshed} bytes"
+    );
+    assert!(
+        host.sessions()
+            .await
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|row| row.id == session && row.working),
+        "the measurement excluded the final durable append"
+    );
+    tokio::time::resume();
+    host.shutdown().await;
 }

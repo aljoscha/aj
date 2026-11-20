@@ -113,7 +113,7 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u6
     false
 }
 
-/// Whether the most recent assistant turn in `messages` was a context
+/// Whether the most recent assistant message in `messages` was a context
 /// overflow. Convenience wrapper around [`is_context_overflow`] for
 /// callers that hold a transcript instead of a single message.
 pub fn last_turn_is_context_overflow(messages: &[Message], context_window: Option<u64>) -> bool {

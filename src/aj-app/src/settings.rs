@@ -17,13 +17,13 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aj_agent::events::AgentId;
+use aj_agent::events::{AgentEvent, AgentId};
 use aj_conf::{Config, ConfigLayer, ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity};
 use aj_models::auth::AuthStorage;
 use aj_models::registry::{ModelInfo, validate_thinking_level};
 use aj_models::types::Speed;
 use aj_models::{ThinkingConfig, speed_name, verbosity_name};
-use aj_session::{EntryRef, ThreadFilter};
+use aj_session::{EntryRef, SessionError, SessionLog, TaggedEvent, ThreadFilter};
 
 use crate::commands::thinking_level_name;
 use crate::model::{
@@ -624,27 +624,26 @@ pub fn persist_axis(
 /// What a settings confirm amounts to: whether the change applied, the entry
 /// it appended, and the text beside it. Every axis answers in this one shape.
 pub struct ConfirmOutcome {
-    /// False when nothing was staged: the target has no live handle, the
-    /// provider bundle could not be rebuilt, validation rejected the
-    /// value. `notice` says which.
+    /// False when nothing was staged: the provider bundle could not be
+    /// rebuilt, validation rejected the value, or the session could not
+    /// record it. `notice` says which.
     pub applied: bool,
     /// The confirmation line, which is also what the entry's projection
     /// renders, or the refusal when `applied` is false.
     pub notice: String,
     /// Live-only information, separate from persistence failures in `notes`.
     pub notices: Vec<String>,
-    /// Problems that do not belong on the durable settings notice: a failed
-    /// config write, a failed log record. A host publishes them separately,
-    /// because a backfill regenerates the projected notice and nothing else.
+    /// Problems that do not belong on the durable settings notice, such as
+    /// a failed config write. A host publishes them separately, because a
+    /// backfill regenerates the projected notice and nothing else.
     pub notes: Vec<String>,
-    /// The settings entry the change appended, absent when the change
-    /// applied but the append failed (a note carries the reason) and when
-    /// it did not apply at all.
+    /// The settings entry the change appended, absent when it did not
+    /// apply and for a choice the session does not record.
     pub entry: Option<EntryRef>,
 }
 
 /// Apply a confirmed thinking pick to the selected model: stage it into the
-/// run config, record it on the session log's user thread, and persist
+/// run config, record it on the session log's main thread, and persist
 /// it per `persist`.
 pub async fn confirm_thinking(
     target: ModelTarget,
@@ -655,6 +654,19 @@ pub async fn confirm_thinking(
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
 ) -> ConfirmOutcome {
+    let name = thinking_level_name(&level);
+    // Record the change on the session log's main thread so a later
+    // resume restores this level.
+    let notice = target.notice(format!("Thinking effort set to {name}."));
+    let recorded = record_change(core, AgentId::Main, &notice, |log| match target {
+        ModelTarget::Main => log.append_thinking_change(ThreadFilter::MAIN, name),
+        ModelTarget::Oracle => log.append_oracle_thinking_change(name),
+    })
+    .await;
+    let entry = match recorded {
+        Ok(entry) => entry,
+        Err(error) => return unrecorded("Thinking effort", error),
+    };
     // Stage the new thinking effort into the loop-side snapshot; the
     // next turn applies it. Never locks the agent, so it's safe while
     // a turn is running (the in-flight turn keeps its effort; the
@@ -662,16 +674,6 @@ pub async fn confirm_thinking(
     target
         .model_mut(&mut run_config.lock().expect("run config mutex poisoned"))
         .thinking = level.clone();
-    let name = thinking_level_name(&level);
-    // Record the change on the session log's user thread so a later
-    // resume restores this level.
-    let (entry, log_note) = {
-        let mut log = core.log.lock().await;
-        record(match target {
-            ModelTarget::Main => log.append_thinking_change(ThreadFilter::USER, name),
-            ModelTarget::Oracle => log.append_oracle_thinking_change(name),
-        })
-    };
     // Persist as the new default only when the change should outlive
     // this session (the settings windows). The thinking-effort selector
     // is session-scoped: it relies on the session-log record
@@ -685,26 +687,77 @@ pub async fn confirm_thinking(
     ConfirmOutcome {
         notices: Vec::new(),
         applied: true,
-        notice: target.notice(format!("Thinking effort set to {name}.")),
-        notes: [save_note, log_note].into_iter().flatten().collect(),
-        entry,
+        notice,
+        notes: save_note.into_iter().collect(),
+        entry: Some(entry),
     }
 }
 
-/// Split an append result into the entry it produced and the note to show
-/// when it failed. A failed record does not undo the change, which is live
-/// for this session. A persistence I/O failure has also fused the log, and the
-/// owning driver ends the session over that rather than over this note.
-fn record(
-    appended: Result<EntryRef, aj_session::ConversationError>,
-) -> (Option<EntryRef>, Option<String>) {
-    match appended {
-        Ok(entry) => (Some(entry), None),
-        Err(err) => (
-            None,
-            Some(format!("(couldn't record in session log: {err})")),
-        ),
+/// The answer to a change the session could not record. A change is
+/// recorded before it is staged, so one that is not recorded is not applied
+/// and a reopened session never differs from what its user was told. A
+/// persistence I/O failure has also fused the log, and the owning driver ends
+/// the session over that.
+fn unrecorded(what: &str, error: aj_session::SessionError) -> ConfirmOutcome {
+    ConfirmOutcome {
+        applied: false,
+        notice: format!("{what} not changed: the session could not record it ({error})."),
+        notices: Vec::new(),
+        notes: Vec::new(),
+        entry: None,
     }
+}
+
+/// What a recorded settings change publishes: the notice a backfill
+/// renders for `entry`, tagged with it, or `confirmation` untagged when the
+/// entry projects none.
+///
+/// A main-thread settings seed before the first message projects no notice,
+/// so a tagged frame would name something no backfill can regenerate. The
+/// untagged confirmation keeps that gesture from going silent for live
+/// clients. The journal still publishes the entry's position.
+///
+/// Call this in the write that appended `entry`. It asks the projection
+/// rather than restating its rule, which walks the log once.
+pub(crate) fn change_events(
+    log: &SessionLog,
+    agent: AgentId,
+    entry: &EntryRef,
+    confirmation: &str,
+) -> Vec<TaggedEvent> {
+    let event = match log.project_state_entry(&entry.id) {
+        Some(event) => TaggedEvent {
+            entry: Some(entry.clone()),
+            event,
+            branch_settings: None,
+        },
+        None => TaggedEvent {
+            entry: None,
+            event: AgentEvent::Notice {
+                agent_id: agent,
+                text: confirmation.to_string(),
+            },
+            branch_settings: None,
+        },
+    };
+    vec![event]
+}
+
+/// Record one settings change of `agent` through the session's journal,
+/// which publishes its notice (see [`change_events`]).
+async fn record_change(
+    core: &SessionCore,
+    agent: AgentId,
+    confirmation: &str,
+    mut append: impl FnMut(&mut SessionLog) -> Result<EntryRef, SessionError>,
+) -> Result<EntryRef, SessionError> {
+    core.journal
+        .record(|log| {
+            let entry = append(log)?;
+            let events = change_events(log, agent, &entry, confirmation);
+            Ok((entry, events))
+        })
+        .await
 }
 
 /// Apply a confirmed thinking pick to sub-agent `n`: validate against
@@ -724,16 +777,6 @@ pub async fn confirm_thinking_for_sub(
     tracked_model: Option<Arc<ModelInfo>>,
     core: &SessionCore,
 ) -> ConfirmOutcome {
-    let target = AgentId::Sub(n);
-    if core.resolve_agent(target).is_none() {
-        return ConfirmOutcome {
-            notices: Vec::new(),
-            applied: false,
-            notice: "This agent can't be prompted.".to_string(),
-            notes: Vec::new(),
-            entry: None,
-        };
-    }
     let name = thinking_level_name(&level);
     // Validate the chosen level (including off) against the target's
     // model: the staged bundle override's info if present, else its recorded
@@ -764,6 +807,17 @@ pub async fn confirm_thinking_for_sub(
             entry: None,
         };
     }
+    // Record the change on the sub-agent's log thread so a resumed
+    // transcript reflects it.
+    let notice = format!("Thinking effort set to {name} for agent {n}.");
+    let recorded = record_change(core, AgentId::Sub(n), &notice, |log| {
+        log.append_thinking_change(ThreadFilter::sub(n), name)
+    })
+    .await;
+    let entry = match recorded {
+        Ok(entry) => entry,
+        Err(error) => return unrecorded("Thinking effort", error),
+    };
     // Stage the standing choice; the sub's next turn applies it.
     core.sub_overrides
         .lock()
@@ -771,17 +825,11 @@ pub async fn confirm_thinking_for_sub(
         .entry(n)
         .or_default()
         .thinking = Some(level.clone());
-    // Record the change on the sub-agent's log thread so a resumed
-    // transcript reflects it.
-    let (entry, log_note) = {
-        let mut log = core.log.lock().await;
-        record(log.append_thinking_change(ThreadFilter::subagent(n), name))
-    };
     ConfirmOutcome {
         notices: Vec::new(),
-        notice: format!("Thinking effort set to {name} for agent {n}."),
-        notes: log_note.into_iter().collect(),
-        entry,
+        notice,
+        notes: Vec::new(),
+        entry: Some(entry),
         applied: true,
     }
 }
@@ -818,6 +866,26 @@ pub async fn confirm_model(
     });
     match replacement {
         Ok(mut model) => {
+            // Record the change on the session log's main thread so a
+            // later resume restores this model.
+            let notice = target.notice(format!(
+                "Model set to {} ({}/{}).",
+                info.name, info.provider, info.id
+            ));
+            let recorded = record_change(core, AgentId::Main, &notice, |log| match target {
+                ModelTarget::Main => log.append_model_change(
+                    ThreadFilter::MAIN,
+                    &info.provider,
+                    &info.id,
+                    info.context_window,
+                ),
+                ModelTarget::Oracle => log.append_oracle_model_change(&info.provider, &info.id),
+            })
+            .await;
+            let entry = match recorded {
+                Ok(entry) => entry,
+                Err(error) => return unrecorded("Model", error),
+            };
             // Never lock the agent here. A running turn retains its bundle,
             // while the next main turn takes these staged choices.
             {
@@ -826,20 +894,6 @@ pub async fn confirm_model(
                     .install_model(&mut model.stream_options, auth, &model.model_info);
                 *target.model_mut(&mut run) = model;
             }
-            // Record the change on the session log's user thread so a
-            // later resume restores this model.
-            let (entry, log_note) = {
-                let mut log = core.log.lock().await;
-                record(match target {
-                    ModelTarget::Main => log.append_model_change(
-                        ThreadFilter::USER,
-                        &info.provider,
-                        &info.id,
-                        info.context_window,
-                    ),
-                    ModelTarget::Oracle => log.append_oracle_model_change(&info.provider, &info.id),
-                })
-            };
             // Persist the model choice (provider + id) as the new
             // default only when the change should outlive this session
             // (the settings windows). The model selector is
@@ -856,12 +910,9 @@ pub async fn confirm_model(
                     &run_config.lock().expect("run config mutex poisoned"),
                 ),
                 applied: true,
-                notice: target.notice(format!(
-                    "Model set to {} ({}/{}).",
-                    info.name, info.provider, info.id
-                )),
-                notes: [save_note, log_note].into_iter().flatten().collect(),
-                entry,
+                notice,
+                notes: save_note.into_iter().collect(),
+                entry: Some(entry),
             }
         }
         Err(err) => ConfirmOutcome {
@@ -889,16 +940,6 @@ pub async fn confirm_model_for_sub(
     recorded_speed: Option<Speed>,
     core: &SessionCore,
 ) -> ConfirmOutcome {
-    let target = AgentId::Sub(n);
-    if core.resolve_agent(target).is_none() {
-        return ConfirmOutcome {
-            notices: Vec::new(),
-            applied: false,
-            notice: "This agent can't be prompted.".to_string(),
-            notes: Vec::new(),
-            entry: None,
-        };
-    }
     let effective_speed = core
         .sub_overrides
         .lock()
@@ -920,6 +961,25 @@ pub async fn confirm_model_for_sub(
             model_info,
             mut stream_options,
         }) => {
+            // Record the change on the sub-agent's log thread so a
+            // resumed transcript reflects it.
+            let notice = format!(
+                "Model set to {} ({}/{}) for agent {n}.",
+                info.name, info.provider, info.id
+            );
+            let recorded = record_change(core, AgentId::Sub(n), &notice, |log| {
+                log.append_model_change(
+                    ThreadFilter::sub(n),
+                    &info.provider,
+                    &info.id,
+                    info.context_window,
+                )
+            })
+            .await;
+            let entry = match recorded {
+                Ok(entry) => entry,
+                Err(error) => return unrecorded("Model", error),
+            };
             core.run_config
                 .lock()
                 .expect("run config mutex poisoned")
@@ -948,25 +1008,11 @@ pub async fn confirm_model_for_sub(
                 stream_options,
                 (info.provider.clone(), info.id.clone()),
             ));
-            // Record the change on the sub-agent's log thread so a
-            // resumed transcript reflects it.
-            let (entry, log_note) = {
-                let mut log = core.log.lock().await;
-                record(log.append_model_change(
-                    ThreadFilter::subagent(n),
-                    &info.provider,
-                    &info.id,
-                    info.context_window,
-                ))
-            };
             ConfirmOutcome {
                 notices: fallback.into_iter().collect(),
-                notice: format!(
-                    "Model set to {} ({}/{}) for agent {n}.",
-                    info.name, info.provider, info.id
-                ),
-                notes: log_note.into_iter().collect(),
-                entry,
+                notice,
+                notes: Vec::new(),
+                entry: Some(entry),
                 applied: true,
             }
         }
@@ -982,7 +1028,7 @@ pub async fn confirm_model_for_sub(
 
 /// Apply a confirmed output-verbosity pick to the selected model: stage it
 /// onto the run config's stream options, persist per `persist`, and
-/// record it on the session log's user thread. Verbosity is a plain
+/// record it on the session log's main thread. Verbosity is a plain
 /// stream-option field (no headers, no bundle rebuild), so unlike
 /// [`confirm_speed`] this never rebuilds the provider. Providers gate the
 /// field on per-model support, so on a model that ignores verbosity this
@@ -1000,19 +1046,24 @@ pub async fn confirm_verbosity(
 ) -> ConfirmOutcome {
     let unified = verbosity.map(config_verbosity_to_unified);
     let name = verbosity_name(unified);
+    // Record on the main thread so a later resume restores this value.
+    let notice = target.notice(format!(
+        "Output verbosity set to {name}. Takes effect next turn."
+    ));
+    let recorded = record_change(core, AgentId::Main, &notice, |log| match target {
+        ModelTarget::Main => log.append_verbosity_change(ThreadFilter::MAIN, name),
+        ModelTarget::Oracle => log.append_oracle_verbosity_change(name),
+    })
+    .await;
+    let entry = match recorded {
+        Ok(entry) => entry,
+        Err(error) => return unrecorded("Output verbosity", error),
+    };
     {
         let mut run = run_config.lock().expect("run config mutex poisoned");
         let cfg = target.model_mut(&mut run);
         cfg.stream_options.verbosity = unified;
     }
-    // Record on the user thread so a later resume restores this value.
-    let (entry, log_note) = {
-        let mut log = core.log.lock().await;
-        record(match target {
-            ModelTarget::Main => log.append_verbosity_change(ThreadFilter::USER, name),
-            ModelTarget::Oracle => log.append_oracle_verbosity_change(name),
-        })
-    };
     let save_note = persist_axis(
         layers,
         config,
@@ -1020,14 +1071,11 @@ pub async fn confirm_verbosity(
         &target.axis(crate::host::SettingsAxis::Verbosity(verbosity)),
     );
     ConfirmOutcome {
-        // Verbosity stages a plain field, so it cannot be refused.
         applied: true,
         notices: Vec::new(),
-        notice: target.notice(format!(
-            "Output verbosity set to {name}. Takes effect next turn."
-        )),
-        notes: [save_note, log_note].into_iter().flatten().collect(),
-        entry,
+        notice,
+        notes: save_note.into_iter().collect(),
+        entry: Some(entry),
     }
 }
 
@@ -1076,14 +1124,19 @@ pub async fn confirm_speed(
     core: &SessionCore,
 ) -> ConfirmOutcome {
     let name = speed_name(speed.as_ref());
+    let notice = format!("Speed set to {name} for Main and Oracle. Takes effect next turn.");
+    let recorded = record_change(core, AgentId::Main, &notice, |log| {
+        log.append_speed_change(ThreadFilter::MAIN, name)
+    })
+    .await;
+    let entry = match recorded {
+        Ok(entry) => entry,
+        Err(error) => return unrecorded("Speed", error),
+    };
     let fallbacks = {
         let mut run = run_config.lock().expect("run config mutex poisoned");
         run.set_speed(speed.clone());
         speed_fallback_notices(&run)
-    };
-    let (entry, log_note) = {
-        let mut log = core.log.lock().await;
-        record(log.append_speed_change(ThreadFilter::USER, name))
     };
     let save_note = persist_axis(
         layers,
@@ -1091,13 +1144,12 @@ pub async fn confirm_speed(
         persist,
         &crate::host::SettingsAxis::Speed(speed.clone()),
     );
-    let notes = [save_note, log_note].into_iter().flatten().collect();
     ConfirmOutcome {
         notices: fallbacks,
         applied: true,
-        notice: format!("Speed set to {name} for Main and Oracle. Takes effect next turn."),
-        notes,
-        entry,
+        notice,
+        notes: save_note.into_iter().collect(),
+        entry: Some(entry),
     }
 }
 
@@ -1134,16 +1186,6 @@ pub async fn confirm_speed_for_sub(
     tracked_model: Option<Arc<ModelInfo>>,
     core: &SessionCore,
 ) -> ConfirmOutcome {
-    let target = AgentId::Sub(n);
-    if core.resolve_agent(target).is_none() {
-        return ConfirmOutcome {
-            notices: Vec::new(),
-            applied: false,
-            notice: "This agent can't be prompted.".into(),
-            notes: Vec::new(),
-            entry: None,
-        };
-    }
     let info = core
         .sub_overrides
         .lock()
@@ -1159,23 +1201,28 @@ pub async fn confirm_speed_for_sub(
     let fallback = info
         .as_ref()
         .and_then(|info| speed_fallback_notice(&format!("Agent {n}"), info, speed.as_ref()));
+    let name = speed_name(speed.as_ref());
+    let notice = format!("Speed set to {name} for agent {n}. Takes effect next turn.");
+    let recorded = record_change(core, AgentId::Sub(n), &notice, |log| {
+        log.append_speed_change(ThreadFilter::sub(n), name)
+    })
+    .await;
+    let entry = match recorded {
+        Ok(entry) => entry,
+        Err(error) => return unrecorded("Speed", error),
+    };
     core.sub_overrides
         .lock()
         .expect("sub overrides mutex poisoned")
         .entry(n)
         .or_default()
         .speed = Some(speed.clone());
-    let name = speed_name(speed.as_ref());
-    let (entry, log_note) = {
-        let mut log = core.log.lock().await;
-        record(log.append_speed_change(ThreadFilter::subagent(n), name))
-    };
     ConfirmOutcome {
         notices: fallback.into_iter().collect(),
         applied: true,
-        notice: format!("Speed set to {name} for agent {n}. Takes effect next turn."),
-        notes: log_note.into_iter().collect(),
-        entry,
+        notice,
+        notes: Vec::new(),
+        entry: Some(entry),
     }
 }
 

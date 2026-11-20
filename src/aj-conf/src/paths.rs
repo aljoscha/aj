@@ -171,39 +171,60 @@ impl Config {
             .join(".env"))
     }
 
-    /// Get the sessions directory path for the current project. The sessions
+    /// Global session database path. Resolving it creates no directories or files.
+    pub fn session_database_path() -> Result<PathBuf, ConfigError> {
+        Ok(home_dir()
+            .ok_or(ConfigError::HomeNotFound)?
+            .join(".aj/sessions.sqlite3"))
+    }
+
+    /// Where background tasks write their output and exit files,
+    /// `~/.aj/tasks`. Resolving it creates no directories or files.
+    ///
+    /// A background task can outlive the process that started it, and a
+    /// later process finds it by these files, so they are kept out of the
+    /// temp directory, which the system cleans.
+    pub fn tasks_dir_path() -> Result<PathBuf, ConfigError> {
+        Ok(home_dir()
+            .ok_or(ConfigError::HomeNotFound)?
+            .join(".aj/tasks"))
+    }
+
+    /// Get the legacy session and writer-lock directory for the current project.
+    /// New SQLite sessions share [`Self::session_database_path`]. Legacy sessions
     /// are stored in subdirectories based on the git root directory. For
     /// example, if the git root is /Users/user/Dev/project, the subdirectory
     /// name will be "Dev-project".
     ///
-    /// NOTE: the subdirectory name comes from `path_to_dir_name`, which is
-    /// lossy. Two distinct projects whose names collide there share this
-    /// directory and interleave their sessions. See that function.
+    /// The subdirectory is named by [`Self::project_id`].
     pub fn get_sessions_dir_path() -> Result<PathBuf, ConfigError> {
-        let aj_dir = Self::get_config_dir()?;
-        let sessions_base_dir = aj_dir.join("sessions");
+        let directory = Self::sessions_dir_path()?;
+        fs::create_dir_all(&directory)?;
+        Ok(directory)
+    }
 
-        // Find the git root directory.
-        let working_directory = env::current_dir().map_err(ConfigError::Io)?;
-        if let Some(git_root) = find_git_root(&working_directory) {
-            // Convert the git root path to a directory name.
-            let project_dir_name = path_to_dir_name(&git_root);
-            let project_sessions_dir = sessions_base_dir.join(project_dir_name);
+    /// Legacy session root, without creating directories or files.
+    pub fn sessions_root_path() -> Result<PathBuf, ConfigError> {
+        Ok(home_dir()
+            .ok_or(ConfigError::HomeNotFound)?
+            .join(".aj/sessions"))
+    }
 
-            // Create the directory if it doesn't exist.
-            if !project_sessions_dir.exists() {
-                fs::create_dir_all(&project_sessions_dir)?;
-            }
+    /// The identity sessions of the current project are stored under: a
+    /// name derived from its git root, or `default` outside a repository.
+    ///
+    /// NOTE: the name comes from `path_to_dir_name`, which is lossy. Two
+    /// distinct projects whose names collide there share their sessions.
+    pub fn project_id() -> Result<String, ConfigError> {
+        let cwd = env::current_dir().map_err(ConfigError::Io)?;
+        Ok(find_git_root(&cwd)
+            .map(|git_root| path_to_dir_name(&git_root))
+            .unwrap_or_else(|| "default".into()))
+    }
 
-            Ok(project_sessions_dir)
-        } else {
-            // Fallback to a default directory if no git root is found.
-            let default_sessions_dir = sessions_base_dir.join("default");
-            if !default_sessions_dir.exists() {
-                fs::create_dir_all(&default_sessions_dir)?;
-            }
-            Ok(default_sessions_dir)
-        }
+    /// Current project's legacy bucket, without creating directories or files.
+    pub fn sessions_dir_path() -> Result<PathBuf, ConfigError> {
+        Ok(Self::sessions_root_path()?.join(Self::project_id()?))
     }
 
     /// Path to the default log file `~/.aj/logs/aj.log`, creating

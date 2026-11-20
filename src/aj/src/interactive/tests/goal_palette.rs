@@ -146,7 +146,7 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
             .view()
             .editor
             .borrow_mut()
-            .set_text("conversation draft");
+            .set_text("prompt draft");
 
         let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {
             writer.write_all(b"\x0fgoal\r").unwrap();
@@ -321,13 +321,14 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
             depth(&observed, 0).await;
             assert_eq!(
                 observed.borrow().view().editor.borrow().text(),
-                "conversation draft"
+                "prompt draft"
             );
             writer.write_all(b"!").unwrap();
             assert!(
-                poll_for(|| (observed.borrow().view().editor.borrow().text()
-                    == "conversation draft!")
-                    .then_some(()))
+                poll_for(
+                    || (observed.borrow().view().editor.borrow().text() == "prompt draft!")
+                        .then_some(())
+                )
                 .await
                 .is_some()
             );

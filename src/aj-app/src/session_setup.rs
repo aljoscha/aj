@@ -3,20 +3,19 @@
 //!
 //! Both modes assemble the same things at startup: the run-config
 //! snapshot (provider/model/thinking/speed merged from CLI > env >
-//! config), the conversation log (created or resumed, with interrupted
-//! tool uses repaired), resume-time settings restoration, the agent
+//! config), the session log (created, or resumed and settled by
+//! [`crate::recovery::recover`]), resume-time settings restoration, the agent
 //! itself, and the system-prompt freeze + transcript seed. This module
 //! owns those steps so the two frontends differ only in what they wrap
 //! around them: the interactive `SessionWorld` adds the sub-agent
 //! registry, bus subscriptions, and event pump. Print mode adds the
-//! JSONL / persistence listeners and the one-shot turn.
+//! JSONL / the journal and the one-shot turn.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_agent::events::AgentSettings;
-use aj_agent::message::AgentMessage;
 use aj_agent::{Agent, AgentSeed};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel};
 use aj_models::auth::AuthStorage;
@@ -27,10 +26,7 @@ use aj_models::{
     ThinkingConfig, speed_name, thinking_config_from_name, thinking_config_name,
     verbosity_from_name, verbosity_name,
 };
-use aj_session::{
-    ConversationError, ConversationLog, ConversationPersistence, TailRepair, ThreadFilter,
-    repair_interrupted_tool_uses,
-};
+use aj_session::{ProjectSessions, SessionError, SessionLog, TailRepair, ThreadFilter};
 use aj_tools::{BuiltinToolOptions, builtin_tools_for_model};
 use anyhow::{Context, Result};
 
@@ -38,6 +34,7 @@ use crate::SYSTEM_PROMPT;
 use crate::cli::args::Args;
 use crate::host::{HostSetup, SessionHost};
 use crate::model::{ModelSelection, ResolvedModel};
+use crate::recovery::{Recovered, RecoveredAgent};
 use crate::settings::ConfigLayers;
 
 /// Loop-side snapshot of the agent's run configuration.
@@ -72,7 +69,7 @@ use crate::settings::ConfigLayers;
 /// several live sessions resolves its process-wide defaults per session
 /// (see [`SessionCore::build`]), because the fields below are mutated
 /// per session: the log stamps `session_id` on it, and a resume
-/// overwrites the whole model bundle from the log's record. A shared
+/// overwrites the whole model bundle from the log's entries. A shared
 /// snapshot would cross-contaminate prompt-cache keys and model
 /// selection between sessions.
 ///
@@ -479,7 +476,7 @@ pub fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
 }
 
 /// Write a resumed session's recorded settings back into the shared
-/// run config, per the resume precedence: the log's record wins over
+/// run config, per the resume precedence: what the log holds wins over
 /// the current defaults. An axis the log doesn't record keeps the
 /// current value. Returns the user-facing notices describing what was
 /// restored or why a recorded value was kept out.
@@ -511,7 +508,9 @@ pub(crate) fn restore_session_settings(
     notices
 }
 
-fn restore_model_settings(
+/// Write one agent's recorded model, thinking, speed and verbosity into
+/// `cfg`, as [`restore_session_settings`] describes, and return the notices.
+pub(crate) fn restore_model_settings(
     cfg: &mut ModelConfig,
     settings: &aj_session::SessionSettings,
     restore: &RestoreContext,
@@ -530,7 +529,7 @@ fn restore_model_settings(
         }
     }
 
-    // Model. Skipped when the record matches the active bundle, except
+    // Model. Skipped when the entry matches the active bundle, except
     // that a restored speed still needs the bundle's headers rebuilt to
     // match.
     let model_changed = settings.model.as_ref().is_some_and(|(prov, id)| {
@@ -630,6 +629,13 @@ pub(crate) fn builtin_tool_options(config: &Config) -> BuiltinToolOptions {
         image_auto_resize: config.image_auto_resize,
         bash_rtk: config.bash_rtk,
         spill_dir: config.spill_dir.as_ref().map(PathBuf::from),
+        // A configured spill directory holds background tasks' files too.
+        // Otherwise they go under `~/.aj`, not into the temp directory: a
+        // task can outlive this process.
+        task_dir: match config.spill_dir {
+            Some(_) => None,
+            None => Config::tasks_dir_path().ok(),
+        },
     }
 }
 
@@ -711,25 +717,21 @@ impl SessionSource {
     }
 }
 
-/// A resolved conversation log plus the agent seed material derived
+/// A resolved session log plus the agent seed material derived
 /// from it.
 pub struct PreparedLog {
     /// The opened log, not yet shared behind an `Arc<Mutex<_>>`. The
     /// caller still mutates it (system-prompt freeze via
     /// [`freeze_and_seed`]) before installing the persistence
     /// listener.
-    pub log: ConversationLog,
-    /// The linearized user thread captured after repair, ready to seed
-    /// the agent. Empty for a fresh log.
-    pub transcript: Vec<AgentMessage>,
+    pub log: SessionLog,
+    /// The settled session: what the last host left, as a live session
+    /// holds it (see [`crate::recovery::recover`]). Empty for a fresh log.
+    pub recovered: Recovered,
     /// Notices from resume-time settings restoration (what was
     /// restored, or why a recorded value was kept out). Empty unless
     /// resuming with a [`RestoreContext`].
     pub restore_notices: Vec<String>,
-    /// The one ephemeral recovery notice, present exactly when this open's
-    /// resume repaired the log's interrupted final write. It belongs to this
-    /// open: a later open finds clean bytes and produces none.
-    pub recovery_notice: Option<String>,
     /// Initial overlay from creation or the resumed log's selected branch.
     /// `None` differs from a recorded empty map.
     pub session_env: Option<BTreeMap<String, String>>,
@@ -739,77 +741,72 @@ pub struct PreparedLog {
 /// recovery design words it for the reopen flow.
 fn recovery_notice_text(repair: &TailRepair) -> String {
     match repair {
-        TailRepair::RemovedIncompleteRecord { .. } => "Recovered this session after an \
-             interrupted write. AJ removed an incomplete final record. Check the last visible \
+        TailRepair::RemovedIncompleteEntry { .. } => "Recovered this session after an \
+             interrupted write. AJ removed an incomplete final entry. Check the last visible \
              action and retry it if needed."
             .to_string(),
         TailRepair::CompletedFraming => "Recovered this session after an interrupted write. AJ \
-             completed the final record's framing. Check the last visible action and retry it \
+             completed the final entry's framing. Check the last visible action and retry it \
              if needed."
             .to_string(),
     }
 }
 
-/// Resolve the log for `source`, repair any interrupted tool uses, and
-/// (on a resume with a [`RestoreContext`]) restore the recorded
-/// settings into `run_config`.
+/// Resolve the log for `source`, settle what its last host left
+/// ([`crate::recovery::recover`]), and (on a resume with a
+/// [`RestoreContext`]) restore the recorded settings into `run_config`.
 ///
-/// Repair runs before the transcript is captured: we re-linearize from
-/// the post-repair head so the seed sees any synthesized `tool_result`
-/// the repair walk just wrote. On error nothing is shared or
-/// installed.
+/// The caller holds the session's lock for a resume: the import and the
+/// settling write. On error nothing is shared or installed.
 pub fn prepare_log(
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     source: &SessionSource,
     run_config: &Arc<StdMutex<RunConfigSnapshot>>,
     restore: Option<&RestoreContext>,
 ) -> Result<PreparedLog> {
-    let mut log = match source {
-        SessionSource::Create { .. } => ConversationLog::create(persistence)
-            .context("failed to create a fresh conversation log")?,
+    let (mut log, tail_repair) = match source {
+        SessionSource::Create { .. } => {
+            let log =
+                SessionLog::create(persistence).context("failed to create a fresh session log")?;
+            (log, None)
+        }
         SessionSource::Resume { session_id, .. } => {
-            ConversationLog::resume(persistence, session_id).map_err(|err| match &err {
+            SessionLog::resume_reporting(persistence, session_id).map_err(|err| match &err {
                 // The refusal copy is the user-facing report the recovery
                 // design fixes; a generic resume context on top would bury
                 // it behind surfaces that show only an error's top line.
-                ConversationError::UnsafeTail { .. } => anyhow::Error::new(err),
+                SessionError::UnsafeTail { .. } => anyhow::Error::new(err),
                 _ => anyhow::Error::new(err)
                     .context(format!("failed to resume session {session_id}")),
             })?
         }
     };
-    let recovery_notice = log.take_tail_repair().as_ref().map(recovery_notice_text);
     let session_env = match source {
         SessionSource::Create { session_env } => session_env.clone(),
         SessionSource::Resume { .. } => log.session_env().cloned(),
     };
 
     let mut restore_notices = Vec::new();
-    let transcript = if let Some(head) = log.head().cloned() {
-        let conversation = log.linearize(&head, ThreadFilter::USER);
-        repair_interrupted_tool_uses(&mut log, &conversation)?;
-        let head = log
-            .head()
-            .cloned()
-            .expect("post-repair head exists when pre-repair head did");
-        let conversation = log.linearize(&head, ThreadFilter::USER);
-        if source.is_resume() {
+    let mut recovered = Recovered::default();
+    if source.is_resume() {
+        recovered = crate::recovery::recover(&mut log)?;
+        // An import this open ran repaired an interrupted final write. A
+        // later open imports nothing and says nothing.
+        if let Some(repair) = &tail_repair {
+            recovered.notices.insert(0, recovery_notice_text(repair));
+        }
+        let settings = &recovered.main.settings;
+        if log.head().is_some() {
             run_config
                 .lock()
                 .expect("run config mutex poisoned")
                 .accounts
-                .replace(conversation.settings().accounts);
+                .replace(settings.accounts.clone());
+            if let Some(restore) = restore {
+                restore_notices = restore_session_settings(run_config, settings, restore);
+            }
         }
-        if source.is_resume()
-            && let Some(restore) = restore
-        {
-            restore_notices =
-                restore_session_settings(run_config, &conversation.settings(), restore);
-        }
-        conversation.agent_messages()
-    } else {
-        Vec::new()
-    };
+    }
 
     // Stamp the session's stable prompt-cache key onto the run config
     // now that the log exists. We do it after the restore block above:
@@ -835,27 +832,29 @@ pub fn prepare_log(
 
     Ok(PreparedLog {
         log,
-        transcript,
+        recovered,
         restore_notices,
-        recovery_notice,
         session_env,
     })
 }
 
+pub use crate::recovery::TURN_INTERRUPTED_NOTICE;
+
 /// Resolve the session's system prompt and seed the agent.
 ///
 /// A brand-new log gets the freshly-assembled prompt frozen as its
-/// root entry, followed by the initial settings record so a later
+/// root entry, followed by the initial settings entry so a later
 /// resume can restore the model/thinking/speed even if the defaults
 /// change in between. A resume reuses the persisted prompt verbatim
 /// (cache-warm) and leaves the log untouched. Either way the agent is
 /// seeded with the transcript, the prompt, and the sub-agent counter
 /// floor (so freshly minted sub-agent ids don't collide with subtrees
-/// already on disk).
+/// already on disk). `main` is the settled main agent, whose transcript and
+/// Code Mode values the agent takes.
 pub fn freeze_and_seed(
-    log: &mut ConversationLog,
+    log: &mut SessionLog,
     agent: &mut Agent,
-    transcript: Vec<AgentMessage>,
+    main: &mut RecoveredAgent,
     env: &AgentEnv,
     include_skills: bool,
     creation_env: Option<&BTreeMap<String, String>>,
@@ -875,18 +874,18 @@ pub fn freeze_and_seed(
             // the model runs with, whatever happens to the files on disk.
             log.append_context(crate::notices::session_context(env))?;
             log.append_model_change(
-                ThreadFilter::USER,
+                ThreadFilter::MAIN,
                 &run.main.model_key.0,
                 &run.main.model_key.1,
                 run.main.model_info.context_window,
             )?;
             log.append_thinking_change(
-                ThreadFilter::USER,
+                ThreadFilter::MAIN,
                 thinking_config_name(run.main.thinking.as_ref()),
             )?;
-            log.append_speed_change(ThreadFilter::USER, speed_name(run.main.speed.as_ref()))?;
+            log.append_speed_change(ThreadFilter::MAIN, speed_name(run.main.speed.as_ref()))?;
             log.append_verbosity_change(
-                ThreadFilter::USER,
+                ThreadFilter::MAIN,
                 verbosity_name(run.main.stream_options.verbosity),
             )?;
             let oracle = &run.oracle;
@@ -898,13 +897,10 @@ pub fn freeze_and_seed(
     };
 
     agent.seed_session(AgentSeed {
-        transcript,
+        transcript: std::mem::take(&mut main.transcript),
         assembled_system_prompt: Some(system_prompt),
         sub_agent_counter: log.max_agent_id().unwrap_or(0),
-        code_mode_store: log
-            .head()
-            .map(|head| log.linearize(head, ThreadFilter::USER).code_mode_store())
-            .unwrap_or_default(),
+        code_mode_store: std::mem::take(&mut main.code_mode_store),
     });
     Ok(())
 }
@@ -963,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn the_name_flag_reaches_the_composed_host() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let compose =
             |args: &Args| compose_host(args, layers(), &empty_auth(&dir), &persistence, None);
 
@@ -990,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn scripted_host_uses_a_persisted_model_for_later_sessions() {
         let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let persistence = ProjectSessions::new(dir.path().join("sessions"));
         let layers = ConfigLayers {
             user: Config::default(),
             project: ConfigLayer::default(),
@@ -1433,7 +1429,7 @@ mod tests {
         assert!(run_config.main.stream_options.session_id.is_none());
 
         let run_config = Arc::new(StdMutex::new(run_config));
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let persistence = ProjectSessions::new(dir.path().to_path_buf());
         let prepared = prepare_log(
             &persistence,
             &SessionSource::Create { session_env: None },
@@ -1523,7 +1519,7 @@ pub fn compose_host(
     args: &Args,
     layers: ConfigLayers,
     auth: &AuthStorage,
-    persistence: &ConversationPersistence,
+    persistence: &ProjectSessions,
     idle_grace: Option<std::time::Duration>,
 ) -> Result<ComposedHost> {
     let config = layers.effective();

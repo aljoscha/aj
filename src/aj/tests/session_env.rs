@@ -4,7 +4,7 @@ use std::io::Read;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use aj_session::{ConversationEntryKind, ConversationLog, ConversationPersistence};
+use aj_session::{LogEntryKind, ProjectSessions, SessionLog};
 use tempfile::TempDir;
 
 fn run_aj(home: &TempDir, cwd: &TempDir, args: &[&str]) -> Output {
@@ -83,6 +83,71 @@ fn deadline_helper_drains_output_while_the_child_runs() {
     assert!(output.status.success());
     assert_eq!(output.stdout.len(), 131_072);
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn cli_migrates_jsonl_sessions_into_the_global_database() {
+    use aj_agent::message::AgentMessage;
+    use aj_models::types::{Message, UserMessage};
+    use aj_session::ThreadKind;
+
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new_in(home.path()).unwrap();
+    std::fs::create_dir(cwd.path().join(".git")).unwrap();
+    let database = home.path().join(".aj/sessions.sqlite3");
+    let legacy = |project: &str| {
+        let store = ProjectSessions::for_project(
+            database.clone(),
+            home.path().join(".aj/sessions").join(project),
+            project.to_owned(),
+        );
+        let message = AgentMessage::wire(Message::User(UserMessage::text(project)));
+        let (id, _) = aj_session::jsonl_session(&store, |log| {
+            log.append(
+                None,
+                ThreadKind::Main,
+                None,
+                LogEntryKind::Message { message },
+            )
+            .unwrap();
+        });
+        (store, id)
+    };
+    let (here, id) = legacy(cwd.path().file_name().unwrap().to_str().unwrap());
+    let (other, other_id) = legacy("other");
+    std::fs::write(other.sessions_dir().join("broken.jsonl"), "not json\n").unwrap();
+    let run = |args: &[&str]| {
+        let output = run_aj(&home, &cwd, args);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        (output.status.success(), stdout)
+    };
+
+    let (ok, dry) = run(&["migrate-session", &id, "--dry-run"]);
+    assert!(ok && dry.contains("would import into SQLite"), "{dry}");
+    assert!(!database.exists());
+
+    // One damaged source fails the command without blocking the others.
+    let (ok, all) = run(&["migrate-session", "--all"]);
+    assert!(!ok, "{all}");
+    assert!(
+        all.contains("2 imported") && all.contains("1 failed"),
+        "{all}"
+    );
+    let (ok, again) = run(&["migrate-session", &id]);
+    assert!(
+        ok && again.contains("already imported into SQLite"),
+        "{again}"
+    );
+
+    assert!(here.in_database(&id).unwrap());
+    assert!(other.in_database(&other_id).unwrap());
+    let (ok, listed) = run(&["list-sessions"]);
+    assert!(ok && listed.lines().count() == 1, "{listed}");
+
+    // Exactly one of an ID or --all selects what to migrate.
+    for args in [&["migrate-session"][..], &["migrate-session", &id, "--all"]] {
+        assert_eq!(run_aj(&home, &cwd, args).status.code(), Some(2));
+    }
 }
 
 #[test]
@@ -169,20 +234,14 @@ fn print_continue_reports_that_env_is_create_only_without_backfilling_the_log() 
         String::from_utf8_lossy(&first.stderr)
     );
     let sessions = home.path().join(".aj/sessions/default");
-    let mut logs = std::fs::read_dir(&sessions)
-        .expect("sessions directory")
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")).then_some(path)
-        })
-        .collect::<Vec<_>>();
+    let persistence = ProjectSessions::for_project(
+        home.path().join(".aj/sessions.sqlite3"),
+        sessions,
+        "default".into(),
+    );
+    let mut logs = persistence.list_sessions().expect("session records");
     assert_eq!(logs.len(), 1, "initial print minted one session: {logs:?}");
-    let path = logs.pop().expect("one log");
-    let session_id = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .expect("session id")
-        .to_string();
+    let session_id = logs.pop().expect("one log").session_id;
 
     let resumed = run_aj(
         &home,
@@ -210,15 +269,14 @@ fn print_continue_reports_that_env_is_create_only_without_backfilling_the_log() 
         "create-only notice missing from stderr: {stderr:?}"
     );
 
-    let persistence = ConversationPersistence::new(sessions);
-    let log = ConversationLog::resume(&persistence, &session_id).expect("resume result log");
+    let log = SessionLog::resume(&persistence, &session_id).expect("resume result log");
     assert_eq!(log.session_env(), None);
     assert_eq!(
         log.entries_in_order()
             .iter()
-            .filter(|entry| matches!(entry.entry, ConversationEntryKind::EnvChange { .. }))
+            .filter(|entry| matches!(entry.entry, LogEntryKind::EnvChange { .. }))
             .count(),
         0,
-        "print continue backfilled a creation record"
+        "print continue backfilled a creation entry"
     );
 }

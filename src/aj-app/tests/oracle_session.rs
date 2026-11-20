@@ -26,7 +26,7 @@ use aj_models::types::{
     AssistantContent, Context, Message, SimpleStreamOptions, Speed, StopReason, StreamOptions,
     ThinkingLevel, ToolCall, UserContent, Verbosity,
 };
-use aj_session::{ConversationLog, ConversationPersistence, ThreadFilter};
+use aj_session::{ProjectSessions, SessionLog, ThreadFilter};
 use aj_wire::{BranchChanges, Frame, ModelSelection, SessionSettings};
 use serde_json::json;
 use tempfile::TempDir;
@@ -39,6 +39,7 @@ struct Request {
     effort: ThinkingLevel,
     speed: Option<Speed>,
     verbosity: Option<Verbosity>,
+    tools: Vec<String>,
 }
 
 #[derive(Default)]
@@ -66,6 +67,7 @@ impl Provider for AdvisorFixture {
             effort: options.reasoning,
             speed: options.base.speed.clone(),
             verbosity: options.base.verbosity,
+            tools: context.tools.iter().map(|tool| tool.name.clone()).collect(),
         });
         let mut message = finalized_text_message("oracle evidence received");
         if !child && matches!(context.messages.last(), Some(Message::User(_))) {
@@ -107,8 +109,8 @@ impl Store {
         }
     }
 
-    fn persistence(&self) -> ConversationPersistence {
-        ConversationPersistence::new(self.root.path().join("sessions"))
+    fn persistence(&self) -> ProjectSessions {
+        ProjectSessions::new(self.root.path().join("sessions"))
     }
 
     fn host(&self, oracle: &str) -> (SessionHost, Arc<Mutex<Config>>) {
@@ -452,7 +454,7 @@ async fn oracle_edits_update_only_the_current_session_and_persist_only_oracle_ke
             assert_bundle(&run.oracle, "oracle-a", "high", "standard", "high");
         }
         let log = handles.log.lock().await;
-        let recorded = log.settings_at(log.head().unwrap());
+        let recorded = log.settings_at(log.head().unwrap()).unwrap();
         assert_eq!(recorded.model, Some(("fixture".into(), "main-a".into())));
         assert_eq!(
             recorded.oracle_model,
@@ -644,7 +646,7 @@ async fn captured_defaults_survive_resume_and_head_switch_restores_each_oracle_a
     let original = handles.log.lock().await.head().unwrap().clone();
     {
         let log = handles.log.lock().await;
-        let recorded = log.settings_at(&original);
+        let recorded = log.settings_at(&original).unwrap();
         assert_eq!(
             recorded.oracle_model,
             Some(("fixture".into(), "oracle-a".into()))
@@ -715,18 +717,18 @@ async fn captured_defaults_survive_resume_and_head_switch_restores_each_oracle_a
 #[tokio::test]
 async fn legacy_logs_keep_unknown_oracle_history_and_use_independent_defaults() {
     let store = Store::new();
-    let mut log = ConversationLog::create(&store.persistence()).unwrap();
+    let mut log = SessionLog::create(&store.persistence()).unwrap();
     log.set_system_prompt("Legacy session instructions".into())
         .unwrap();
-    log.append_model_change(ThreadFilter::USER, "fixture", "main-b", 0)
+    log.append_model_change(ThreadFilter::MAIN, "fixture", "main-b", 0)
         .unwrap();
-    log.append_thinking_change(ThreadFilter::USER, "low")
+    log.append_thinking_change(ThreadFilter::MAIN, "low")
         .unwrap();
     log.append(
         log.head().cloned(),
-        aj_session::ThreadKind::User,
+        aj_session::ThreadKind::Main,
         None,
-        aj_session::ConversationEntryKind::Message {
+        aj_session::LogEntryKind::Message {
             message: aj_agent::message::AgentMessage::wire(Message::User(
                 aj_models::types::UserMessage::text("legacy prompt"),
             )),
@@ -744,7 +746,7 @@ async fn legacy_logs_keep_unknown_oracle_history_and_use_independent_defaults() 
         assert_bundle(&run.oracle, "oracle-a", "high", "standard", "high");
     }
     let log = handles.log.lock().await;
-    let settings = log.settings_at(&historical);
+    let settings = log.settings_at(&historical).unwrap();
     assert_eq!(settings.oracle_model, None);
     assert_eq!(settings.oracle_thinking, None);
     assert_eq!(settings.oracle_speed, None);
@@ -841,22 +843,22 @@ async fn separate_model_and_thinking_edits_can_repair_invalid_effort_for_main_an
 #[tokio::test]
 async fn unavailable_recorded_oracle_keeps_fallback_and_restores_request_speed() {
     let store = Store::new();
-    let mut log = ConversationLog::create(&store.persistence()).unwrap();
+    let mut log = SessionLog::create(&store.persistence()).unwrap();
     log.set_system_prompt("Shared engineering instructions".into())
         .unwrap();
-    log.append_model_change(ThreadFilter::USER, "fixture", "main-a", 0)
+    log.append_model_change(ThreadFilter::MAIN, "fixture", "main-a", 0)
         .unwrap();
-    log.append_thinking_change(ThreadFilter::USER, "low")
+    log.append_thinking_change(ThreadFilter::MAIN, "low")
         .unwrap();
     log.append_oracle_model_change("fixture", "unavailable")
         .unwrap();
-    log.append_speed_change(ThreadFilter::USER, "fast").unwrap();
+    log.append_speed_change(ThreadFilter::MAIN, "fast").unwrap();
     log.append_oracle_speed_change("standard").unwrap();
     log.append(
         log.head().cloned(),
-        aj_session::ThreadKind::User,
+        aj_session::ThreadKind::Main,
         None,
-        aj_session::ConversationEntryKind::Message {
+        aj_session::LogEntryKind::Message {
             message: aj_agent::message::AgentMessage::wire(Message::User(
                 aj_models::types::UserMessage::text("prior question"),
             )),
@@ -893,18 +895,18 @@ async fn unavailable_recorded_oracle_keeps_fallback_and_restores_request_speed()
 #[tokio::test]
 async fn branch_model_restore_preserves_unrecorded_verbosity() {
     let store = Store::new();
-    let mut log = ConversationLog::create(&store.persistence()).unwrap();
+    let mut log = SessionLog::create(&store.persistence()).unwrap();
     log.set_system_prompt("Shared engineering instructions".into())
         .unwrap();
-    log.append_model_change(ThreadFilter::USER, "fixture", "main-b", 0)
+    log.append_model_change(ThreadFilter::MAIN, "fixture", "main-b", 0)
         .unwrap();
     log.append_oracle_model_change("fixture", "oracle-b")
         .unwrap();
     log.append(
         log.head().cloned(),
-        aj_session::ThreadKind::User,
+        aj_session::ThreadKind::Main,
         None,
-        aj_session::ConversationEntryKind::Message {
+        aj_session::LogEntryKind::Message {
             message: aj_agent::message::AgentMessage::wire(Message::User(
                 aj_models::types::UserMessage::text("prior question"),
             )),
@@ -960,7 +962,7 @@ async fn shared_speed_persists_one_default_without_changing_other_live_sessions(
             writes: Default::default(),
         },
         &AuthStorage::with_providers(root.path().join("auth.json"), HashMap::new()),
-        &ConversationPersistence::new(root.path().join("sessions")),
+        &ProjectSessions::new(root.path().join("sessions")),
         None,
     )
     .unwrap();
@@ -993,5 +995,89 @@ async fn shared_speed_persists_one_default_without_changing_other_live_sessions(
     let fresh = host.create().await.unwrap();
     let fresh = host.local_handles(&fresh).await.unwrap();
     assert_speed(&fresh.run_config.lock().unwrap(), Speed::Fast);
+    host.shutdown().await;
+}
+
+/// An Oracle sub-agent built from its stored run by a later host keeps the
+/// tools its first run was offered as a ceiling. A model change replaces a
+/// sub-agent's tool catalog at its next turn, which is where an Oracle
+/// without the ceiling would get a sub-agent's full set.
+#[tokio::test]
+async fn an_oracle_built_from_its_stored_run_keeps_its_restricted_tools() {
+    let store = Store::new();
+    let (host, _) = store.host("oracle-a");
+    let session = host.create().await.unwrap();
+    store
+        .consult(
+            &host,
+            &session,
+            ThinkingLevel::Low,
+            ThinkingLevel::High,
+            Verbosity::High,
+            Speed::Standard,
+        )
+        .await;
+    let (parent, spawned) = {
+        let requests = store.provider.0.lock().unwrap();
+        (requests[0].tools.clone(), requests[1].tools.clone())
+    };
+    assert!(
+        parent
+            .iter()
+            .any(|tool| !spawned.contains(tool) && tool != "oracle"),
+        "the Oracle is restricted: {spawned:?} of {parent:?}"
+    );
+    host.shutdown().await;
+
+    let (host, _) = store.host("oracle-a");
+    store.provider.0.lock().unwrap().clear();
+    // Staged as the model selector stages it, with the fixture's provider:
+    // one resolved from the catalog would not answer.
+    let handles = host.local_handles(&session).await.unwrap();
+    let swapped = store.bundle("oracle-b", Some(ThinkingConfig::High));
+    handles.sub_overrides.lock().unwrap().insert(
+        1,
+        aj_app::session::SubAgentOverrides {
+            bundle: Some((
+                swapped.provider,
+                swapped.model_info,
+                swapped.stream_options,
+                swapped.model_key,
+            )),
+            ..Default::default()
+        },
+    );
+    drop(handles);
+    host.command(
+        &session,
+        Command::Prompt {
+            agent: AgentId::Sub(1),
+            content: vec![UserContent::text("and the other invariant?")],
+        },
+    )
+    .await
+    .unwrap();
+    let rebuilt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // The request, and then the end of the turn it belongs to.
+            let request = store.provider.0.lock().unwrap().first().map(|request| {
+                assert!(request.child);
+                assert_eq!(request.model, "oracle-b");
+                request.tools.clone()
+            });
+            let list = host.sessions().await.unwrap();
+            let idle = list
+                .sessions
+                .iter()
+                .any(|row| row.id == session && !row.working);
+            if let (Some(tools), true) = (request, idle) {
+                return tools;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Oracle's continuation");
+    assert_eq!(rebuilt, spawned);
     host.shutdown().await;
 }

@@ -1,7 +1,7 @@
 //! The empty-state splash: an animated `aj` wordmark, a command-palette hint,
 //! and, when there are startup warnings, one bordered notices box below them.
 //!
-//! Shown in the chat slot before the conversation has any user or assistant
+//! Shown in the chat slot before the session has any user or assistant
 //! entry. The animation is tick-driven off the frame clock the async driver
 //! already runs, so it costs a periodic redraw and no extra thread. Both the
 //! drift and the color pulse derive from elapsed wall-clock time (an
@@ -309,9 +309,9 @@ impl Splash {
     ///
     /// NOTE: We skip Info-level notices here. Context and any other
     /// informational notice are scrollback content, so the box surfaces only
-    /// attention-worthy warnings. Only the leading run counts: once a user or
-    /// assistant entry lands the splash is gone. An Info notice inside the run
-    /// is skipped without ending the run, so a leading context notice followed
+    /// attention-worthy warnings. Only the leading sequence counts: once a user or
+    /// assistant entry lands the splash is gone. An Info notice inside the sequence
+    /// is skipped without ending it, so a leading context notice followed
     /// by warnings still shows the warnings.
     fn notice_spans(&self) -> Option<Vec<TextSpan>> {
         let chat = self.chat.borrow();

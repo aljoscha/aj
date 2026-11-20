@@ -12,13 +12,18 @@ use crate::BranchSettings;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
-    /// Backing JSONL path on the host.
+    /// Path of the database that stores the session, on the host.
     pub path: PathBuf,
+    /// The project the session is stored under. Empty from a host that does
+    /// not send it.
+    #[serde(default)]
+    pub project: String,
     /// Creation time parsed from the session id, if available.
     pub created_at: Option<DateTime<Utc>>,
     /// Most recent timestamped message, if any.
     pub last_activity: Option<DateTime<Utc>>,
-    /// Backing file size, absent when the file does not exist.
+    /// Summed size of the session's stored entries, absent when it is not
+    /// stored.
     pub size_bytes: Option<u64>,
     pub total_entries: usize,
     pub user_messages: usize,

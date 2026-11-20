@@ -1,7 +1,7 @@
 //! Provider-independent unified message types.
 //!
 //! All provider implementations produce and consume these types. They are the
-//! canonical representation for conversations, tool calls, and streaming
+//! canonical representation for messages, tool calls, and streaming
 //! options across Anthropic, OpenAI, and any future providers.
 
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 // ---------------------------------------------------------------------------
 
 /// Text content block.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TextContent {
     pub text: String,
     /// Opaque provider-specific signature for multi-turn replay.
@@ -40,7 +40,7 @@ pub struct ThinkingContent {
 }
 
 /// Base64-encoded image content.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ImageContent {
     /// Base64-encoded image data.
     pub data: String,
@@ -88,7 +88,7 @@ pub enum AssistantContent {
 }
 
 /// Content that can appear in a user message.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum UserContent {
     #[serde(rename = "text")]
@@ -161,7 +161,7 @@ pub struct ToolResultMessage {
     pub timestamp: i64,
 }
 
-/// A conversation message — one of user, assistant, or tool result.
+/// A message — one of user, assistant, or tool result.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "role")]
 pub enum Message {
@@ -199,7 +199,7 @@ impl StopReason {
     /// `Error` and `Aborted` mean it did not: the stream failed or was
     /// cancelled, and what got persisted is the partial captured at that
     /// moment. The partial carries any usage disclosed before that point.
-    /// It does not advance a turn, so a failed attempt is retried and the
+    /// It does not advance the turn, so a failed attempt is retried and the
     /// retry is what counts.
     /// Everything else completed, whatever the model chose to stop for.
     pub fn completed(&self) -> bool {
@@ -292,7 +292,7 @@ pub struct AssistantError {
     pub http_status: Option<u16>,
 }
 
-/// Classification of a failure terminating an assistant turn.
+/// Classification of a failure terminating an assistant message.
 ///
 /// Categories are stable and form the contract callers key retry
 /// behaviour off.
